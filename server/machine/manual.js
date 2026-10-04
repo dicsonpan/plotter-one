@@ -41,6 +41,27 @@ export function buildManualCommand(preset, cmd) {
   const speed = Number(cmd.speed) > 0 ? Number(cmd.speed) : 30;
 
   /**
+   * 🔴 每条手动指令都必须先发初始化前缀 `IN;`（2026-10-04 实机踩到）。
+   *
+   * 教训：修坐标轴方向时，我嫌 `IN;` 「重置整机状态」把它删了，
+   * 结果机器**所有按钮全部失灵**——点什么都没有反应。
+   *
+   * 原因：力宇固件在冷启动 / 重新上电后处于未初始化状态，
+   * **没有 `IN;` 就拒绝执行任何运动指令**（PU / PR / PA / !PG 全部被静默忽略）。
+   * 串口层面写入是成功的、任务显示「完成」，但机器不动——
+   * 表现和「串口坏了」一模一样，极难定位。
+   *
+   * 所以「归位要发干净的物理指令」这个判断是对的，但**不能连初始化一起去掉**。
+   * 正确做法：`IN;` 保留，危险的 SC 映射（反向 SC）由 hpgl.js 保证为正序。
+   *
+   * SP1 选刀 + LT 连续线一并带上，与刻字任务保持一致的起始状态。
+   */
+  const initPrefix = () => {
+    b.emit('IN;');
+    b.emit('SP1;');
+  };
+
+  /**
    * 相对位移指令。
    *
    * 🔴 HP-GL 的 PA/PR 语义（这里原先踩了大坑）：
@@ -71,6 +92,8 @@ export function buildManualCommand(preset, cmd) {
         dy = Math.sign(dy) * Math.min(Math.abs(dy), MAX_STEP);
         notes.push(`单次位移已限制在 ±${MAX_STEP}mm`);
       }
+      initPrefix();
+      b.setSpeed(speed);
       relative(dx, dy);
       notes.push(`移动 ${dx.toFixed(1)}, ${dy.toFixed(1)} mm（抬刀状态，不划伤材料）`);
       break;
@@ -78,15 +101,12 @@ export function buildManualCommand(preset, cmd) {
 
     case 'home': {
       /**
-       * 🔴 机械归位：**只发 PU + !PG**，不发 IN、也不发 SC。
+       * 机械归位：先 `IN;` 初始化（否则固件拒绝执行），再抬刀 + `!PG`。
        *
-       * 理由：
-       *   - `!PG` 是力宇的物理归位，不经过坐标换算，对轴向设置免疫；
-       *   - `IN;` 会重置整机状态，SC 会改变 P1/P2 映射——
-       *     在归位前塞这两条，等于让机器带着人为设定的坐标系去找机械原点，
-       *     是「Y 轴飞转、X 轴反走」这类失控的温床。
-       * 归位就该是归位：最少指令，物理动作，不掺杂任何坐标假设。
+       * `!PG` 是物理归位，不经过坐标换算，所以**不带 SC**——
+       * 归位不该掺入任何坐标系假设，这是它对轴向设置免疫的原因。
        */
+      initPrefix();
       b.penUp();
       b.emit('PU;');
       b.emit('!PG;');
@@ -95,6 +115,7 @@ export function buildManualCommand(preset, cmd) {
     }
 
     case 'penup': {
+      initPrefix();
       b.penUp();
       notes.push('抬刀');
       break;
@@ -104,10 +125,11 @@ export function buildManualCommand(preset, cmd) {
       /**
        * 落刀试压：沿当前方向走 2mm 再抬刀。
        *
-       * 原代码用 `lineTo(2, 0)`，那是**绝对**移动到 (2,0)——
+       * 原来用 `lineTo(2, 0)`，那是**绝对**移动到 (2,0)——
        * 落刀状态下从当前位置直插材料左下角，等于在成品上划一道对角线。
        * 必须用相对移动。
        */
+      initPrefix();
       b.penUp();
       b.setSpeed(Math.max(5, speed / 2));
       b.emit('PD;');
@@ -121,6 +143,7 @@ export function buildManualCommand(preset, cmd) {
 
     case 'setorigin': {
       // 力宇兼容 HP-GL，IP 就是「设定用户原点」：把当前位置定义为 (0,0)
+      initPrefix();
       b.penUp();
       b.emit('PU;');
       b.emit('IP0,0;');
@@ -137,13 +160,14 @@ export function buildManualCommand(preset, cmd) {
        * 用户报「回原点时 Y 轴疯狂转动」，那个转的就是走纸滚筒。
        * 所以进纸必须沿 Y 相对移动。
        *
-       * 原代码写的是 `moveTo(d, 0)`——那是**绝对**移动到 (d, 0)，
+       * 原来写的是 `moveTo(d, 0)`——那是**绝对**移动到 (d, 0)，
        * 名为「进纸 50mm」实际却是把刀头横移到画面某个位置。
        */
       let d = Math.abs(Number(cmd.distance) || 0);
       if (d === 0) { notes.push('距离为 0，未发送进纸指令'); break; }
       if (d > MAX_STEP) { d = MAX_STEP; notes.push(`单次进纸限制在 ${MAX_STEP}mm`); }
       const sign = cmd.action === 'feed' ? 1 : -1;
+      initPrefix();
       b.setSpeed(speed);
       relative(0, d * sign);
       notes.push(`${cmd.action === 'feed' ? '进纸' : '出纸'} ${d.toFixed(0)}mm`);
@@ -166,6 +190,7 @@ export function buildManualCommand(preset, cmd) {
     }
 
     case 'end': {
+      initPrefix();
       b.penUp();
       b.emit('PU;');
       b.home();

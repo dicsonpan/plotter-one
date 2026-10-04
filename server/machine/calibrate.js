@@ -47,6 +47,9 @@ export function buildCalibrationStep(preset, step) {
   const d = b.toMachineDelta(dx, dy);
   const u = (mm) => Math.round((mm / 25.4) * b.spi);
 
+  // 🔴 必须先 IN; 初始化，否则力宇固件拒绝执行任何运动指令（见 manual.js 的说明）
+  b.emit('IN;');
+  b.emit('SP1;');
   b.emit('PR;');
   b.emit(`PR${u(d.dx)},${u(d.dy)};`);
   b.emit(`PR${u(-d.dx)},${u(-d.dy)};`);   // 原路返回
