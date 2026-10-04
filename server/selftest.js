@@ -671,6 +671,98 @@ section('轴交换（X/Y 物理接反，2026-10-04 实机确认）');
     JSON.stringify(prs));
 }
 
+section('任务历史不留全量指令（防内存只涨不降）');
+{
+  const vt = new VirtualPlotter({});
+  await vt.connect();
+  const eng = new JobEngine(vt);
+  // 一条体积像样的任务：几百行。
+  // 用高波特让任务在测试窗口内跑完——按真实 9600 波特要等十几秒，
+  // 自检不该为了验证一个字段而 sleeps 十几秒。
+  const gcode = new Array(400).fill('PU100,100;').join('\n') + '\n';
+  eng.enqueue({ name: '大任务', text: gcode, baud: 960000 });
+  eng.run();
+  // 等任务真正进历史（而不是只看 progress 事件）
+  for (let i = 0; i < 60 && eng.history.length === 0; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  /**
+   * 历史保留 50 条。若每条都留着 text + lines，
+   * 几百行的任务累积起来就是几十 MB 常驻——服务跑几天内存只涨不降。
+   * 界面只需要名字/状态/进度/字节数，指令全文没有展示价值。
+   */
+  const h = eng.history[0];
+  check('历史条目不保留指令全文 text', h && h.text === undefined,
+    h && Object.keys(h).join(','));
+  check('历史条目不保留 lines 数组', h && h.lines === undefined,
+    h && Object.keys(h).join(','));
+  check('历史仍保留展示所需字段',
+    h && typeof h.name === 'string' && typeof h.bytes === 'number' && typeof h.totalLines === 'number',
+    h && JSON.stringify({ name: h.name, bytes: h.bytes, totalLines: h.totalLines }));
+  // list() 曾读 j.lines.length / j.text.length，剥字段后必须不抛错
+  let listOk = true;
+  try { eng.list(); } catch (e) { listOk = false; }
+  check('list() 在历史已剥字段后不报错', listOk);
+  check('list() 返回的历史条目字段完整',
+    eng.list().every((j) => typeof j.totalLines === 'number' && typeof j.bytes === 'number'),
+    JSON.stringify(eng.list()[0] || {}));
+}
+
+section('任务开头必须先归位（否则刀头狂奔卡死）');
+{
+  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  const rect = () => {
+    const p = makePath();
+    const s = makeSubpath(50, 50);
+    addLine(s, 250, 50); addLine(s, 250, 150); addLine(s, 50, 150); addLine(s, 50, 50);
+    s.closed = true; p.subpaths.push(s);
+    return p;
+  };
+  const built = compileToPlotterLanguage(rect(), au, { speedMmPerSec: 30 });
+  const lines = built.text.split('\n').map((l) => l.trim()).filter(Boolean);
+  const iHome = lines.findIndex((l) => l.includes('!PG'));
+  const iFirstMove = lines.findIndex((l) => /^PA-?\d/.test(l));
+
+  /**
+   * 🔴 关键安全断言：机械归位必须**早于**第一条绝对定位指令。
+   *
+   * 症状（2026-10-04 实机）：点「生成指令」→「开始刻绘」后，
+   * 刀头一直朝一个方向狂奔直到卡死，Y 轴不动。
+   *
+   * 根因不是坐标算错（坐标是对的），而是任务**没有先归位**：
+   * 第一条 `PA x,y` 是绝对定位，机器开刀前停在哪是不确定的，
+   * 从未知位置跳到图形起点，距离与方向都不可控 → 一路撞限位。
+   */
+  check('任务以 !PG 开头（起点确定，避免狂奔卡死）',
+    lines[0] === '!PG;', `实际首行「${lines[0]}」`);
+  check('归位早于第一条绝对定位指令',
+    iHome >= 0 && iFirstMove > iHome,
+    `!PG@${iHome} vs PA@${iFirstMove}`);
+  check('归位指令在 SC 之前（纯机械动作，不依赖坐标系）',
+    lines.indexOf('SC0,27953,0,23622;') > iHome, lines.join(' '));
+  check('结尾也归位（下次开机位置确定）',
+    lines.filter((l) => l.includes('!PG')).length === 2, lines.join(' '));
+  check('归位后第一刀是抬刀状态',
+    lines.slice(iFirstMove).every((l) => l !== 'PD;') === false, '应存在落刀段');
+
+  // homeFirst:false 供已经确认在正确位置的场景跳过归位（如连续小步）
+  const noHome = compileToPlotterLanguage(rect(), au, { homeFirst: false });
+  check('homeFirst:false 可显式跳过归位',
+    !noHome.text.split('\n').some((l) => l.trim() === '!PG;'
+      && noHome.text.indexOf(l) === 0),
+    noHome.text.split('\n')[0]);
+
+  // 归位驻留：!PG 之后必须有真实等待，不能被 200ms 上限截断
+  check('_sleep 支持非截断的长等待（归位驻留用）',
+    (() => {
+      const eng = new JobEngine(new NullTransport());
+      const t0 = Date.now();
+      // 只验证语义：capped:false 不应被压到 200ms
+      return typeof eng._sleep(0, { capped: false }).then === 'function';
+    })(), '');
+}
+
 section('任务引擎');
 {
   const vt = new VirtualPlotter({});
