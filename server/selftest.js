@@ -485,9 +485,37 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
 
   // 手动「回原点」绝不能带 IN / SC：归位是纯物理动作，不该掺入坐标系假设
   const mh = buildManualCommand(au, { action: 'home' });
-  check('手动回原点只发 PU + !PG（不含 IN/SC）',
-    !/\bIN;/.test(mh.text) && !/\bSC/.test(mh.text) && mh.text.includes('!PG'),
+  check('手动回原点含 !PG 且不带 SC（归位不掺入坐标系假设）',
+    !/\bSC/.test(mh.text) && mh.text.includes('!PG'),
     mh.text.replace(/\n/g, ' ').trim());
+
+  /**
+   * 🔴 回归测试：漏发 IN; 会让整台机器**所有按钮失灵**（2026-10-04 实机）。
+   *
+   * 力宇固件冷启动后处于未初始化状态，没有 `IN;` 就静默忽略所有运动指令——
+   * 串口写入成功、任务显示「完成」，但机器纹丝不动，
+   * 表现和「串口坏了」一模一样。
+   * 修坐标轴时曾把 IN; 当成「多余的状态重置」删掉，直接导致全机失灵，
+   * 而且下面那条「不含 IN」的断言还把它当成了正确行为。
+   * 这组断言就是为了防止它再被当成冗余删掉。
+   */
+  for (const [label, act] of [
+    ['回原点', { action: 'home' }],
+    ['方向键移动', { action: 'move', dx: 5, dy: 0 }],
+    ['抬刀', { action: 'penup' }],
+    ['落刀', { action: 'pendown' }],
+    ['进纸', { action: 'feed', distance: 50 }],
+    ['设原点', { action: 'setorigin' }],
+    ['抬刀回位', { action: 'end' }],
+  ]) {
+    const t = buildManualCommand(au, act).text;
+    check(`${label}指令含 IN; 初始化（否则固件拒绝执行，全机失灵）`,
+      /(^|\n)IN;/.test(t), t.replace(/\n/g, ' ').trim().slice(0, 60));
+  }
+
+  const calIn = buildCalibrationStep(au, { dir: 'x+', axisX: 1, axisY: 1 });
+  check('校准指令也必须含 IN;（同样会全机失灵）',
+    /(^|\n)IN;/.test(calIn), calIn.replace(/\n/g, ' ').trim());
 
   // 手动 jog 必须是相对移动，且收尾不能把刀头拽回原点
   const mv = buildManualCommand(au, { action: 'move', dx: 5, dy: 0 });
