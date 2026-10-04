@@ -230,7 +230,13 @@
       </div>
 
       <div class="field">
-        <label class="field-label" for="axisXSel">坐标轴方向（不确定就用下方校准，别猜）</label>
+        <label class="field-label" for="axisXSel">坐标轴映射（不确定就用下方校准，别猜）</label>
+        <div class="row" style="margin-bottom:6px">
+          <select id="axisSwapSel">
+            <option value="0">X/Y 正常对应</option>
+            <option value="1">X/Y 接反了（交换）</option>
+          </select>
+        </div>
         <div class="row">
           <select id="axisXSel">
             <option value="1">X 正向 = 往右 →</option>
@@ -242,7 +248,9 @@
           </select>
         </div>
         <div class="notice notice-warn" style="margin:8px 0 0">
-          <span>这里只影响<b>发什么坐标</b>，不会让机器失控——设错最坏是图形镜像。
+          <span><b>「接反」和「方向相反」是两件事</b>：
+          接反选上面的交换，方向反了选下面的箭头。
+          这里只影响<b>发什么坐标</b>，不会让机器失控——设错最坏是图形镜像。
           但<b>方向没确认前不要上料刻字</b>。先点下方「原点校准」，
           全程抬刀、只走 5mm，来回一次，很安全。</span>
         </div>

@@ -146,10 +146,13 @@ if (typeof window !== 'undefined') {
         // 轴向：config 优先（用户校准过），否则用机型预设的默认值
         const ax = s.config.axisX !== undefined ? s.config.axisX : (s.preset.axisX ?? 1);
         const ay = s.config.axisY !== undefined ? s.config.axisY : (s.preset.axisY ?? 1);
+        const sw = s.config.swapAxes !== undefined ? !!s.config.swapAxes : !!s.preset.swapAxes;
         $('axisXSel').value = String(ax);
         $('axisYSel').value = String(ay);
+        $('axisSwapSel').value = sw ? '1' : '0';
         state.config.axisX = ax;
         state.config.axisY = ay;
+        state.config.swapAxes = sw;
       }
 
       $('serverInfo').textContent = `${s.server.hostname} · :${s.server.port}`;
@@ -789,7 +792,11 @@ if (typeof window !== 'undefined') {
     document.body.appendChild(box);
     box.querySelectorAll('[data-r]').forEach((b) => {
       b.addEventListener('click', async () => {
-        const axis = dir[0] === 'x' ? 'axisX' : 'axisY';
+        // 🔴 写回哪个字段由服务端决定：轴交换时「按右」实际测的是机器 Y，
+        //    前端自己按 dir 猜 axis 会在交换模式下翻错那根轴。
+        const swap = !!state.config.swapAxes;
+        const axis = dir[0] === 'x' ? (swap ? 'axisY' : 'axisX')
+                                 : (swap ? 'axisX' : 'axisY');
         const current = +(b.dataset.r === 'yes' ? 1 : -1);
         const existing = state.config[axis] !== undefined ? state.config[axis] : current;
         // 「是」→ 设为 1；「不是」→ 若当前是 1 就改 -1
@@ -830,6 +837,17 @@ if (typeof window !== 'undefined') {
     $('axisYSel').addEventListener('change', () => {
       api('/api/config', { method: 'POST', body: { axisY: +$('axisYSel').value } })
         .then(() => { state.config.axisY = +$('axisYSel').value; logLine('Y 轴方向已改为 ' + $('axisYSel').value, 'ok'); })
+        .catch((e) => logLine('保存失败：' + e.message, 'err'));
+    });
+    $('axisSwapSel').addEventListener('change', () => {
+      const sw = $('axisSwapSel').value === '1';
+      api('/api/config', { method: 'POST', body: { swapAxes: sw } })
+        .then(() => {
+          state.config.swapAxes = sw;
+          logLine('X/Y 轴' + (sw ? '已设为交换' : '已恢复正常对应'), 'ok');
+          // 交换会改变两轴的物理含义，方向设置需要重新确认
+          if (sw) toast('已交换。方向可能也要重设，建议重新跑一次校准。', 'warn');
+        })
         .catch((e) => logLine('保存失败：' + e.message, 'err'));
     });
   }

@@ -83,19 +83,36 @@ export const MACHINE_PRESETS = {
     // 实测（2026-10-04，用户上机确认）：这台机器的机械原点在**用户的右手边**。
     //
     // 「正对机器时右手边」= 站在机器前看，原点在右侧。
-    // 也就是说机器坐标 x 增大的方向是**向左**，与用户坐标相反 → X 需要镜像。
+    // 也就是说**刀头（龙门）**前进的方向是向左，与画布的 X 方向相反。
     //
-    // 🔴 但镜像只在**上位机**做（toMachine 里 x → width - x），
+    // 🔴 镜像只在**上位机**做（toMachine 里 x → span - x），
     //    绝不能靠发 SC23622,0,... 让固件自己镜像——固件不支持，
     //    会算出负缩放系数，回原点时 Y 轴飞转、X 轴狂奔。
-    //    这里的 axisX 只影响「发什么坐标」，不影响「怎么跟机器说话」。
-    axisX: -1,
-    axisY: 1,
+    //    这里的 axisX/axisY 只影响「发什么坐标」，不影响「怎么跟机器说话」。
+    // ⚠️ 交换轴之后 axisX/axisY 的物理含义变了，不能沿用交换前的取值。
+    //
+    // 交换前：机器X = 刀头（龙门），所以「原点在右手边」→ axisX = -1。
+    // 交换后：机器Y = 刀头，机器X = 走纸。同一个物理事实
+    // （刀头归位在右手边）现在要落在**机器Y** 上 → axisY = -1。
+    // 把 -1 留在 axisX 上会让走纸方向反掉、刀头方向仍然错。
+    //
+    // 走纸轴（机器X）的方向无法从「原点在右手边」推出来（那是刀头的性质），
+    // 先按正向设，由校准向导的第二步确认。
+    axisX: 1,
+    axisY: -1,
+    // 实机确认（2026-10-04）：这台机器的**物理 X/Y 与用户坐标是接反的**——
+    // 推动刀头（龙门）的那个电机，固件里编号是 Y；走纸的那个是 X。
+    //
+    // 「接反」和「方向相反」是两件事，可以同时成立。
+    // 交换后机器 X 实际走 710mm（走纸方向），所以 SC 上界按 710 声明，
+    // 由 machineSpanX 处理，不要写死 preset.width。
+    swapAxes: true,
     serialDefault: { baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 10, max: 500, default: 250, unit: 'g' },
     note: 'AU 版海外规格表标称刻绘 600mm / 进纸 710mm。'
-        + '本机实测机械原点在用户右手边，故 X 轴在上位机做镜像（SC 仍为正序）。',
+        + '本机实测：机械原点在用户右手边（刀头轴 = 机器Y，故 axisY=-1）、'
+        + '且物理 X/Y 接反（故交换轴）。走纸轴方向待校准确认。',
   },
   'liyue-sc631e': {
     id: 'liyue-sc631e',
@@ -209,6 +226,10 @@ export class HpglBuilder {
                  : (preset.axisX !== undefined ? preset.axisX : 1);
     this.axisY = options.axisY !== undefined ? options.axisY
                  : (preset.axisY !== undefined ? preset.axisY : 1);
+    // 轴交换：这台机器的物理 X/Y 与用户坐标 X/Y 是接反的（2026-10-04 实机确认）。
+    // 与 axisX/axisY 正交——「接反」和「方向相反」是两件事，可以叠加。
+    this.swapAxes = options.swapAxes !== undefined ? !!options.swapAxes
+                    : !!preset.swapAxes;
     this.dialect = preset.dialect || 'hpgl';
     this.cmds = [];
     this.pos = { x: 0, y: 0 };
@@ -220,40 +241,72 @@ export class HpglBuilder {
   // 坐标变换：用户坐标(mm) → 机器坐标(mm)
   // -------------------------------------------------------------------------
   /**
+   * 机器坐标系在**各轴上的物理跨度**。
+   *
+   * 🔴 轴交换时必须换过来：交换前机器 X 走 600mm（幅面宽），
+   * 交换后机器 X 实际走的是用户的 Y，也就是 710mm（进纸方向）。
+   * SC 的上界按这个值算，写错会导致机器按错误的比例换算坐标。
+   */
+  get machineSpanX() { return this.swapAxes ? this.preset.height : this.preset.width; }
+  get machineSpanY() { return this.swapAxes ? this.preset.width : this.preset.height; }
+
+  /**
    * 绝对坐标变换。
    *
    * 用户坐标约定：原点在材料**左下角**，X 向右，Y 向上（与画布一致）。
    * 机器坐标由 SC 正序定义，机器固件只认「x 增大 = 机器 x 增大」。
    *
-   * 所以方向差异必须在这里（上位机）消化掉：
-   *   - axisX = -1：机器原点在用户右手边，x 增大要往左走 → x → width - x
-   *   - axisY = -1：y 增大要往下走 → y → height - y
+   * 三步，顺序不能换：
+   *   1. swapAxes：先换轴。用户 (x,y) → 机器 (y,x)。
+   *      换轴只是重新分配「哪根轴」，不涉及方向，所以放在最前面。
+   *   2. axisX/axisY：再按各轴方向做镜像（宽度按**该轴自己的跨度**取，
+   *      交换后 X 轴要减去的是 710 而不是 600——这是容易写错的地方）。
    *
    * 关键点：**SC 始终正序**。固件永远只看到一个正常的坐标系，
    * 方向填错的后果仅限于「图形镜像」，而不会像反向 SC 那样
    * 让固件算出负缩放、进而回原点时飞车。
    */
   toMachine(x, y) {
-    const w = this.preset.width;
-    const h = this.preset.height;
+    let mx = x;
+    let my = y;
+    if (this.swapAxes) { const t = mx; mx = y; my = t; }
+    const sx = this.machineSpanX;
+    const sy = this.machineSpanY;
     return {
-      x: this.axisX >= 0 ? x : (w - x),
-      y: this.axisY >= 0 ? y : (h - y),
+      x: this.axisX >= 0 ? mx : (sx - mx),
+      y: this.axisY >= 0 ? my : (sy - my),
     };
   }
 
   /**
    * 相对位移变换。
    *
-   * 与 toMachine 的区别：位移只有方向，没有位置，所以**不**做 width-x 偏移，
-   * 只翻符号。手动方向键、PR 增量走刀都必须走这里——
+   * 与 toMachine 的区别：位移只有方向，没有位置，所以**不**做 span-x 偏移，
+   * 只换轴 + 翻符号。手动方向键、PR 增量走刀都必须走这里——
    * 早先的手动 jog 误用了绝对 moveTo，在镜像机器上会变成「朝原点狂冲」。
    */
   toMachineDelta(dx, dy) {
+    let mdx = dx;
+    let mdy = dy;
+    if (this.swapAxes) { const t = mdx; mdx = dy; mdy = t; }
     return {
-      dx: this.axisX >= 0 ? dx : -dx,
-      dy: this.axisY >= 0 ? dy : -dy,
+      dx: this.axisX >= 0 ? mdx : -mdx,
+      dy: this.axisY >= 0 ? mdy : -mdy,
     };
+  }
+
+  /**
+   * 当前变换是否为反射（会翻转圆弧绕向）。
+   *
+   * 行列式：每次轴交换或单轴反向都是一次反射（det = -1）。
+   * 偶数次反射 = 旋转（det = +1，绕向不变）；奇数次 = 反射（绕向翻转）。
+   */
+  get isReflection() {
+    let n = 0;
+    if (this.swapAxes) n++;
+    if (this.axisX < 0) n++;
+    if (this.axisY < 0) n++;
+    return n % 2 === 1;
   }
 
   emit(str) {
@@ -278,8 +331,10 @@ export class HpglBuilder {
    * 这样即便方向设错，最坏也只是图形镜像，不会让机器失控撞机。
    */
   setupCoords(origin) {
-    const w = this.preset.width;
-    const h = this.preset.height;
+    // 🔴 交换轴时用 machineSpanX/Y（已互换），不能用 preset.width/height，
+    // 否则 SC 上界按错误的跨度声明，机器换算坐标会整体缩放。
+    const w = this.machineSpanX;
+    const h = this.machineSpanY;
     this.emit('IN;');
     if (this.dialect === 'dmpl') {
       this.emit(';:');
@@ -344,11 +399,13 @@ export class HpglBuilder {
   /**
    * 绝对圆弧：AA cx,cy,起始角,扫掠角（角度制，只能逆时针）
    *
-   * 🔴 镜像（反射变换）有两个坑，都必须处理：
+   * 🔴 反射变换（镜像 / 换轴）有两个坑，都必须处理：
    *
-   *   1. **绕向翻转**：X 镜像 x→w-x 是反射，会把用户坐标里逆时针的弧
-   *      变成机器坐标里顺时针的弧。而 HP-GL 的 AA 只能逆时针。
+   *   1. **绕向翻转**：X 镜像 x→w-x 与轴交换 x,y→y,x 都是反射（det = -1），
+   *      会把用户坐标里逆时针的弧变成机器坐标里顺时针的弧。
+   *      而 HP-GL 的 AA 只能逆时针。
    *      换算：顺时针 s 段 ≡ 逆时针 (360-s) 段，落点与圆弧完全一致。
+   *      反射次数为偶数（如换轴 + 单轴反向 = 旋转 180°）时绕向不变。
    *
    *   2. **起始角也要镜像**：起点角 a0 在反射后不再是 a0。
    *      （X 镜像：a0 → 180-a0；Y 镜像：a0 → -a0）
@@ -370,10 +427,10 @@ export class HpglBuilder {
     let d0 = Math.round(Math.atan2(this.pos.y - cyq, this.pos.x - cxq) / DEG) % 360;
     if (d0 < 0) d0 += 360;
 
-    // 扫掠角：反射则取反，再统一成「逆时针为正」
+    // 扫掠角：反射则取反，再统一成「逆时针为正」。
+    // isReflection 已把 swapAxes 计入（交换轴也是一次反射，det = -1）。
     let sweep = (a1 - a0) / DEG;
-    const reflected = (this.axisX < 0) !== (this.axisY < 0);
-    if (reflected) sweep = -sweep;
+    if (this.isReflection) sweep = -sweep;
     if (Math.abs(sweep) >= 360 - 1e-9) {
       sweep = 360;              // 整圆：不能被换算成 0（那会退化成零长度弧）
     } else if (sweep < 0) {

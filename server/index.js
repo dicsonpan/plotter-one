@@ -53,6 +53,8 @@ const DEFAULT_CONFIG = {
   defaultForce: 250,
   direction: Direction.CCW,
   optimize: true,
+  // 轴向三项缺省不写，由 axisOptions() 回落到机型预设。
+  // 写死在这里会覆盖预设，导致换机型时轴向被上一台机器的设置污染。
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -97,12 +99,17 @@ function getPreset(id) {
  *
  * 优先级：用户在界面/校准向导里保存的值（config）> 机型预设默认值。
  * 所有生成指令的入口都必须经过这里，避免「界面改了但指令没变」。
+ *
+ * 三个维度是正交的，可以任意组合：
+ *   swapAxes：物理 X/Y 是否接反
+ *   axisX/-Y：各轴方向是否相反
  */
 function axisOptions() {
   const preset = getPreset(config.machineId);
   return {
     axisX: config.axisX !== undefined ? config.axisX : (preset.axisX ?? 1),
     axisY: config.axisY !== undefined ? config.axisY : (preset.axisY ?? 1),
+    swapAxes: config.swapAxes !== undefined ? !!config.swapAxes : !!preset.swapAxes,
   };
 }
 
