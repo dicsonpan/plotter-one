@@ -17,6 +17,7 @@ import {
 import { MACHINE_PRESETS, HpglBuilder, compileToPlotterLanguage } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
 import { buildManualCommand } from './machine/manual.js';
+import { readFileSync } from 'node:fs';
 import { parseHpgl } from './import/hpglReader.js';
 import { parseDxf } from './import/dxf.js';
 import { parseSvgPath } from './import/svg.js';
@@ -669,6 +670,71 @@ section('轴交换（X/Y 物理接反，2026-10-04 实机确认）');
     prs.length === 2 && (Math.abs(prs[0][0]) === 197 || Math.abs(prs[0][1]) === 197)
     && (prs[0][0] === 0 || prs[0][1] === 0),
     JSON.stringify(prs));
+}
+
+section('安全操作必须无条件下发（不能因「软件以为已经抬刀」而空转）');
+{
+  const au = MACHINE_PRESETS['liyue-sc631-au'];
+
+  /**
+   * 🔴 回归：抬刀 / 回原点 / 抬刀回位曾经「点了没反应」。
+   *
+   * 根因：`penUp()` 只在 `penDown === true` 时才发 `PU;`，
+   * 这是给生成任务省字节用的优化。但手动按钮场景下，
+   * 软件对刀状态的认知来自「本次任务有没有下发过 PD」，
+   * 而机器真实状态可能已经不同：
+   *   - 上一次任务中途被停止 / 急停
+   *   - 串口断线重连（软件状态清零，机器还压着）
+   *   - 换过控制板
+   * 此时按「抬刀」一条指令都不发 → 按钮点了没反应，刀还压着材料。
+   *
+   * 抬刀是**安全**操作，多发一个字节的成本可以忽略；不发指令的风险不行。
+   */
+  check('penUp() 在未落刀时确实不发光刀指令（省字节优化的原意）',
+    !new HpglBuilder(au, {}).penUp().cmds.includes('PU;'), '应为空');
+  check('forcePenUp() 永远发光刀指令',
+    new HpglBuilder(au, {}).forcePenUp().cmds.includes('PU;'), '应含 PU;');
+
+  for (const [label, act, mustHave] of [
+    ['抬刀', { action: 'penup' }, ['PU;']],
+    ['回原点', { action: 'home' }, ['PU;', '!PG;']],
+    ['抬刀回位', { action: 'end' }, ['PU;', '!PG;']],
+    ['落刀试压', { action: 'pendown' }, ['PD;', 'PU;']],
+    ['停止', { action: 'stop' }, ['PU;', 'SP0;']],
+  ]) {
+    const t = buildManualCommand(au, act).text;
+    const missing = mustHave.filter((k) => !t.includes(k));
+    check(`${label}必定下发 ${mustHave.join('+')}（无条件，不看软件状态）`,
+      missing.length === 0, missing.length ? `缺少 ${missing.join(',')}` : t.replace(/\n/g, ' ').trim());
+  }
+
+  // 落刀试压必须「先抬 → 落 → 试 → 抬」，收尾的抬刀不能省
+  const pd = buildManualCommand(au, { action: 'pendown' }).text.trim().split('\n').map((l) => l.trim());
+  check('落刀试压顺序为 抬→落→走→抬',
+    pd.indexOf('PD;') > pd.indexOf('PU;')
+    && pd.lastIndexOf('PU;') > pd.indexOf('PD;'),
+    pd.join(' '));
+}
+
+section('串口自动重连（服务重启后机器不能「失联」）');
+{
+  /**
+   * 服务每次重启都会释放串口，界面上的手动按钮随之全部置灰，
+   * 表现为「点什么都不反应」——用户会以为机器坏了。
+   * 配置里已经记了串口路径，具备自动重连条件，所以必须自动接回。
+   */
+  const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
+  check('存在自动重连逻辑 tryReconnect', /function tryReconnect/.test(src));
+  check('启动时尝试自动连接', /await tryReconnect\(\)/.test(src));
+  check('持续重试（USB 重新插拔后能恢复）', /startReconnectLoop/.test(src));
+  check('手动连接后停掉自动重连（避免两套逻辑抢占串口）',
+    /stopReconnectLoop\(\)/.test(src));
+  check('退出前抬刀收尾（不留压刀状态）',
+    /SIGTERM/.test(src) && /PU;/.test(src));
+  check('重连定时器 unref（不阻止进程退出）',
+    /reconnectTimer\.unref/.test(src));
+  check('候选串口含配置路径（USB 换节点也能恢复）',
+    /currentSerialCandidates/.test(src));
 }
 
 section('任务历史不留全量指令（防内存只涨不降）');
