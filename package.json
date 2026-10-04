@@ -1,0 +1,16 @@
+{
+  "name": "plotter-one",
+  "version": "1.0.0",
+  "description": "刻字机 Web 控制服务 — 局域网内用手机或电脑直接驱动刻字机，替代 Windows 专用输出软件",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "selftest": "node server/selftest.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}

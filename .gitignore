@@ -1,0 +1,16 @@
+# 运行时数据（含本机配置，不应进版本库）
+data/
+*.log
+
+# 依赖（本项目零依赖，留着以防万一）
+node_modules/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 编辑器
+.vscode/
+.idea/

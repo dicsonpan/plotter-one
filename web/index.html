@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>刻字机控制台</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232563eb'/><path d='M28 66 L44 34 L56 58 L70 30' stroke='white' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body>
+<div class="app">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">刻</div>
+      <div>
+        <div class="brand-text" style="font-weight:600">刻字机控制台</div>
+        <div class="brand-sub" id="serverInfo">连接中…</div>
+      </div>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="conn-pill" id="connPill">
+      <span class="conn-dot"></span>
+      <span id="connText">未连接</span>
+    </div>
+    <button class="btn btn-sm" id="btnConnectTop">连接设备</button>
+  </header>
+
+  <!-- 左栏：内容 -->
+  <aside class="panel panel-left" id="panelLeft">
+
+    <div class="sect">
+      <h3 class="sect-title">导入文件</h3>
+      <div class="notice notice-info">
+        <span>支持 DXF / SVG / PLT / HPGL / AI 导出的矢量文件。位图请先在设计软件中描摹成矢量。</span>
+      </div>
+      <div class="btn-grid">
+        <button class="btn" id="btnImportFile">选择文件</button>
+        <button class="btn" id="btnImportDemo">载入示例</button>
+      </div>
+      <input type="file" id="fileInput" accept=".dxf,.svg,.plt,.hgl,.hpgl,.txt" style="display:none">
+    </div>
+
+    <div class="sect" id="transformSect" style="display:none">
+      <h3 class="sect-title">对象属性 <span id="selName" style="margin-left:auto;font-weight:400;text-transform:none;letter-spacing:0"></span></h3>
+
+      <div class="prop-row">
+        <label class="prop-k" for="propX">X</label>
+        <input type="number" id="propX" step="0.5">
+        <label class="prop-k" for="propY">Y</label>
+        <input type="number" id="propY" step="0.5">
+      </div>
+
+      <div class="prop-row">
+        <label class="prop-k" for="propW">宽</label>
+        <input type="number" id="propW" step="0.5" min="0.1">
+        <label class="prop-k" for="propH">高</label>
+        <input type="number" id="propH" step="0.5" min="0.1">
+        <button class="prop-lock" id="btnLockRatio" title="锁定宽高比">🔗</button>
+      </div>
+
+      <div class="prop-row">
+        <label class="prop-k" for="propRot">角度</label>
+        <input type="number" id="propRot" step="1" min="-180" max="180">
+        <span class="prop-unit">°</span>
+        <button class="btn btn-sm" id="btnRotateL" title="逆时针 90°">↺</button>
+        <button class="btn btn-sm" id="btnRotateR" title="顺时针 90°">↻</button>
+      </div>
+
+      <div class="prop-label">水平对齐</div>
+      <div class="btn-grid-3">
+        <button class="btn btn-sm" data-align="left" title="左对齐">⇤</button>
+        <button class="btn btn-sm" data-align="hcenter" title="水平居中">⇔</button>
+        <button class="btn btn-sm" data-align="right" title="右对齐">⇥</button>
+      </div>
+      <div class="prop-label" style="margin-top:7px">垂直对齐</div>
+      <div class="btn-grid-3">
+        <button class="btn btn-sm" data-align="bottom" title="底部对齐">⇣</button>
+        <button class="btn btn-sm" data-align="vcenter" title="垂直居中">⇕</button>
+        <button class="btn btn-sm" data-align="top" title="顶部对齐">⇡</button>
+      </div>
+      <div class="btn-grid" style="margin-top:9px">
+        <button class="btn btn-sm" id="btnFlipX">水平翻转</button>
+        <button class="btn btn-sm" id="btnFlipY">垂直翻转</button>
+      </div>
+      <div class="btn-grid-3" style="margin-top:7px">
+        <button class="btn btn-sm" id="btnDupLayer">复制</button>
+        <button class="btn btn-sm" id="btnFrontLayer">置顶</button>
+        <button class="btn btn-sm" id="btnDelLayer">删除</button>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">快速文字</h3>
+      <div class="field">
+        <label class="field-label" for="txtContent">内容</label>
+        <input type="text" id="txtContent" value="SK-2026" placeholder="输入要刻的字">
+      </div>
+      <div class="row">
+        <div class="field">
+          <label class="field-label" for="txtSize">字高 mm</label>
+          <input type="number" id="txtSize" value="30" min="2" max="400" step="1">
+        </div>
+        <div class="field">
+          <label class="field-label" for="txtRot">旋转 °</label>
+          <input type="number" id="txtRot" value="0" min="-180" max="180" step="1">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label class="field-label" for="txtX">起点 X</label>
+          <input type="number" id="txtX" value="40" step="1">
+        </div>
+        <div class="field">
+          <label class="field-label" for="txtY">起点 Y</label>
+          <input type="number" id="txtY" value="40" step="1">
+        </div>
+      </div>
+      <button class="btn btn-primary btn-block" id="btnAddText">加入版面</button>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">图形</h3>
+      <div class="row" style="margin-bottom:9px">
+        <div class="field" style="margin:0">
+          <label class="field-label" for="shpType">类型</label>
+          <select id="shpType">
+            <option value="rect">矩形</option>
+            <option value="circle">圆形</option>
+            <option value="ellipse">椭圆</option>
+            <option value="line">直线</option>
+          </select>
+        </div>
+        <div class="field" style="margin:0">
+          <label class="field-label" for="shpSize">尺寸 mm</label>
+          <input type="number" id="shpSize" value="80" min="1" step="1">
+        </div>
+      </div>
+      <button class="btn btn-block" id="btnAddShape">加入版面</button>
+    </div>
+
+    <div class="sect" style="flex:1">
+      <h3 class="sect-title">版面内容 <span id="layerCount" style="margin-left:auto;font-weight:400"></span></h3>
+      <div class="layers" id="layerList"></div>
+      <div id="layerEmpty" class="empty">
+        <div class="empty-icon">◇</div>
+        版面还是空的<br>导入文件或加点东西
+      </div>
+    </div>
+  </aside>
+
+  <!-- 画布 -->
+  <main class="canvas-wrap" id="canvasWrap">
+    <canvas id="stage"></canvas>
+    <div class="canvas-toolbar">
+      <button class="tool active" data-tool="select">选择</button>
+      <button class="tool" data-tool="pan">平移</button>
+      <button class="tool" id="btnFit">适应窗口</button>
+      <button class="tool" id="btnGridToggle">网格</button>
+    </div>
+    <div class="badge-zoom" id="zoomBadge">100%</div>
+    <div class="canvas-hint" id="canvasHint">滚轮缩放 · 拖拽平移</div>
+  </main>
+
+  <!-- 右栏：机器与控制 -->
+  <aside class="panel panel-right" id="panelRight">
+
+    <div class="sect">
+      <h3 class="sect-title">设备连接</h3>
+      <div class="field">
+        <label class="field-label" for="machineSel">机器型号</label>
+        <select id="machineSel"></select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="connType">连接方式</label>
+        <select id="connType">
+          <option value="serial">USB / 串口（推荐）</option>
+          <option value="tcp">网口 TCP</option>
+          <option value="virtual">内置虚拟机（调试用）</option>
+        </select>
+      </div>
+      <div class="field" id="portWrap">
+        <label class="field-label" for="portSel">串口设备</label>
+        <div class="row">
+          <select id="portSel" style="flex:3"></select>
+          <button class="btn btn-sm" id="btnScanPorts" style="flex:1">刷新</button>
+        </div>
+      </div>
+      <div class="row" id="tcpWrap" style="display:none">
+        <div class="field">
+          <label class="field-label" for="tcpHost">IP</label>
+          <input type="text" id="tcpHost" value="192.168.1.100">
+        </div>
+        <div class="field">
+          <label class="field-label" for="tcpPort">端口</label>
+          <input type="number" id="tcpPort" value="9100">
+        </div>
+      </div>
+      <div class="btn-grid">
+        <button class="btn btn-primary" id="btnConnect">连接</button>
+        <button class="btn" id="btnDisconnect" disabled>断开</button>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">材料参数</h3>
+      <div class="field">
+        <label class="field-label" for="matSel">材料预设</label>
+        <select id="matSel"></select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="speedRange">刻绘速度 <b id="speedVal" style="color:var(--accent)">30</b> mm/s</label>
+        <input type="range" id="speedRange" min="5" max="200" step="1" value="30">
+      </div>
+      <div class="field">
+        <label class="field-label" for="forceRange">刀压 <b id="forceVal" style="color:var(--accent)">250</b> g</label>
+        <input type="range" id="forceRange" min="50" max="500" step="10" value="250">
+      </div>
+      <div class="field">
+        <label class="field-label" for="dirSel">走刀方向</label>
+        <select id="dirSel">
+          <option value="ccw">逆时针（推荐，切口无毛边）</option>
+          <option value="cw">顺时针</option>
+          <option value="alternate">交替（多层防积屑）</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="axisXSel">坐标轴方向（不确定就别改）</label>
+        <div class="row">
+          <select id="axisXSel">
+            <option value="1">X 向右 →</option>
+            <option value="-1">X 向左 ←</option>
+          </select>
+          <select id="axisYSel">
+            <option value="1">Y 向上 ↑</option>
+            <option value="-1">Y 向下 ↓</option>
+          </select>
+        </div>
+        <div class="notice notice-warn" style="margin:8px 0 0">
+          <span>方向设错会导致图形镜像，甚至撞到机器尽头上。
+          <b>不确定就先别开机</b>——先用下方「原点校准」逐项验证。</span>
+        </div>
+      </div>
+
+      <button class="btn btn-block" id="btnCalibrate">原点校准（安全自检）</button>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">手动控制</h3>
+
+      <!-- 方向键：中心是落刀，四周移动。压感强的方块键，
+           跟 Ucancam / 文泰那类软件的操作习惯一致 -->
+      <div class="pad-wrap">
+        <div class="pad" id="pad">
+          <button class="pad-key up"    data-dx="0"  data-dy="1"  title="向上">▲</button>
+          <button class="pad-key left"  data-dx="-1" data-dy="0"  title="向左">◀</button>
+          <button class="pad-key center" data-act="pendown" title="落刀（试刀压）">●</button>
+          <button class="pad-key right" data-dx="1"  data-dy="0"  title="向右">▶</button>
+          <button class="pad-key down"  data-dx="0"  data-dy="-1" title="向下">▼</button>
+        </div>
+        <div class="pad-side">
+          <label class="field-label" for="stepMm">步长 mm</label>
+          <select id="stepMm">
+            <option value="0.1">0.1（微调）</option>
+            <option value="1">1</option>
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+          </select>
+          <div class="pad-hint">按住 <kbd>Shift</kbd> 反向 · 连续点击可连续移动</div>
+        </div>
+      </div>
+
+      <div class="btn-grid-3" style="margin-top:9px">
+        <button class="btn btn-sm" data-manual="penup">抬刀</button>
+        <button class="btn btn-sm" data-manual="home">回原点</button>
+        <button class="btn btn-sm btn-warn" data-manual="setorigin">设原点</button>
+        <button class="btn btn-sm" data-manual="feed" data-dist="50">进纸50</button>
+        <button class="btn btn-sm" data-manual="eject" data-dist="50">出纸50</button>
+        <button class="btn btn-sm" data-manual="end">抬刀回位</button>
+      </div>
+
+      <div class="notice notice-warn" style="margin-top:10px">
+        <span>「设原点」会把当前位置定为新基准，之前的坐标全部作废。
+        「落刀」会在当前位置划入 2mm 试刀压——先放废料，别在成品上试。</span>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">刀路概览</h3>
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-k">总长度</div><div class="stat-v" id="statLen">—</div></div>
+        <div class="stat"><div class="stat-k">图形数</div><div class="stat-v" id="statSubs">—</div></div>
+        <div class="stat"><div class="stat-k">预计耗时</div><div class="stat-v" id="statTime">—</div></div>
+        <div class="stat"><div class="stat-k">指令量</div><div class="stat-v" id="statBytes">—</div></div>
+      </div>
+      <div id="compileWarn"></div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">输出</h3>
+      <div class="btn-grid" style="margin-bottom:9px">
+        <button class="btn" id="btnPreview">预览刀路</button>
+        <button class="btn" id="btnCompile">生成指令</button>
+      </div>
+      <button class="btn btn-ok btn-lg btn-block" id="btnSend" disabled>开始刻绘</button>
+      <div id="jobPanel" style="margin-top:12px; display:none">
+        <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+        <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-2)">
+          <span id="progText">等待中</span>
+          <span id="progEta"></span>
+        </div>
+        <div class="btn-grid-3" style="margin-top:10px">
+          <button class="btn btn-sm" id="btnPause">暂停</button>
+          <button class="btn btn-sm" id="btnStop">停止</button>
+          <button class="btn btn-sm btn-danger" id="btnEstop">急停</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">指令预览</h3>
+      <div class="log" id="gcodeView">生成指令后在此查看</div>
+      <div class="btn-grid" style="margin-top:9px">
+        <button class="btn btn-sm" id="btnCopyCode">复制</button>
+        <button class="btn btn-sm" id="btnSaveCode">下载 PLT</button>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">运行日志</h3>
+      <div class="log" id="logView">等待操作</div>
+    </div>
+
+    <div class="sect">
+      <h3 class="sect-title">在手机上使用</h3>
+      <div class="qr-hint" id="qrHint">
+        同一 Wi-Fi 下，手机浏览器打开本机地址即可控制这台刻字机，无需安装任何 App。
+      </div>
+    </div>
+  </aside>
+
+  <!-- 移动端标签栏 -->
+  <nav class="mobile-tabs" id="mtabs">
+    <button class="mtab" data-panel="left"><span class="mtab-ico">◫</span>内容</button>
+    <button class="mtab active" data-panel="none"><span class="mtab-ico">▦</span>画布</button>
+    <button class="mtab" data-panel="right"><span class="mtab-ico">⚙</span>控制</button>
+  </nav>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<!-- 全部用原生 ES module：浏览器直接支持，零构建，且前端与服务端
+     共用同一份几何内核（web/geom.js 是 server/geom/path.js 的副本，
+     由 deploy/sync-geom.sh 同步）。共用是必须的，否则会出现
+     「屏幕上在这里、刻出来在那里」的错位。 -->
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
