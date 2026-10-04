@@ -16,6 +16,25 @@
  * 3. 力宇是 2D 刻字机：XY 两轴 + 刀压升降。没有 Z，所以不需要 G-code 的
  *    抬刀高度、也没有 Z 轴补偿。整条链路是「轮廓切割」，不是「区域铣削」。
  *
+ * 🔴🔴 坐标轴方向：最容易造成「撞机 / 飞车」的地方，务必读完再改
+ *
+ *   曾经踩过：为了镜像 X 轴，代码发 `SC23622,0,...`（Xmin > Xmax）。
+ *   HP-GL 规范确实允许 Xmin>Xmax 表示镜像，**但力宇固件不支持**——
+ *   它照样按 Xmax-Xmin 算每单位步数，分母为负 → 整机得到一个**负缩放系数**。
+ *   后果不是「图形镜像」，而是回原点时 Y 轴疯狂转动、X 轴朝反方向狂奔。
+ *   那是负缩放导致的失控，不是方向填错。
+ *
+ *   正确做法（现在的代码）：
+ *     1. `SC` **永远正序**（Xmin < Xmax、Ymin < Ymax），不给固件任何歧义；
+ *     2. 方向差异全部在**上位机**做——用户坐标(mm) → 机器坐标(mm) 的仿射变换，
+ *        见 `toMachine()` / `toMachineDelta()`；
+ *     3. 圆弧在反射变换下绕向会反转，`arcTo()` 用「顺时针 s 段 ≡ 逆时针 (360-s) 段」
+ *        换算，保证 AA 仍然只发逆时针。
+ *
+ *   这样固件看到的永远是「正序 SC + 正常坐标」，方向对错只影响我们发什么数字，
+ *   不会让机器进入失控状态。方向仍然可配置——它决定「发什么」，
+ *   但不再决定「怎么跟机器说话」。
+ *
  * 指令速查（刻字机实际会用到的子集）：
  *   IN        初始化
  *   SP1       选刀（刻字机只有一把刀，SP1 即可；SP0 收起）
@@ -61,16 +80,22 @@ export const MACHINE_PRESETS = {
     width: 600, height: 710,
     stepsPerInch: 1000,
     dialect: 'hpgl',
-    // 实测：这台机器的原点在**右侧**（用户 2026-10-04 上机验证）。
-    // 所以用户坐标 +X 对应物理向左，必须发 SC 时让 Xmin > Xmax（HP-GL 镜像）。
-    // 这是从「图形一直往左走直到撞机」反推出来的——原先假设 P1 在左下角是错的。
+    // 实测（2026-10-04，用户上机确认）：这台机器的机械原点在**用户的右手边**。
+    //
+    // 「正对机器时右手边」= 站在机器前看，原点在右侧。
+    // 也就是说机器坐标 x 增大的方向是**向左**，与用户坐标相反 → X 需要镜像。
+    //
+    // 🔴 但镜像只在**上位机**做（toMachine 里 x → width - x），
+    //    绝不能靠发 SC23622,0,... 让固件自己镜像——固件不支持，
+    //    会算出负缩放系数，回原点时 Y 轴飞转、X 轴狂奔。
+    //    这里的 axisX 只影响「发什么坐标」，不影响「怎么跟机器说话」。
     axisX: -1,
     axisY: 1,
     serialDefault: { baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 10, max: 500, default: 250, unit: 'g' },
     note: 'AU 版海外规格表标称刻绘 600mm / 进纸 710mm。'
-        + '本机实测原点在右侧，故 X 轴反向。',
+        + '本机实测机械原点在用户右手边，故 X 轴在上位机做镜像（SC 仍为正序）。',
   },
   'liyue-sc631e': {
     id: 'liyue-sc631e',
@@ -179,7 +204,7 @@ export class HpglBuilder {
     this.spi = preset.stepsPerInch;
     this.originMode = options.originMode || 'user'; // 'user' = 按材料坐标
     // 轴向：+1 常规, -1 反向。由 preset 提供默认值，用户可在界面覆盖。
-    // 不可假定——P1 在哪个角由机器硬件决定，见 setupCoords 的说明。
+    // 不可假定——原点位置与轴向是机器硬件属性，见文件头与 toMachine 的说明。
     this.axisX = options.axisX !== undefined ? options.axisX
                  : (preset.axisX !== undefined ? preset.axisX : 1);
     this.axisY = options.axisY !== undefined ? options.axisY
@@ -191,31 +216,66 @@ export class HpglBuilder {
     this.bytes = 0;
   }
 
+  // -------------------------------------------------------------------------
+  // 坐标变换：用户坐标(mm) → 机器坐标(mm)
+  // -------------------------------------------------------------------------
+  /**
+   * 绝对坐标变换。
+   *
+   * 用户坐标约定：原点在材料**左下角**，X 向右，Y 向上（与画布一致）。
+   * 机器坐标由 SC 正序定义，机器固件只认「x 增大 = 机器 x 增大」。
+   *
+   * 所以方向差异必须在这里（上位机）消化掉：
+   *   - axisX = -1：机器原点在用户右手边，x 增大要往左走 → x → width - x
+   *   - axisY = -1：y 增大要往下走 → y → height - y
+   *
+   * 关键点：**SC 始终正序**。固件永远只看到一个正常的坐标系，
+   * 方向填错的后果仅限于「图形镜像」，而不会像反向 SC 那样
+   * 让固件算出负缩放、进而回原点时飞车。
+   */
+  toMachine(x, y) {
+    const w = this.preset.width;
+    const h = this.preset.height;
+    return {
+      x: this.axisX >= 0 ? x : (w - x),
+      y: this.axisY >= 0 ? y : (h - y),
+    };
+  }
+
+  /**
+   * 相对位移变换。
+   *
+   * 与 toMachine 的区别：位移只有方向，没有位置，所以**不**做 width-x 偏移，
+   * 只翻符号。手动方向键、PR 增量走刀都必须走这里——
+   * 早先的手动 jog 误用了绝对 moveTo，在镜像机器上会变成「朝原点狂冲」。
+   */
+  toMachineDelta(dx, dy) {
+    return {
+      dx: this.axisX >= 0 ? dx : -dx,
+      dy: this.axisY >= 0 ? dy : -dy,
+    };
+  }
+
   emit(str) {
     this.cmds.push(str);
     this.bytes += str.length;
     return this;
   }
 
-  /** 坐标系设置：把 mm 直接作为用户单位，机器端做换算 */
   /**
    * 设置坐标系。
    *
-   * 🔴 SC 指令的语义（这是踩过坑的地方）：
+   * 🔴 SC 的语义（这是踩过坑的地方）：
    *   SC Xmin, Xmax, Ymin, Ymax
    * 里的 Xmin/Ymin 映射到**物理点 P1**，Xmax/Ymax 映射到**物理点 P2**。
    * P1 在机器的哪个角，是由硬件与面板设置决定的，**不是我们能假定的**。
    *
-   * 早期版本直接发 SC0,W,0,H，等于假定「P1 在左下角」。
-   * 用户实测这台 SC631-AU 的原点在**右边**，于是用户坐标 0 对应物理右侧，
-   * X 增大的方向朝左——图形越画越往左，直到撞机。
+   * HP-GL 规范允许 Xmin > Xmax 来表达「X 轴镜像」，但**力宇固件不支持**：
+   * 它仍按 Xmax-Xmin 计算每单位步数，负分母直接产生负缩放系数。
+   * 实测症状：回原点时 Y 轴疯狂转动、X 轴朝反方向狂奔（2026-10-04）。
    *
-   * HP-GL 规范允许 Xmin > Xmax，语义就是「X 轴反向」（镜像）。
-   * 所以正确做法是把轴向做成可配置项，由用户在界面上按实际机器选，
-   * 而不是在这里替用户猜死。
-   *
-   * axisX: +1 用户坐标 +X 对应物理向右（常规）, -1 反向
-   * axisY: +1 用户坐标 +Y 对应物理向上（常规）, -1 反向
+   * 所以这里**永远发正序 SC**，方向差异交给 toMachine() 在上位机处理。
+   * 这样即便方向设错，最坏也只是图形镜像，不会让机器失控撞机。
    */
   setupCoords(origin) {
     const w = this.preset.width;
@@ -227,24 +287,12 @@ export class HpglBuilder {
     }
     this.emit('SP1;');
 
-    if (this.originMode === 'user') {
-      const ax = this.axisX >= 0 ? 1 : -1;
-      const ay = this.axisY >= 0 ? 1 : -1;
-      // 轴向为 -1 时交换 P1/P2 的位置，即 Xmin > Xmax（HP-GL 定义的镜像）
-      const x0 = toPlotterUnits(origin.x, this.spi);
-      const y0 = toPlotterUnits(origin.y, this.spi);
-      const x1 = toPlotterUnits(origin.x + w, this.spi);
-      const y1 = toPlotterUnits(origin.y + h, this.spi);
-      this.emit(`SC${ax > 0 ? x0 : x1},${ax > 0 ? x1 : x0},${ay > 0 ? y0 : y1},${ay > 0 ? y1 : y0};`);
-    } else {
-      const ax = this.axisX >= 0 ? 1 : -1;
-      const ay = this.axisY >= 0 ? 1 : -1;
-      const xa = toPlotterUnits(ax > 0 ? 0 : w, this.spi);
-      const xb = toPlotterUnits(ax > 0 ? w : 0, this.spi);
-      const ya = toPlotterUnits(ay > 0 ? 0 : h, this.spi);
-      const yb = toPlotterUnits(ay > 0 ? h : 0, this.spi);
-      this.emit(`SC${xa},${xb},${ya},${yb};`);
-    }
+    // 正序：Xmin < Xmax、Ymin < Ymax。任何情况下都不反转。
+    const x0 = toPlotterUnits(origin.x, this.spi);
+    const y0 = toPlotterUnits(origin.y, this.spi);
+    const x1 = toPlotterUnits(origin.x + w, this.spi);
+    const y1 = toPlotterUnits(origin.y + h, this.spi);
+    this.emit(`SC${Math.min(x0, x1)},${Math.max(x0, x1)},${Math.min(y0, y1)},${Math.max(y0, y1)};`);
     this.emit('LT;');
     return this;
   }
@@ -275,36 +323,67 @@ export class HpglBuilder {
   }
 
   moveTo(x, y) {
-    const px = toPlotterUnits(x, this.spi);
-    const py = toPlotterUnits(y, this.spi);
+    const p = this.toMachine(x, y);
+    const px = toPlotterUnits(p.x, this.spi);
+    const py = toPlotterUnits(p.y, this.spi);
     this.emit(`PA${px},${py};`);
     this.pos = { x: px, y: py };
     return this;
   }
 
   lineTo(x, y) {
-    const px = toPlotterUnits(x, this.spi);
-    const py = toPlotterUnits(y, this.spi);
+    const p = this.toMachine(x, y);
+    const px = toPlotterUnits(p.x, this.spi);
+    const py = toPlotterUnits(p.y, this.spi);
     if (!this.penDown) { this.emit('PD;'); this.penDown = true; }
     this.emit(`PA${px},${py};`);
     this.pos = { x: px, y: py };
     return this;
   }
 
-  /** 绝对圆弧：AA cx,cy,起始角,结束角（角度制，逆时针为正） */
+  /**
+   * 绝对圆弧：AA cx,cy,起始角,扫掠角（角度制，只能逆时针）
+   *
+   * 🔴 镜像（反射变换）有两个坑，都必须处理：
+   *
+   *   1. **绕向翻转**：X 镜像 x→w-x 是反射，会把用户坐标里逆时针的弧
+   *      变成机器坐标里顺时针的弧。而 HP-GL 的 AA 只能逆时针。
+   *      换算：顺时针 s 段 ≡ 逆时针 (360-s) 段，落点与圆弧完全一致。
+   *
+   *   2. **起始角也要镜像**：起点角 a0 在反射后不再是 a0。
+   *      （X 镜像：a0 → 180-a0；Y 镜像：a0 → -a0）
+   *      起点角发错，固件会从当前位置直线拉到「算出来的圆弧起点」——
+   *      也就是凭空多刻一条不在设计里的线。
+   *
+   * 起点角不手算，直接由**当前实际位置**与映射后的圆心反解：
+   * 当前点必然是 runSubpath 走出来的、已经映射过的真实位置，
+   * 这样起点角与实际位置永远自洽，不依赖任何角度变换公式。
+   */
   arcTo(cx, cy, r, a0, a1) {
-    const cxq = toPlotterUnits(cx, this.spi);
-    const cyq = toPlotterUnits(cy, this.spi);
+    const c = this.toMachine(cx, cy);
+    const cxq = toPlotterUnits(c.x, this.spi);
+    const cyq = toPlotterUnits(c.y, this.spi);
     const rq = toPlotterUnits(r, this.spi);
     if (!this.penDown) { this.emit('PD;'); this.penDown = true; }
-    // HPGL 角度为逆时针度数，且 Y 轴向上为正
-    const d0 = Math.round(normAngle(a0) / DEG);
+
+    // 起点角由当前点反解（atan2 结果规范化到 0-360）
+    let d0 = Math.round(Math.atan2(this.pos.y - cyq, this.pos.x - cxq) / DEG) % 360;
+    if (d0 < 0) d0 += 360;
+
+    // 扫掠角：反射则取反，再统一成「逆时针为正」
     let sweep = (a1 - a0) / DEG;
-    // HPGL 圆弧只能逆时针；顺时针需转为「负角」
-    if (sweep < 0) sweep = 360 + sweep;
+    const reflected = (this.axisX < 0) !== (this.axisY < 0);
+    if (reflected) sweep = -sweep;
+    if (Math.abs(sweep) >= 360 - 1e-9) {
+      sweep = 360;              // 整圆：不能被换算成 0（那会退化成零长度弧）
+    } else if (sweep < 0) {
+      sweep += 360;
+    }
     const d1 = Math.round(sweep);
     this.emit(`AA${cxq},${cyq},${d0},${d1};`);
-    const endA = a0 + (d1 * DEG);
+
+    // 终点按实际下发的扫掠角推算（绕向换算过，与原始 a1 可能不同）
+    const endA = d0 * DEG + d1 * DEG;
     this.pos = { x: cxq + rq * Math.cos(endA), y: cyq + rq * Math.sin(endA) };
     return this;
   }
@@ -331,11 +410,20 @@ export class HpglBuilder {
     return this;
   }
 
+  /**
+   * 整圆：CI 以**当前位置**为起点画圆，所以必须先把笔移到映射后的圆心位置。
+   *
+   * 圆是镜像不变的（反射后仍是同一个圆），所以半径不用改，
+   * 但圆心坐标要经过 toMachine——否则镜像机器上整圆会跑到材料另一头。
+   */
   circleAt(x, y, r) {
+    const c = this.toMachine(x, y);
+    this.moveTo(c.x, c.y);
     if (!this.penDown) { this.emit('PD;'); this.penDown = true; }
     const rq = toPlotterUnits(r, this.spi);
     this.emit(`CI${rq};`);
-    this.pos = { x: toPlotterUnits(x + r, this.spi), y: toPlotterUnits(y, this.spi) };
+    // CI 结束在圆心正右方（机器坐标），记录真实终点供后续闭合判断
+    this.pos = { x: toPlotterUnits(c.x + r, this.spi), y: toPlotterUnits(c.y, this.spi) };
     return this;
   }
 
@@ -370,15 +458,14 @@ export class HpglBuilder {
    *
    * 刻完必须机械归位，否则下次开机的位置不对，材料会刻歪。
    * 所以这里统一用 !PG;，不管当前 SC 怎么设。
+   *
+   * `!PG` 是机器的**物理**动作，不经过任何坐标换算，
+   * 因此它对轴向设置免疫——这也是方向填错时它仍然安全的原因。
    */
   home() {
     this.penUp();
-    if (this.dialect === 'dmpl' || this.dialect === 'dmpl3d') {
-      // DM-PL 同样用 !PG
-      this.emit('!PG;');
-    } else {
-      this.emit('!PG;');
-    }
+    // DMPL 与 HPGL 都用 !PG；力宇的归位不依赖 SC
+    this.emit('!PG;');
     return this;
   }
 

@@ -92,6 +92,20 @@ function getPreset(id) {
   return MACHINE_PRESETS[id] || MACHINE_PRESETS[config.machineId] || MACHINE_PRESETS['liyue-sc630'];
 }
 
+/**
+ * 当前生效的轴向配置。
+ *
+ * 优先级：用户在界面/校准向导里保存的值（config）> 机型预设默认值。
+ * 所有生成指令的入口都必须经过这里，避免「界面改了但指令没变」。
+ */
+function axisOptions() {
+  const preset = getPreset(config.machineId);
+  return {
+    axisX: config.axisX !== undefined ? config.axisX : (preset.axisX ?? 1),
+    axisY: config.axisY !== undefined ? config.axisY : (preset.axisY ?? 1),
+  };
+}
+
 function broadcast(type, payload) {
   wss.broadcast({ type, payload, t: Date.now() });
 }
@@ -315,6 +329,10 @@ const routes = {
       speedMmPerSec: speed,
       force,
       origin: body.origin || { x: 0, y: 0 },
+      // 🔴 必须把轴向配置传进去。
+      // 之前这里漏传，界面上的「坐标轴方向」下拉框对实际输出毫无作用——
+      // 改完看着没变化，很容易误判成「机器有问题」。
+      ...axisOptions(),
     });
 
     const time = estimateTime(compiled.path, speed);
@@ -361,8 +379,7 @@ const routes = {
 
     const text = buildCalibrationStep(preset, {
       dir,
-      axisX: config.axisX !== undefined ? config.axisX : (preset.axisX ?? 1),
-      axisY: config.axisY !== undefined ? config.axisY : (preset.axisY ?? 1),
+      ...axisOptions(),
     });
     const id = engine.enqueue({
       name: `校准·${dir}`,
@@ -384,7 +401,9 @@ const routes = {
     const preset = getPreset(config.machineId);
     let built;
     try {
-      built = buildManualCommand(preset, body);
+      // 手动方向键必须与图形输出用同一套轴向设置，
+      // 否则会出现「画布上往右、方向键往左」的错位。
+      built = buildManualCommand({ ...preset, ...axisOptions() }, body);
     } catch (err) {
       return sendJson(res, 400, { error: '指令生成失败：' + err.message });
     }

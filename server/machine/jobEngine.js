@@ -222,13 +222,21 @@ export class JobEngine extends EventEmitter {
     }
   }
 
-  /** 急停：立刻断流并抬刀 */
+  /**
+   * 急停：立刻断流并抬刀。
+   *
+   * 🔴 急停只发 `PU;`（抬刀），**不发任何 PA 移动指令**。
+   * 原实现在这里写 `PU;PA0,0;`——`PA0,0` 是一次真实的绝对移动，
+   * 会在急停时把刀头拽向 P1 点。急停的第一原则是「不再产生任何运动」，
+   * 移动指令必须在急停路径上彻底消失。
+   * 位置由操作者在恢复后手动「回原点」处理。
+   */
   emergencyStop() {
     this.queue = [];
     this.setState(JobState.STOPPING);
-    this.pushLog('⛔ 急停');
+    this.pushLog('⛔ 急停（已抬刀，未发送任何移动指令）');
     if (this.transport.open) {
-      this.transport.write('PU;PA0,0;\n').catch(() => {});
+      this.transport.write('PU;\n').catch(() => {});
     }
   }
 }

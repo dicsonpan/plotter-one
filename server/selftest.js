@@ -16,6 +16,7 @@ import {
 } from './geom/path.js';
 import { MACHINE_PRESETS, HpglBuilder, compileToPlotterLanguage } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
+import { buildManualCommand } from './machine/manual.js';
 import { parseHpgl } from './import/hpglReader.js';
 import { parseDxf } from './import/dxf.js';
 import { parseSvgPath } from './import/svg.js';
@@ -425,47 +426,126 @@ section('串口写入路径（曾经从未被测到）');
   check('未连接时给出明确错误', errMsg === '串口未连接', `实际「${errMsg}」`);
 }
 
-section('坐标轴方向（曾因假定 P1 在左下角而撞机）');
+section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X 轴狂奔）');
 {
   const au = MACHINE_PRESETS['liyue-sc631-au'];
   const seg = { subpaths: [{ start: { x: 0, y: 0 }, elems: [{ type: 'line', x1: 0, y1: 0, x2: 100, y2: 0 }], closed: false }] };
 
-  // SC 的 Xmin 映射到物理 P1。X 轴反向时必须 Xmin > Xmax（HP-GL 定义的镜像）
   const scOf = (opts) => {
     const t = compileToPlotterLanguage(seg, au, opts).text;
     return t.match(/SC(-?\d+),(-?\d+),(-?\d+),(-?\d+);/);
   };
 
-  const normal = scOf({ axisX: 1, axisY: 1 });
-  check('常规轴向 Xmin < Xmax', normal && +normal[1] < +normal[2], normal && normal[0]);
+  /**
+   * 🔴 核心安全断言：SC 必须**永远正序**。
+   *
+   * 这里原来断言的是「X 反向时 Xmin > Xmax」——那正是 bug 本身。
+   * 力宇固件不支持反向 SC，会算出负缩放系数，回原点时 Y 轴疯狂转动、
+   * X 轴朝反方向狂奔（2026-10-04 实机确认）。
+   * 方向差异改由上位机 toMachine() 处理，SC 只负责正序声明坐标系。
+   */
+  for (const [label, opts] of [
+    ['常规', { axisX: 1, axisY: 1 }],
+    ['X 反向', { axisX: -1, axisY: 1 }],
+    ['Y 反向', { axisX: 1, axisY: -1 }],
+    ['双向反向', { axisX: -1, axisY: -1 }],
+  ]) {
+    const m = scOf(opts);
+    check(`${label}轴向下 SC 仍为正序（固件安全）`,
+      m && +m[1] < +m[2] && +m[3] < +m[4], m && m[0]);
+  }
 
-  const flipX = scOf({ axisX: -1, axisY: 1 });
-  check('X 反向时 Xmin > Xmax（镜像）', flipX && +flipX[1] > +flipX[2], flipX && flipX[0]);
-
-  const flipY = scOf({ axisX: 1, axisY: -1 });
-  check('Y 反向时 Ymin > Ymax', flipY && +flipY[3] > +flipY[4], flipY && flipY[0]);
-
-  check('SC 无 NaN', normal && !/NaN/.test(normal[0]));
+  check('SC 无 NaN', scOf({ axisX: -1, axisY: -1 }) && !/NaN/.test(scOf({ axisX: -1, axisY: -1 })[0]));
   check('SC 覆盖整个幅面（用户单位=mm）',
-    normal && +normal[2] === Math.round(au.width / 25.4 * au.stepsPerInch),
-    normal && `Xmax=${normal[2]}`);
+    +scOf({ axisX: 1, axisY: 1 })[2] === Math.round(au.width / 25.4 * au.stepsPerInch),
+    `Xmax=${scOf({ axisX: 1, axisY: 1 })[2]}`);
 
-  // 关键安全项：回原点必须用机械归位指令，不能用 PA0,0
-  // （SC 反向后 PA0,0 指向 P1，即右端，不是机械原点）
-  const h = new HpglBuilder(au, { axisX: -1 }).home();
+  // 方向差异必须体现在**坐标**上，而不是 SC 上
+  const bNormal = new HpglBuilder(au, { axisX: 1 });
+  const bFlip = new HpglBuilder(au, { axisX: -1 });
+  check('X 反向时 SC 与常规完全一致（差异只在坐标）',
+    bNormal.setupCoords({ x: 0, y: 0 }).cmds[2] === bFlip.setupCoords({ x: 0, y: 0 }).cmds[2],
+    `${bNormal.cmds[2]} vs ${bFlip.cmds[2]}`);
+  check('X 反向时用户 x=0 映射到机器右端（width）',
+    bFlip.toMachine(0, 0).x === au.width, `实际 ${bFlip.toMachine(0, 0).x}`);
+  check('X 反向时用户 x=width 映射到机器 0',
+    bFlip.toMachine(au.width, 0).x === 0, `实际 ${bFlip.toMachine(au.width, 0).x}`);
+  check('常规轴向下 x=0 映射到机器 0',
+    bNormal.toMachine(0, 0).x === 0, `实际 ${bNormal.toMachine(0, 0).x}`);
+  check('相对位移只翻符号、不做 width-x 偏移',
+    bFlip.toMachineDelta(5, 0).dx === -5 && bNormal.toMachineDelta(5, 0).dx === 5,
+    JSON.stringify({ flip: bFlip.toMachineDelta(5, 0), normal: bNormal.toMachineDelta(5, 0) }));
+
+  // 关键安全项：回原点必须是纯机械归位，不带任何坐标指令
+  const h = new HpglBuilder(au, { axisX: -1 });
+  h.setupCoords({ x: 0, y: 0 }); h.home();
   check('回原点用 !PG（机械归位）而非 PA0,0',
     h.cmds.some((c) => c.includes('!PG')) && !h.cmds.some((c) => c.includes('PA0,0')),
     h.cmds.join(' '));
 
-  // 校准指令必须小步、抬刀
+  // 手动「回原点」绝不能带 IN / SC：归位是纯物理动作，不该掺入坐标系假设
+  const mh = buildManualCommand(au, { action: 'home' });
+  check('手动回原点只发 PU + !PG（不含 IN/SC）',
+    !/\bIN;/.test(mh.text) && !/\bSC/.test(mh.text) && mh.text.includes('!PG'),
+    mh.text.replace(/\n/g, ' ').trim());
+
+  // 手动 jog 必须是相对移动，且收尾不能把刀头拽回原点
+  const mv = buildManualCommand(au, { action: 'move', dx: 5, dy: 0 });
+  check('手动 jog 用 PR 相对移动（非 PA 绝对跳变）',
+    /PR-?197,0;/.test(mv.text) && !/PA-?\d+,-?\d+;/.test(mv.text),
+    mv.text.replace(/\n/g, ' ').trim());
+  check('手动 jog 收尾只切模式、不移动到原点',
+    mv.text.includes('PA;') && !mv.text.includes('PA0,0'),
+    mv.text.replace(/\n/g, ' ').trim());
+
+  // 落刀试压必须是相对 2mm：原来是绝对 lineTo(2,0)，落刀状态下会划穿材料
+  const pd = buildManualCommand(au, { action: 'pendown' });
+  check('落刀试压为相对 2mm，不做绝对移动',
+    /PD;/.test(pd.text) && /PR-?79,0;/.test(pd.text) && !/PA-?\d+,-?\d+;/.test(pd.text),
+    pd.text.replace(/\n/g, ' ').trim());
+
+  // 校准指令必须小步、抬刀、纯相对
   const cal = buildCalibrationStep(au, { dir: 'x+', axisX: 1, axisY: 1 });
   check('校准指令全程抬刀（不含 PD）', !cal.includes('PD'), cal.replace(/\n/g, ' ').slice(0, 70));
-  // 从中心走 5mm 再回来，X 方向的往返差必须正好是 5mm 换算成 197 单位
-  const pas = [...cal.matchAll(/PA(-?\d+),(-?\d+);/g)].map((m) => [+m[1], +m[2]]);
-  const dx = Math.abs(pas[1][0] - pas[0][0]);
-  check('校准位移为 5mm（197 单位）', dx === 197, `实测 ${dx} 单位 = ${(dx / au.stepsPerInch * 25.4).toFixed(2)}mm`);
-  check('校准走完能回到起点', pas[0][0] === pas[2][0] && pas[0][1] === pas[2][1],
-    JSON.stringify(pas));
+  check('校准走完能回到起点（往返增量互相抵消）',
+    (() => {
+      const pr = [...cal.matchAll(/PR(-?\d+),(-?\d+);/g)].map((m) => [+m[1], +m[2]]);
+      return pr.length === 2 && pr[0][0] === -pr[1][0] && pr[0][1] === -pr[1][1];
+    })(), cal.replace(/\n/g, ' ').trim());
+  check('校准位移为 5mm（197 单位）',
+    (() => {
+      const m = cal.match(/PR(-?\d+),(-?\d+);/);
+      return m && Math.abs(+m[1]) === 197;
+    })(), cal.replace(/\n/g, ' ').trim());
+  check('校准不含绝对定位（未归位也安全）', !/PA\d/.test(cal), cal.replace(/\n/g, ' ').trim());
+}
+
+section('镜像下的几何往返（反射会翻转圆弧绕向）');
+{
+  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  // 四种轴向组合下，编译再解析回几何都必须无损
+  for (const [ax, ay] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+    const p = circleToPath(300, 300, 25);
+    const built = compileToPlotterLanguage(p, au, { axisX: ax, axisY: ay });
+    const back = parseHpgl(built.text, { stepsPerInch: au.stepsPerInch });
+    const e = back.path.subpaths[0]?.elems?.[0];
+    check(`整圆往返（axisX=${ax}, axisY=${ay}）长度误差 <1%`,
+      Math.abs(pathLength(back.path) - pathLength(p)) / pathLength(p) < 0.01,
+      `误差 ${((pathLength(back.path) - pathLength(p)) / pathLength(p) * 100).toFixed(3)}%`);
+    check(`整圆往返（axisX=${ax}, axisY=${ay}）半径不变`,
+      e && e.r > 24 && e.r < 26, `半径 ${e?.r}`);
+  }
+
+  // 直线在镜像下应落到对称位置（x → width - x），且长度不变
+  const mk = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 300); p.subpaths.push(s); return p; };
+  const backFlip = parseHpgl(
+    compileToPlotterLanguage(mk(), au, { axisX: -1, axisY: 1 }).text,
+    { stepsPerInch: au.stepsPerInch }).path;
+  const bbF = pathBBox(backFlip);
+  check('镜像后直线长度不变', Math.abs(bbF.w - 400) < 0.5 && Math.abs(bbF.h - 300) < 0.5,
+    `${bbF.w.toFixed(1)}×${bbF.h.toFixed(1)}`);
+  check('镜像后直线落到对称位置（x 偏移 = width - 400）',
+    Math.abs(bbF.minX - (au.width - 400)) < 0.5, `minX=${bbF.minX.toFixed(1)}`);
 }
 
 section('任务引擎');

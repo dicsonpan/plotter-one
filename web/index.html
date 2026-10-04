@@ -230,20 +230,21 @@
       </div>
 
       <div class="field">
-        <label class="field-label" for="axisXSel">坐标轴方向（不确定就别改）</label>
+        <label class="field-label" for="axisXSel">坐标轴方向（不确定就用下方校准，别猜）</label>
         <div class="row">
           <select id="axisXSel">
-            <option value="1">X 向右 →</option>
-            <option value="-1">X 向左 ←</option>
+            <option value="1">X 正向 = 往右 →</option>
+            <option value="-1">X 正向 = 往左 ←</option>
           </select>
           <select id="axisYSel">
-            <option value="1">Y 向上 ↑</option>
-            <option value="-1">Y 向下 ↓</option>
+            <option value="1">Y 正向 = 材料往里</option>
+            <option value="-1">Y 正向 = 材料往外</option>
           </select>
         </div>
         <div class="notice notice-warn" style="margin:8px 0 0">
-          <span>方向设错会导致图形镜像，甚至撞到机器尽头上。
-          <b>不确定就先别开机</b>——先用下方「原点校准」逐项验证。</span>
+          <span>这里只影响<b>发什么坐标</b>，不会让机器失控——设错最坏是图形镜像。
+          但<b>方向没确认前不要上料刻字</b>。先点下方「原点校准」，
+          全程抬刀、只走 5mm，来回一次，很安全。</span>
         </div>
       </div>
 

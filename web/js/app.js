@@ -750,11 +750,11 @@ if (typeof window !== 'undefined') {
     if (!state.connected) { toast('设备未连接', 'err'); return; }
     const askText = {
       'x+': '刀头是往「右」移动了吗？',
-      'y+': '刀头是往「上」移动了吗？',
+      'y+': '材料是往「里」走（远离你）了吗？',
     }[dir];
     const ans = await confirmSafe(
-      `即将测试：刀头从材料中心向${dir[0] === 'x' ? '右' : '上'}移动 5mm\n` +
-      `全程抬刀，不落刀、不划伤材料。\n\n准备好了点「确定」。`
+      `即将测试：${dir[0] === 'x' ? '刀头' : '材料'}向${dir[0] === 'x' ? '右' : '里'}移动 5mm，然后自动返回。\n` +
+      `全程抬刀，不落刀、不划伤材料；用的是相对移动，没归位也安全。\n\n准备好了点「确定」。`
     );
     if (!ans) return;
     try {
@@ -771,13 +771,14 @@ if (typeof window !== 'undefined') {
   function showCalibResult(dir, askText) {
     const box = document.createElement('div');
     box.className = 'modal-bg';
+    const yesLabel = dir === 'x+' ? '是，往右走了' : '是，往里走了';
     box.innerHTML = `
       <div class="modal" style="width:min(420px,100%)">
         <div class="modal-head">校准结果</div>
         <div class="modal-body">
           <p style="margin:0 0 14px; font-size:14px">${askText}</p>
           <div class="btn-grid" style="grid-template-columns:1fr 1fr">
-            <button class="btn btn-ok" data-r="yes">${dir === 'x+' ? '是，往右走了' : '是，往上走了'}</button>
+            <button class="btn btn-ok" data-r="yes">${yesLabel}</button>
             <button class="btn btn-warn" data-r="no">不是，方向反了</button>
           </div>
           <p style="margin:14px 0 0;font-size:12px;color:var(--text-2)">
@@ -806,9 +807,20 @@ if (typeof window !== 'undefined') {
   const confirmSafe = (msg) => confirm(msg);
 
   function wireAxisCalibration() {
-    $('btnCalibrate').addEventListener('click', () => {
+    /**
+     * 校准向导：依次测 X、Y 两步。
+     * 原来只测 X 就结束，用户以为校准完了，实际 Y 方向仍是猜的——
+     * 而这台机器的走纸（Y）方向恰恰是最容易设反的那个。
+     */
+    $('btnCalibrate').addEventListener('click', async () => {
       if (!state.connected) { toast('设备未连接', 'err'); return; }
-      runCalibration('x+');
+      await runCalibration('x+');
+      // 第一步答完后再问要不要继续测 Y，避免一次性弹两个框把人搞晕
+      if (await confirmSafe('X 轴已确认。\n\n接着测 Y 轴（走纸方向）吗？\n同样是 5mm、抬刀、来回一次。')) {
+        await runCalibration('y+');
+      } else {
+        toast('已跳过 Y 轴。方向没确认前不要上料刻字。', 'warn');
+      }
     });
     $('axisXSel').addEventListener('change', () => {
       api('/api/config', { method: 'POST', body: { axisX: +$('axisXSel').value } })
