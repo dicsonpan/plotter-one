@@ -371,6 +371,9 @@ class Renderer {
       let prevPt = null;
       for (const sub of path.subpaths) {
         const pts = G.flattenSubpathOpen(sub, 0.08);
+        // 空子路径直接跳过：pts 不足 2 点时 pts[pts.length-1] 是 undefined，
+        // 后面算距离会得到 NaN，污染 total 与动画进度。
+        if (pts.length < 2) { continue; }
         for (let i = 1; i < pts.length; i++) {
           const a = pts[i - 1], b = pts[i];
           const d = Math.hypot(b.x - a.x, b.y - a.y);
@@ -378,8 +381,7 @@ class Renderer {
           segs.push({ a, b, len: d, cum: total + d, cut: true });
           total += d;
         }
-        // 快移：抬刀到下一段起点
-        if (i < pts.length) { /* noop */ }
+        // 快移：抬刀到下一段起点（cut:false，动画里画成虚线）
         const last = pts[pts.length - 1];
         if (prevPt) {
           const d = Math.hypot(last.x - prevPt.x, last.y - prevPt.y);

@@ -532,16 +532,52 @@ export class HpglBuilder {
     return this;
   }
 
+  /**
+   * 生成完整任务指令。
+   *
+   * 🔴 **开头必须先机械归位**（2026-10-04 实机踩到，症状：刀一直往一个方向
+   * 狂奔直到卡死，Y 轴不动）。
+   *
+   * 原因：任务的第一条运动指令是 `PA x,y`，那是**绝对定位**。
+   * 而机器开刀前停在哪是不确定的（上次刻完的位置、手动挪过的位置、
+   * 甚至断电重启后的未知位置）。从「未知位置」跳到「图形起点」，
+   * 距离和方向都不可控，机器会一路撞向限位开关。
+   *
+   * 用户描述的「刀一直往原点的方向走，走到卡死」正是这个：
+   * 不是坐标算错，是**起点未知**。
+   *
+   * 所以顺序必须是：机械归位（!PG，物理动作，结果确定）
+   *            → 建立坐标系（SC）
+   *            → 绝对定位到图形起点（此时起点已知，行程有界）
+   *
+   * `!PG` 放在 SC 之前也不影响：它是纯机械动作，不经过坐标换算。
+   *
+   * ⚠️ 归位后的等待**不能**靠发一条猜测的固件指令来实现——
+   * 本项目没有任何资料佐证力宇支持某种「延时 N 秒」指令，
+   * 凭空发 `PG1;` 之类只会被固件当成未知指令丢弃，或更糟。
+   * 等待由任务引擎在指令之间插入（见 jobEngine 的 dwell 机制）。
+   */
   build(path, options = {}) {
     const origin = options.origin || { x: 0, y: 0 };
+
+    // 1. 先归位，让后续所有绝对坐标都有确定的参考点
+    if (options.homeFirst !== false) {
+      this.penUp();
+      this.emit('!PG;');
+    }
+
+    // 2. 建立坐标系（SC 恒正序，见 setupCoords）
     this.setupCoords(origin);
     this.setSpeed(options.speedMmPerSec || 30);
     if (options.force) this.setForce(options.force);
     this.penSelectOn();
 
+    // 3. 图形本体
     for (const sub of path.subpaths) {
       this.runSubpath(sub, { closeAll: !!options.closeAll });
     }
+
+    // 4. 收尾也归位，保证下次开机位置确定
     this.home();
     this.end();
 

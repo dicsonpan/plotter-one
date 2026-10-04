@@ -20,6 +20,19 @@ import { EventEmitter } from 'node:events';
 
 const BAUD_EFFICIENCY = 0.88; // 协议开销 + 控制板缓冲，实测效率约 88%
 
+/**
+ * 机械归位后的驻留时间（毫秒）。
+ *
+ * `!PG;` 触发限位开关搜索，固件不回执完成。串口是流式的，
+ * 发完就返回，所以上位机必须自己等机器走完再发下一条坐标指令。
+ *
+ * 3 秒是保守值：SC631-AU 最长行程 710mm，
+ * 即使按 60mm/s 的极限慢速也就 12 秒，通常 1-2 秒。
+ * 取大值只是多等一会儿，不会出错；取小值会让机器边归位边接收新目标，
+ * 表现为刀头朝一个方向狂奔直到撞限位。
+ */
+const HOME_DWELL_MS = 3000;
+
 export const JobState = {
   IDLE: 'idle',
   RUNNING: 'running',
@@ -82,10 +95,14 @@ export class JobEngine extends EventEmitter {
   list() {
     // 当前任务 + 排队任务 + 最近完成的历史。
     // 只返回 queue 会让界面在任务开始后「凭空消失」，这是实测踩到的坑。
+    //
+    // 注意：历史条目**没有** lines/text 字段（入历史时已剥掉，见 run 末尾），
+    // 所以这里用 totalLines/bytes，并给 undefined 兜底。
+    // 直接写 j.lines.length 会读到 undefined.length 抛错，界面就整个刷不出来。
     const out = this.history.slice(-20).map((j) => ({
       id: j.id, name: j.name, status: j.status,
-      totalLines: j.lines.length, sentLines: j.sent || 0,
-      bytes: j.text.length, createdAt: j.createdAt, meta: j.meta,
+      totalLines: j.totalLines ?? 0, sentLines: j.sent || 0,
+      bytes: j.bytes ?? 0, createdAt: j.createdAt, meta: j.meta,
     }));
     if (this.current) {
       out.unshift({
@@ -153,6 +170,24 @@ export class JobEngine extends EventEmitter {
         }
         this.current.sent = i + 1;
 
+        /**
+         * 机械归位后必须等机器真的停下，再发下一条坐标指令。
+         *
+         * 归位（`!PG;`）是纯机械动作，固件收到后开始跑限位开关搜索，
+         * **不会**回执完成。紧接着发 `PA x,y` 的话，新目标会在归位途中就生效——
+         * 机器可能边归位边往新位置走，表现为「刀一直往一个方向狂奔直到卡死」。
+         *
+         * 串口本身是流式的，发完就返回，没有「等机器执行完」的语义，
+         * 所以这个停顿只能由上位机在这里插入。
+         *
+         * 用注释行做锚点，避免在 hpgl.js 里凭空发明固件延时指令
+         * （没有资料佐证力宇支持 `PG1;` 之类，发出去只会被当未知指令丢掉）。
+         */
+        if (line.trim() === '!PG;') {
+          this.pushLog('  机械归位中，等待机器到位…');
+          await this._sleep(HOME_DWELL_MS, { capped: false });
+        }
+
         const pct = Math.round((this.current.sent / this.current.lines.length) * 100);
         this.emit('progress', {
           jobId: job.id,
@@ -180,7 +215,27 @@ export class JobEngine extends EventEmitter {
         this.setState(JobState.DONE, job.name);
       }
       this.emit('jobdone', { id: job.id, status: this.current.status });
-      this.history.push(this.current);
+
+      /**
+       * 入历史前剥掉重字段。
+       *
+       * `this.current` 里带着完整的 `text`（几十 KB）和 `lines` 数组
+       * （每行一个字符串，5000 行能到 400KB+）。历史保留 50 条，
+       * 照原样留着就是几十 MB 常驻——服务跑几天内存只涨不降。
+       *
+       * 历史只用于界面展示（名字、状态、进度、字节数），
+       * 指令全文没有展示价值，所以只留字节数与行数。
+       */
+      this.history.push({
+        id: this.current.id,
+        name: this.current.name,
+        status: this.current.status,
+        createdAt: this.current.createdAt,
+        meta: this.current.meta,
+        bytes: this.current.text.length,
+        totalLines: this.current.lines.length,
+        sent: this.current.sent,
+      });
       if (this.history.length > 50) this.history.shift();
       this.current = null;
       this.emit('queue', this.list());
@@ -194,8 +249,20 @@ export class JobEngine extends EventEmitter {
     return Math.max(0, remain * perLineMs);
   }
 
-  _sleep(ms) {
-    return new Promise((r) => setTimeout(r, Math.min(ms, 200)));
+  /**
+   * 睡眠。
+   *
+   * 🔴 两种语义必须分开，不能共用一个 200ms 上限：
+   *
+   *   - 轮询等待（暂停/停止的检查）：要**短**，否则停止按钮响应迟钝。
+   *     200ms 上限就是为它设的。
+   *   - 机器驻留（归位后等到位）：要**真的等够**。
+   *     以前两种共用 `Math.min(ms, 200)`，导致传 3000 也只睡 200ms，
+   *     归位等待形同虚设——而且不报错，只是「偶尔撞机」，极难察觉。
+   */
+  _sleep(ms, { capped = true } = {}) {
+    const d = capped ? Math.min(ms, 200) : ms;
+    return new Promise((r) => setTimeout(r, d));
   }
 
   pause() {
