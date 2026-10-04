@@ -107,17 +107,24 @@ export function buildManualCommand(preset, cmd) {
        * 归位不该掺入任何坐标系假设，这是它对轴向设置免疫的原因。
        */
       initPrefix();
-      b.penUp();
-      b.emit('PU;');
+      b.forcePenUp();
       b.emit('!PG;');
       notes.push('回机械原点（抬刀后归位，不受坐标设置影响）');
       break;
     }
 
     case 'penup': {
+      /**
+       * 用 forcePenUp() 而不是 penUp()。
+       *
+       * penUp() 在「软件认为刀已抬起」时不发任何指令。手动按钮场景下这是个坑：
+       * 上一次任务被停止 / 串口重连 / 换控制板之后，软件认知与机器真实状态
+       * 可能不一致，此时按「抬刀」会一条指令都不发——按钮点了没反应，
+       * 而刀可能还压着材料。抬刀是安全操作，多发一个字节的成本可忽略。
+       */
       initPrefix();
-      b.penUp();
-      notes.push('抬刀');
+      b.forcePenUp();
+      notes.push('抬刀（已强制下发 PU，不依赖软件对刀状态的判断）');
       break;
     }
 
@@ -130,13 +137,13 @@ export function buildManualCommand(preset, cmd) {
        * 必须用相对移动。
        */
       initPrefix();
-      b.penUp();
+      b.forcePenUp();
       b.setSpeed(Math.max(5, speed / 2));
       b.emit('PD;');
       const d = b.toMachineDelta(2, 0);
       b.emit(`PR${u(d.dx)},${u(d.dy)};`);
       b.emit('PA;');
-      b.penUp();
+      b.forcePenUp();
       notes.push('落刀并在当前位置划入 2mm（用于试刀压）');
       break;
     }
@@ -191,8 +198,7 @@ export function buildManualCommand(preset, cmd) {
 
     case 'end': {
       initPrefix();
-      b.penUp();
-      b.emit('PU;');
+      b.forcePenUp();
       b.home();
       b.emit('SP0;');
       notes.push('抬刀并回机械原点，本次控制指令结束');

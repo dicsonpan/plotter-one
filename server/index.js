@@ -132,6 +132,101 @@ function attachTransport(t) {
   t.on('close', () => { connected = false; broadcast('device:closed', {}); });
 }
 
+// ---------------------------------------------------------------------------
+// 自动重连
+// ---------------------------------------------------------------------------
+/**
+ * 串口连接**必须自动恢复**，否则服务一重启机器就「失联」。
+ *
+ * 之前每次重启服务（改代码、崩溃重启、systemctl restart）都会丢掉串口，
+ * 界面上所有手动按钮随之置灰，表现为「点什么都不反应」——
+ * 用户会以为是按钮坏了或机器死了，实际上只是没人重新连串口。
+ * 这个坑在本次调试里反复出现（我自己重启了好几次）。
+ *
+ * 为什么必须自动：
+ *   - 串口是独占资源，进程退出就释放，没有「重连」这回事，只能重新 open；
+ *   - 配置里已经记了 path/baud（用户连过一次就存下来了），具备自动重连条件；
+ *   - USB 转串口经常被重新插拔，设备节点会变（ttyACM0 → ttyACM1），
+ *     所以不能只认死一个路径，要在候选列表里找。
+ *
+ * 策略：每 3 秒试一次，连上就停。失败不刷日志（避免刷屏），
+ * 只在状态变化时广播，界面上的连接灯会自己亮起来。
+ */
+const RECONNECT_INTERVAL_MS = 3000;
+let reconnectTimer = null;
+let lastConnected = null;
+
+async function currentSerialCandidates() {
+  // 优先用配置里记的路径，其次扫一遍所有可用串口
+  const list = await SerialTransport.list();
+  const saved = config.serial?.path;
+  const out = [];
+  if (saved && list.includes(saved)) out.push(saved);
+  for (const p of list) if (!out.includes(p)) out.push(p);
+  return out;
+}
+
+async function tryReconnect() {
+  if (connected) return true;
+  const candidates = await currentSerialCandidates();
+  for (const path of candidates) {
+    try {
+      const t = new SerialTransport({
+        path,
+        baud: +(config.serial?.baud || 9600),
+        dataBits: +(config.serial?.dataBits || 8),
+        stopBits: +(config.serial?.stopBits || 1),
+        parity: config.serial?.parity || 'none',
+        rtscts: !!config.serial?.rtscts,
+      });
+      await t.connect();
+      attachTransport(t);
+      connected = true;
+      deviceInfo = await SerialTransport.describe(path);
+      // 记住实际连上的路径：USB 重新插拔后节点可能变
+      if (config.serial?.path !== path) {
+        config.serial = { ...config.serial, path };
+        await saveConfig();
+      }
+      console.log(`  ✓ 已自动连接串口 ${path} ${config.serial?.baud || 9600}`);
+      broadcast('device:connected', { connected: true, info: deviceInfo });
+      return true;
+    } catch {
+      // 这个口连不上就试下一个，不刷日志
+    }
+  }
+  return false;
+}
+
+function startReconnectLoop() {
+  if (reconnectTimer) return;
+  reconnectTimer = setInterval(async () => {
+    // 服务正在退出时别再连
+    if (shuttingDown) return;
+    const ok = await tryReconnect();
+    if (ok !== lastConnected) {
+      lastConnected = ok;
+      if (!ok) broadcast('device:closed', {});
+    }
+  }, RECONNECT_INTERVAL_MS);
+  // 不要因为这个定时器而阻止进程退出
+  if (typeof reconnectTimer.unref === 'function') reconnectTimer.unref();
+}
+
+let shuttingDown = false;
+function stopReconnectLoop() {
+  shuttingDown = true;
+  if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
+}
+
+/**
+ * 手动连接成功后停掉自动重连。
+ *
+ * 用户主动点「连接设备」时若还挂着自动重连，会出现两个连接互相抢占：
+ * 自动重连每 3 秒试一次，可能把用户刚连上的传输层替换掉，
+ * 表现为「刚连上又断」。所以手动连上后要让位。
+ */
+
 function fullState() {
   const preset = getPreset(config.machineId);
   return {
@@ -214,6 +309,8 @@ const routes = {
       }
       attachTransport(t);
       connected = true;
+      // 用户主动连上了 → 停掉自动重连，避免两套逻辑抢占同一块串口
+      stopReconnectLoop();
       if (type === 'serial') {
         config.serial = { ...config.serial, ...body };
         await saveConfig();
@@ -559,7 +656,7 @@ wss.handleUpgrade = (req, socket, head) => {
   }
 };
 
-server.listen(PORT, HOST, () => {
+server.listen(PORT, HOST, async () => {
   const ip = localIP();
   console.log('');
   console.log('  刻字机 Web 控制服务已启动');
@@ -571,7 +668,37 @@ server.listen(PORT, HOST, () => {
   console.log('  ─────────────────────────────────────────');
   console.log('  手机连同一个 Wi-Fi，浏览器直接输上面的局域网地址即可');
   console.log('');
+
+  // 自动接回串口：服务重启 / 崩溃恢复后不该要求用户手动重连，
+  // 否则界面上的手动按钮全是灰的，看起来像「机器失灵」。
+  if (config.serial?.path) {
+    const ok = await tryReconnect();
+    if (!ok) {
+      console.log(`  ! 未能自动连接 ${config.serial.path}，将持续重试`);
+      console.log('    （确认设备已插好、USB 线供电正常，或在界面上手动选择串口）');
+    }
+    startReconnectLoop();
+  } else {
+    console.log('  · 尚未配置串口，请在界面上选择串口并连接');
+  }
 });
+
+/**
+ * 退出前收尾。
+ *
+ * 不处理 SIGTERM 的话，systemd 重启时进程被直接杀掉，
+ * 串口 fd 由内核关闭（尚可），但控制板可能还处在上一条指令的中间状态。
+ * 抬一刀再退出，让机器处于确定的「抬刀」状态。
+ */
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => {
+    stopReconnectLoop();
+    try {
+      if (connected) await transport.write('PU;\n');
+    } catch { /* 已断开，忽略 */ }
+    process.exit(0);
+  });
+}
 
 function localIP() {
   for (const list of Object.values(os.networkInterfaces())) {
