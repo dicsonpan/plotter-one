@@ -443,6 +443,11 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
    * 力宇固件不支持反向 SC，会算出负缩放系数，回原点时 Y 轴疯狂转动、
    * X 轴朝反方向狂奔（2026-10-04 实机确认）。
    * 方向差异改由上位机 toMachine() 处理，SC 只负责正序声明坐标系。
+   *
+   * 注意：本节全部显式指定 swapAxes:false，只测「方向」这一个维度。
+   * 这台机器的预设默认 swapAxes:true（X/Y 物理接反），
+   * 不锁住的话下面的断言会被交换轴干扰，测的就不再是方向逻辑了。
+   * 交换轴单独一节测。
    */
   for (const [label, opts] of [
     ['常规', { axisX: 1, axisY: 1 }],
@@ -450,19 +455,19 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
     ['Y 反向', { axisX: 1, axisY: -1 }],
     ['双向反向', { axisX: -1, axisY: -1 }],
   ]) {
-    const m = scOf(opts);
+    const m = scOf({ ...opts, swapAxes: false });
     check(`${label}轴向下 SC 仍为正序（固件安全）`,
       m && +m[1] < +m[2] && +m[3] < +m[4], m && m[0]);
   }
 
-  check('SC 无 NaN', scOf({ axisX: -1, axisY: -1 }) && !/NaN/.test(scOf({ axisX: -1, axisY: -1 })[0]));
+  check('SC 无 NaN', scOf({ axisX: -1, axisY: -1, swapAxes: false }) && !/NaN/.test(scOf({ axisX: -1, axisY: -1, swapAxes: false })[0]));
   check('SC 覆盖整个幅面（用户单位=mm）',
-    +scOf({ axisX: 1, axisY: 1 })[2] === Math.round(au.width / 25.4 * au.stepsPerInch),
-    `Xmax=${scOf({ axisX: 1, axisY: 1 })[2]}`);
+    +scOf({ axisX: 1, axisY: 1, swapAxes: false })[2] === Math.round(au.width / 25.4 * au.stepsPerInch),
+    `Xmax=${scOf({ axisX: 1, axisY: 1, swapAxes: false })[2]}`);
 
   // 方向差异必须体现在**坐标**上，而不是 SC 上
-  const bNormal = new HpglBuilder(au, { axisX: 1 });
-  const bFlip = new HpglBuilder(au, { axisX: -1 });
+  const bNormal = new HpglBuilder(au, { axisX: 1, swapAxes: false });
+  const bFlip = new HpglBuilder(au, { axisX: -1, swapAxes: false });
   check('X 反向时 SC 与常规完全一致（差异只在坐标）',
     bNormal.setupCoords({ x: 0, y: 0 }).cmds[2] === bFlip.setupCoords({ x: 0, y: 0 }).cmds[2],
     `${bNormal.cmds[2]} vs ${bFlip.cmds[2]}`);
@@ -517,8 +522,11 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
   check('校准指令也必须含 IN;（同样会全机失灵）',
     /(^|\n)IN;/.test(calIn), calIn.replace(/\n/g, ' ').trim());
 
-  // 手动 jog 必须是相对移动，且收尾不能把刀头拽回原点
-  const mv = buildManualCommand(au, { action: 'move', dx: 5, dy: 0 });
+  // 手动 jog 必须是相对移动，且收尾不能把刀头拽回原点。
+  // 用 swapAxes:false 的机型副本，让断言聚焦「相对 vs 绝对」这一个维度；
+  // 交换轴下的增量换轴由「轴交换」一节负责。
+  const auNoSwap = { ...au, swapAxes: false, axisX: 1, axisY: 1 };
+  const mv = buildManualCommand(auNoSwap, { action: 'move', dx: 5, dy: 0 });
   check('手动 jog 用 PR 相对移动（非 PA 绝对跳变）',
     /PR-?197,0;/.test(mv.text) && !/PA-?\d+,-?\d+;/.test(mv.text),
     mv.text.replace(/\n/g, ' ').trim());
@@ -527,13 +535,13 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
     mv.text.replace(/\n/g, ' ').trim());
 
   // 落刀试压必须是相对 2mm：原来是绝对 lineTo(2,0)，落刀状态下会划穿材料
-  const pd = buildManualCommand(au, { action: 'pendown' });
+  const pd = buildManualCommand(auNoSwap, { action: 'pendown' });
   check('落刀试压为相对 2mm，不做绝对移动',
     /PD;/.test(pd.text) && /PR-?79,0;/.test(pd.text) && !/PA-?\d+,-?\d+;/.test(pd.text),
     pd.text.replace(/\n/g, ' ').trim());
 
-  // 校准指令必须小步、抬刀、纯相对
-  const cal = buildCalibrationStep(au, { dir: 'x+', axisX: 1, axisY: 1 });
+  // 校准指令必须小步、抬刀、纯相对（同样锁定不交换，隔离维度）
+  const cal = buildCalibrationStep(auNoSwap, { dir: 'x+', axisX: 1, axisY: 1 });
   check('校准指令全程抬刀（不含 PD）', !cal.includes('PD'), cal.replace(/\n/g, ' ').slice(0, 70));
   check('校准走完能回到起点（往返增量互相抵消）',
     (() => {
@@ -551,10 +559,13 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
 section('镜像下的几何往返（反射会翻转圆弧绕向）');
 {
   const au = MACHINE_PRESETS['liyue-sc631-au'];
+  // 锁定不交换：本节只测「方向」对几何的影响，交换轴另有一节。
+  // 不锁的话预设的 swapAxes:true 会把包围盒也旋转，断言就不成立了。
+  const auMirror = { ...au, swapAxes: false };
   // 四种轴向组合下，编译再解析回几何都必须无损
   for (const [ax, ay] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
     const p = circleToPath(300, 300, 25);
-    const built = compileToPlotterLanguage(p, au, { axisX: ax, axisY: ay });
+    const built = compileToPlotterLanguage(p, auMirror, { axisX: ax, axisY: ay });
     const back = parseHpgl(built.text, { stepsPerInch: au.stepsPerInch });
     const e = back.path.subpaths[0]?.elems?.[0];
     check(`整圆往返（axisX=${ax}, axisY=${ay}）长度误差 <1%`,
@@ -567,13 +578,97 @@ section('镜像下的几何往返（反射会翻转圆弧绕向）');
   // 直线在镜像下应落到对称位置（x → width - x），且长度不变
   const mk = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 300); p.subpaths.push(s); return p; };
   const backFlip = parseHpgl(
-    compileToPlotterLanguage(mk(), au, { axisX: -1, axisY: 1 }).text,
+    compileToPlotterLanguage(mk(), auMirror, { axisX: -1, axisY: 1 }).text,
     { stepsPerInch: au.stepsPerInch }).path;
   const bbF = pathBBox(backFlip);
   check('镜像后直线长度不变', Math.abs(bbF.w - 400) < 0.5 && Math.abs(bbF.h - 300) < 0.5,
     `${bbF.w.toFixed(1)}×${bbF.h.toFixed(1)}`);
   check('镜像后直线落到对称位置（x 偏移 = width - 400）',
     Math.abs(bbF.minX - (au.width - 400)) < 0.5, `minX=${bbF.minX.toFixed(1)}`);
+}
+
+section('轴交换（X/Y 物理接反，2026-10-04 实机确认）');
+{
+  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  const mkSeg = () => ({ subpaths: [{ start: { x: 0, y: 0 }, elems: [{ type: 'line', x1: 0, y1: 0, x2: 100, y2: 0 }], closed: false }] });
+  const scOf = (opts) => compileToPlotterLanguage(mkSeg(), { ...au, axisX: 1, axisY: 1, ...opts }).text
+    .match(/SC(-?\d+),(-?\d+),(-?\d+),(-?\d+);/);
+
+  // 🔴 最容易写错的地方：交换后 SC 的上界必须跟着换。
+  // 交换前机器 X 走 600mm（幅面宽），交换后走 710mm（用户 Y / 进纸方向）。
+  // 写死 preset.width 会让机器按错误跨度换算坐标，整体缩放。
+  const noSwap = scOf({ swapAxes: false });
+  const swapped = scOf({ swapAxes: true });
+  check('未交换时 SC 上界 = 600×710',
+    +noSwap[2] === Math.round(au.width / 25.4 * au.stepsPerInch)
+    && +noSwap[4] === Math.round(au.height / 25.4 * au.stepsPerInch),
+    noSwap[0]);
+  check('交换后 SC 上界互换 = 710×600',
+    +swapped[2] === Math.round(au.height / 25.4 * au.stepsPerInch)
+    && +swapped[4] === Math.round(au.width / 25.4 * au.stepsPerInch),
+    swapped[0]);
+  check('交换后 SC 仍为正序（固件安全）',
+    +swapped[1] < +swapped[2] && +swapped[3] < +swapped[4], swapped[0]);
+
+  // machineSpanX/Y 是 SC 上界的唯一来源
+  const bSwap = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: true });
+  const bNo = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: false });
+  check('machineSpanX 随交换改变', bSwap.machineSpanX === au.height && bNo.machineSpanX === au.width,
+    `${bSwap.machineSpanX} vs ${bNo.machineSpanX}`);
+
+  // 交换：用户 (x,y) → 机器 (y,x)
+  check('交换后用户 (100,200) 映射到机器 (200,100)',
+    bSwap.toMachine(100, 200).x === 200 && bSwap.toMachine(100, 200).y === 100,
+    JSON.stringify(bSwap.toMachine(100, 200)));
+  check('未交换时用户 (100,200) 映射到机器 (100,200)',
+    bNo.toMachine(100, 200).x === 100 && bNo.toMachine(100, 200).y === 200,
+    JSON.stringify(bNo.toMachine(100, 200)));
+
+  // 增量也要换轴：用户「往右 5mm」在交换后应变成机器 Y 方向
+  check('交换后往右的增量落在机器 Y 上',
+    bSwap.toMachineDelta(5, 0).dx === 0 && bSwap.toMachineDelta(5, 0).dy === 5,
+    JSON.stringify(bSwap.toMachineDelta(5, 0)));
+
+  // 反射判定：交换(1次) + 单轴反向(1次) = 2 次 = 旋转，绕向不变
+  check('交换 + 单轴反向 = 旋转（isReflection=false）',
+    new HpglBuilder(au, { axisX: -1, axisY: 1, swapAxes: true }).isReflection === false);
+  check('仅交换 = 反射（isReflection=true）',
+    new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: true }).isReflection === true);
+
+  // 几何往返：交换不改变长度，只旋转包围盒
+  const mkLine = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 300); p.subpaths.push(s); return p; };
+  for (const sw of [false, true]) {
+    const t = compileToPlotterLanguage(mkLine(), { ...au, axisX: 1, axisY: 1, swapAxes: sw }).text;
+    const back = parseHpgl(t, { stepsPerInch: au.stepsPerInch }).path;
+    check(`交换=${sw} 时线段长度不变（误差<0.1%）`,
+      Math.abs(pathLength(back) - 500) / 500 < 0.001,
+      `误差 ${((pathLength(back) - 500) / 500 * 100).toFixed(4)}%`);
+    const bb = pathBBox(back);
+    check(`交换=${sw} 时包围盒${sw ? '旋转' : '不变'}（${bb.w.toFixed(0)}×${bb.h.toFixed(0)}）`,
+      sw ? (Math.abs(bb.w - 300) < 0.5 && Math.abs(bb.h - 400) < 0.5)
+         : (Math.abs(bb.w - 400) < 0.5 && Math.abs(bb.h - 300) < 0.5),
+      `${bb.w.toFixed(1)}×${bb.h.toFixed(1)}`);
+  }
+
+  // 整圆在交换下往返无损
+  for (const sw of [false, true]) {
+    const c = circleToPath(300, 300, 25);
+    const t = compileToPlotterLanguage(c, { ...au, axisX: 1, axisY: 1, swapAxes: sw }).text;
+    const back = parseHpgl(t, { stepsPerInch: au.stepsPerInch }).path;
+    const e = back.path?.subpaths?.[0]?.elems?.[0] ?? back.subpaths[0]?.elems?.[0];
+    check(`交换=${sw} 时整圆往返长度误差 <1%`,
+      Math.abs(pathLength(back) - pathLength(c)) / pathLength(c) < 0.01,
+      `误差 ${((pathLength(back) - pathLength(c)) / pathLength(c) * 100).toFixed(3)}%`);
+    check(`交换=${sw} 时整圆半径不变`, e && e.r > 24 && e.r < 26, `半径 ${e?.r}`);
+  }
+
+  // 校准指令在交换下也必须只动一根轴，且走 5mm
+  const calSwap = buildCalibrationStep(au, { dir: 'x+', axisX: 1, axisY: 1, swapAxes: true });
+  const prs = [...calSwap.matchAll(/PR(-?\d+),(-?\d+);/g)].map((m) => [+m[1], +m[2]]);
+  check('交换后校准仍走 5mm 且只动一根轴',
+    prs.length === 2 && (Math.abs(prs[0][0]) === 197 || Math.abs(prs[0][1]) === 197)
+    && (prs[0][0] === 0 || prs[0][1] === 0),
+    JSON.stringify(prs));
 }
 
 section('任务引擎');
