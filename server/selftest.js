@@ -160,7 +160,8 @@ section('HPGL 生成与往返');
   const built = compileToPlotterLanguage(p, preset, { speedMmPerSec: 30, force: 250 });
   check('生成了指令', built.text.length > 0, `${built.bytes} 字节 / ${built.commandCount} 条`);
   check('含初始化 IN;', /(^|\n)IN;/.test(built.text));
-  check('含坐标系 SC', /SC-?\d+,-?\d+,-?\d+,-?\d+;/.test(built.text));
+  check('含连续线 LT;', /(^|\n)LT;/.test(built.text));
+  check('不含破坏 Y 轴缩放的 SC 指令', !/\bSC-?\d+/.test(built.text));
   check('含速度 VS', /VS\d+;/.test(built.text));
   check('含抬刀 PU', /PU/.test(built.text));
   check('含落刀 PD', /PD/.test(built.text));
@@ -216,8 +217,8 @@ section('分辨率正确性（力宇 1000 vs HPGL 标准 1016）');
   // 1000dpi：100mm → 100 * 1000/25.4 = 3937.0 → 3937
   const a = probe(MACHINE_PRESETS['liyue-sc630']);
   check('100mm @ 1000dpi 量化为 3937', a.all.includes(3937), `PA 目标值 ${a.all.join(',')}`);
-  check('1000dpi 下 SC 上界 = 幅面 630mm → 24803',
-    a.built.text.includes(`24803`), a.built.text.split('\n').find((l) => l.startsWith('SC')));
+  check('1000dpi 下幅面 630mm 步进换算 = 24803',
+    Math.round(630 / 25.4 * 1000) === 24803);
 
   // 1016dpi：100mm → 100 * 1016/25.4 = 4000
   const b = probe(MACHINE_PRESETS['generic-hpgl-1016']);
@@ -427,28 +428,14 @@ section('串口写入路径（曾经从未被测到）');
   check('未连接时给出明确错误', errMsg === '串口未连接', `实际「${errMsg}」`);
 }
 
-section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X 轴狂奔）');
+section('坐标轴方向与不发 SC 安全性');
 {
   const au = MACHINE_PRESETS['liyue-sc631-au'];
   const seg = { subpaths: [{ start: { x: 0, y: 0 }, elems: [{ type: 'line', x1: 0, y1: 0, x2: 100, y2: 0 }], closed: false }] };
 
-  const scOf = (opts) => {
-    const t = compileToPlotterLanguage(seg, au, opts).text;
-    return t.match(/SC(-?\d+),(-?\d+),(-?\d+),(-?\d+);/);
-  };
-
   /**
-   * 🔴 核心安全断言：SC 必须**永远正序**。
-   *
-   * 这里原来断言的是「X 反向时 Xmin > Xmax」——那正是 bug 本身。
-   * 力宇固件不支持反向 SC，会算出负缩放系数，回原点时 Y 轴疯狂转动、
-   * X 轴朝反方向狂奔（2026-10-04 实机确认）。
-   * 方向差异改由上位机 toMachine() 处理，SC 只负责正序声明坐标系。
-   *
-   * 注意：本节全部显式指定 swapAxes:false，只测「方向」这一个维度。
-   * 这台机器的预设默认 swapAxes:true（X/Y 物理接反），
-   * 不锁住的话下面的断言会被交换轴干扰，测的就不再是方向逻辑了。
-   * 交换轴单独一节测。
+   * 🔴 核心安全断言：绝不能在卷筒刻字机上发 SC 指令。
+   * HP-GL 的 SC 会把卷筒纸轴的缩放除零归零，导致 Y 轴无响应。
    */
   for (const [label, opts] of [
     ['常规', { axisX: 1, axisY: 1 }],
@@ -456,22 +443,16 @@ section('坐标轴方向（曾因反向 SC 导致回原点时 Y 轴飞转、X �
     ['Y 反向', { axisX: 1, axisY: -1 }],
     ['双向反向', { axisX: -1, axisY: -1 }],
   ]) {
-    const m = scOf({ ...opts, swapAxes: false });
-    check(`${label}轴向下 SC 仍为正序（固件安全）`,
-      m && +m[1] < +m[2] && +m[3] < +m[4], m && m[0]);
+    const text = compileToPlotterLanguage(seg, au, { ...opts, swapAxes: false }).text;
+    check(`${label}轴向下不含 SC 指令（防止滚筒 Y 轴失灵）`, !/\bSC-?\d+/.test(text));
   }
-
-  check('SC 无 NaN', scOf({ axisX: -1, axisY: -1, swapAxes: false }) && !/NaN/.test(scOf({ axisX: -1, axisY: -1, swapAxes: false })[0]));
-  check('SC 覆盖整个幅面（用户单位=mm）',
-    +scOf({ axisX: 1, axisY: 1, swapAxes: false })[2] === Math.round(au.width / 25.4 * au.stepsPerInch),
-    `Xmax=${scOf({ axisX: 1, axisY: 1, swapAxes: false })[2]}`);
 
   // 方向差异必须体现在**坐标**上，而不是 SC 上
   const bNormal = new HpglBuilder(au, { axisX: 1, swapAxes: false });
   const bFlip = new HpglBuilder(au, { axisX: -1, swapAxes: false });
-  check('X 反向时 SC 与常规完全一致（差异只在坐标）',
-    bNormal.setupCoords({ x: 0, y: 0 }).cmds[2] === bFlip.setupCoords({ x: 0, y: 0 }).cmds[2],
-    `${bNormal.cmds[2]} vs ${bFlip.cmds[2]}`);
+  check('X 反向与常规设置指令头一致',
+    bNormal.setupCoords({ x: 0, y: 0 }).cmds[0] === bFlip.setupCoords({ x: 0, y: 0 }).cmds[0],
+    `${bNormal.cmds[0]} vs ${bFlip.cmds[0]}`);
   check('X 反向时用户 x=0 映射到机器右端（width）',
     bFlip.toMachine(0, 0).x === au.width, `实际 ${bFlip.toMachine(0, 0).x}`);
   check('X 反向时用户 x=width 映射到机器 0',
@@ -588,32 +569,14 @@ section('镜像下的几何往返（反射会翻转圆弧绕向）');
     Math.abs(bbF.minX - (au.width - 400)) < 0.5, `minX=${bbF.minX.toFixed(1)}`);
 }
 
-section('轴交换（X/Y 物理接反，2026-10-04 实机确认）');
+section('轴交换（支持 X/Y 交换配置）');
 {
   const au = MACHINE_PRESETS['liyue-sc631-au'];
-  const mkSeg = () => ({ subpaths: [{ start: { x: 0, y: 0 }, elems: [{ type: 'line', x1: 0, y1: 0, x2: 100, y2: 0 }], closed: false }] });
-  const scOf = (opts) => compileToPlotterLanguage(mkSeg(), { ...au, axisX: 1, axisY: 1, ...opts }).text
-    .match(/SC(-?\d+),(-?\d+),(-?\d+),(-?\d+);/);
-
-  // 🔴 最容易写错的地方：交换后 SC 的上界必须跟着换。
-  // 交换前机器 X 走 600mm（幅面宽），交换后走 710mm（用户 Y / 进纸方向）。
-  // 写死 preset.width 会让机器按错误跨度换算坐标，整体缩放。
-  const noSwap = scOf({ swapAxes: false });
-  const swapped = scOf({ swapAxes: true });
-  check('未交换时 SC 上界 = 600×710',
-    +noSwap[2] === Math.round(au.width / 25.4 * au.stepsPerInch)
-    && +noSwap[4] === Math.round(au.height / 25.4 * au.stepsPerInch),
-    noSwap[0]);
-  check('交换后 SC 上界互换 = 710×600',
-    +swapped[2] === Math.round(au.height / 25.4 * au.stepsPerInch)
-    && +swapped[4] === Math.round(au.width / 25.4 * au.stepsPerInch),
-    swapped[0]);
-  check('交换后 SC 仍为正序（固件安全）',
-    +swapped[1] < +swapped[2] && +swapped[3] < +swapped[4], swapped[0]);
-
-  // machineSpanX/Y 是 SC 上界的唯一来源
+  // machineSpanX/Y 是各轴物理跨度的来源
   const bSwap = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: true });
   const bNo = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: false });
+  check('未交换时 machineSpanX 为幅面宽 600', bNo.machineSpanX === au.width);
+  check('交换后 machineSpanX 互换为进纸长 710', bSwap.machineSpanX === au.height);
   check('machineSpanX 随交换改变', bSwap.machineSpanX === au.height && bNo.machineSpanX === au.width,
     `${bSwap.machineSpanX} vs ${bNo.machineSpanX}`);
 
@@ -775,7 +738,7 @@ section('任务历史不留全量指令（防内存只涨不降）');
     JSON.stringify(eng.list()[0] || {}));
 }
 
-section('任务开头必须先归位（否则刀头狂奔卡死）');
+section('任务原点保护与安全');
 {
   const au = MACHINE_PRESETS['liyue-sc631-au'];
   const rect = () => {
@@ -787,37 +750,30 @@ section('任务开头必须先归位（否则刀头狂奔卡死）');
   };
   const built = compileToPlotterLanguage(rect(), au, { speedMmPerSec: 30 });
   const lines = built.text.split('\n').map((l) => l.trim()).filter(Boolean);
-  const iHome = lines.findIndex((l) => l.includes('!PG'));
   const iFirstMove = lines.findIndex((l) => /^PA-?\d/.test(l));
 
   /**
-   * 🔴 关键安全断言：机械归位必须**早于**第一条绝对定位指令。
+   * 🔴 关键原点保护断言：默认刻绘开头绝不能发 !PG; 机械归位。
    *
-   * 症状（2026-10-04 实机）：点「生成指令」→「开始刻绘」后，
-   * 刀头一直朝一个方向狂奔直到卡死，Y 轴不动。
-   *
-   * 根因不是坐标算错（坐标是对的），而是任务**没有先归位**：
-   * 第一条 `PA x,y` 是绝对定位，机器开刀前停在哪是不确定的，
-   * 从未知位置跳到图形起点，距离与方向都不可控 → 一路撞限位。
+   * 刻字机是以操作者在材料上设定的对刀原点为基准的。
+   * 开头下发 !PG; 会让刀头横跨整机去撞限位开关，不仅冲掉用户原点，还会造成 X 轴远离原点狂奔。
    */
-  check('任务以 !PG 开头（起点确定，避免狂奔卡死）',
-    lines[0] === '!PG;', `实际首行「${lines[0]}」`);
-  check('归位早于第一条绝对定位指令',
-    iHome >= 0 && iFirstMove > iHome,
-    `!PG@${iHome} vs PA@${iFirstMove}`);
-  check('归位指令在 SC 之前（纯机械动作，不依赖坐标系）',
-    lines.indexOf('SC0,27953,0,23622;') > iHome, lines.join(' '));
-  check('结尾也归位（下次开机位置确定）',
-    lines.filter((l) => l.includes('!PG')).length === 2, lines.join(' '));
-  check('归位后第一刀是抬刀状态',
-    lines.slice(iFirstMove).every((l) => l !== 'PD;') === false, '应存在落刀段');
+  check('默认任务开头不发 !PG（保护用户对刀原点）',
+    !lines[0].includes('!PG'), `实际首行「${lines[0]}」`);
+  check('任务开头以 IN; 初始化',
+    lines[0] === 'IN;', `实际首行「${lines[0]}」`);
+  check('默认结尾抬刀并返回原点 PA0,0;（不强制撞限位）',
+    lines.includes('PA0,0;') && !lines.slice(-3).some((l) => l.includes('!PG')), lines.join(' '));
+  check('落刀段状态正常',
+    lines.slice(iFirstMove).some((l) => l === 'PD;'), '应存在落刀段');
 
-  // homeFirst:false 供已经确认在正确位置的场景跳过归位（如连续小步）
-  const noHome = compileToPlotterLanguage(rect(), au, { homeFirst: false });
-  check('homeFirst:false 可显式跳过归位',
-    !noHome.text.split('\n').some((l) => l.trim() === '!PG;'
-      && noHome.text.indexOf(l) === 0),
-    noHome.text.split('\n')[0]);
+  // homeFirst:true 供需要显式机械归位的场景
+  const withHome = compileToPlotterLanguage(rect(), au, { homeFirst: true });
+  check('homeFirst:true 可显式开启开头归位',
+    withHome.text.startsWith('!PG;'), withHome.text.split('\n')[0]);
+  const withEndHome = compileToPlotterLanguage(rect(), au, { homeEnd: true });
+  check('homeEnd:true 可显式开启收尾归位',
+    withEndHome.text.includes('!PG;\nSP0;'), withEndHome.text.slice(-20));
 
   // 归位驻留：!PG 之后必须有真实等待，不能被 200ms 上限截断
   check('_sleep 支持非截断的长等待（归位驻留用）',

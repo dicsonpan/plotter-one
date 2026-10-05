@@ -98,21 +98,19 @@ export const MACHINE_PRESETS = {
     //
     // 走纸轴（机器X）的方向无法从「原点在右手边」推出来（那是刀头的性质），
     // 先按正向设，由校准向导的第二步确认。
+    // 实测（2026-10-04 / 2026-10-05）：
+    // 力宇刻字机标准轴向：
+    // - 机器 X 轴（HP-GL 第一参数）：刀头（龙门左右导轨，幅面宽度 600mm）
+    // - 机器 Y 轴（HP-GL 第二参数）：走纸滚筒（材料进退，进纸方向 710mm）
+    // 默认 X 轴向左进刀（向材料内部）、Y 轴向内进纸，均从用户对刀原点 (0,0) 开始正向递增。
+    // 不开启 swapAxes，避免轴向混乱导致 Y 轴无响应、X 轴走反。
     axisX: 1,
-    axisY: -1,
-    // 实机确认（2026-10-04）：这台机器的**物理 X/Y 与用户坐标是接反的**——
-    // 推动刀头（龙门）的那个电机，固件里编号是 Y；走纸的那个是 X。
-    //
-    // 「接反」和「方向相反」是两件事，可以同时成立。
-    // 交换后机器 X 实际走 710mm（走纸方向），所以 SC 上界按 710 声明，
-    // 由 machineSpanX 处理，不要写死 preset.width。
-    swapAxes: true,
+    axisY: 1,
+    swapAxes: false,
     serialDefault: { baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 10, max: 500, default: 250, unit: 'g' },
-    note: 'AU 版海外规格表标称刻绘 600mm / 进纸 710mm。'
-        + '本机实测：机械原点在用户右手边（刀头轴 = 机器Y，故 axisY=-1）、'
-        + '且物理 X/Y 接反（故交换轴）。走纸轴方向待校准确认。',
+    note: 'AU 版海外规格表标称刻绘 600mm / 进纸 710mm。默认 X 轴为刀头（左右）、Y 轴为走纸滚筒（前后）。',
   },
   'liyue-sc631e': {
     id: 'liyue-sc631e',
@@ -316,38 +314,27 @@ export class HpglBuilder {
   }
 
   /**
-   * 设置坐标系。
+   * 初始化机器与设定状态。
    *
-   * 🔴 SC 的语义（这是踩过坑的地方）：
-   *   SC Xmin, Xmax, Ymin, Ymax
-   * 里的 Xmin/Ymin 映射到**物理点 P1**，Xmax/Ymax 映射到**物理点 P2**。
-   * P1 在机器的哪个角，是由硬件与面板设置决定的，**不是我们能假定的**。
+   * 🔴 严禁在卷筒刻字机上发送 SC 指令：
+   *   HP-GL 的 SC Xmin,Xmax,Ymin,Ymax 指令依赖物理缩放点 P1 与 P2：
+   *     Scale_Y = (P2y - P1y) / (Ymax - Ymin)
+   *   刻字机采用滚筒进纸（卷材），Y 轴为连续进纸滚筒，硬件根本没有固定的 Y 轴物理上限（P2y = 0 或未初始化）。
+   *   一旦下发 SC，固件算出的 Y 轴缩放比例直接被归零（Scale_Y = 0），
+   *   导致后续所有 Y 轴运动指令在固件内部全部乘以 0，表现为「Y 轴彻底失去响应」；
+   *   同时 X 轴因错误的缩放基准导致失控狂奔。
    *
-   * HP-GL 规范允许 Xmin > Xmax 来表达「X 轴镜像」，但**力宇固件不支持**：
-   * 它仍按 Xmax-Xmin 计算每单位步数，负分母直接产生负缩放系数。
-   * 实测症状：回原点时 Y 轴疯狂转动、X 轴朝反方向狂奔（2026-10-04）。
-   *
-   * 所以这里**永远发正序 SC**，方向差异交给 toMachine() 在上位机处理。
-   * 这样即便方向设错，最坏也只是图形镜像，不会让机器失控撞机。
+   *   上位机在 moveTo() / lineTo() / arcTo() 中已经通过 toPlotterUnits()
+   *   把毫米精确按机器脉冲分辨率（如 1000 步/英寸）量化成了整数步进，
+   *   因此直发原生绘图仪步进即可，完全不需要也绝不能下发 SC。
    */
   setupCoords(origin) {
-    // 🔴 交换轴时用 machineSpanX/Y（已互换），不能用 preset.width/height，
-    // 否则 SC 上界按错误的跨度声明，机器换算坐标会整体缩放。
-    const w = this.machineSpanX;
-    const h = this.machineSpanY;
     this.emit('IN;');
     if (this.dialect === 'dmpl') {
       this.emit(';:');
       this.emit('IN;');
     }
     this.emit('SP1;');
-
-    // 正序：Xmin < Xmax、Ymin < Ymax。任何情况下都不反转。
-    const x0 = toPlotterUnits(origin.x, this.spi);
-    const y0 = toPlotterUnits(origin.y, this.spi);
-    const x1 = toPlotterUnits(origin.x + w, this.spi);
-    const y1 = toPlotterUnits(origin.y + h, this.spi);
-    this.emit(`SC${Math.min(x0, x1)},${Math.max(x0, x1)},${Math.min(y0, y1)},${Math.max(y0, y1)};`);
     this.emit('LT;');
     return this;
   }
@@ -554,38 +541,25 @@ export class HpglBuilder {
   /**
    * 生成完整任务指令。
    *
-   * 🔴 **开头必须先机械归位**（2026-10-04 实机踩到，症状：刀一直往一个方向
-   * 狂奔直到卡死，Y 轴不动）。
-   *
-   * 原因：任务的第一条运动指令是 `PA x,y`，那是**绝对定位**。
-   * 而机器开刀前停在哪是不确定的（上次刻完的位置、手动挪过的位置、
-   * 甚至断电重启后的未知位置）。从「未知位置」跳到「图形起点」，
-   * 距离和方向都不可控，机器会一路撞向限位开关。
-   *
-   * 用户描述的「刀一直往原点的方向走，走到卡死」正是这个：
-   * 不是坐标算错，是**起点未知**。
-   *
-   * 所以顺序必须是：机械归位（!PG，物理动作，结果确定）
-   *            → 建立坐标系（SC）
-   *            → 绝对定位到图形起点（此时起点已知，行程有界）
-   *
-   * `!PG` 放在 SC 之前也不影响：它是纯机械动作，不经过坐标换算。
-   *
-   * ⚠️ 归位后的等待**不能**靠发一条猜测的固件指令来实现——
-   * 本项目没有任何资料佐证力宇支持某种「延时 N 秒」指令，
-   * 凭空发 `PG1;` 之类只会被固件当成未知指令丢弃，或更糟。
-   * 等待由任务引擎在指令之间插入（见 jobEngine 的 dwell 机制）。
+   * 🔴 原点保护原则：
+   *   刻字机通常由操作者在材料上手动定位刀尖后，按下机身面板的【原点】(Origin) 按钮，
+   *   将当前对刀位置设为局部原点 (0,0)。
+   *   因此任务开头**绝不能默认发送 !PG; 机械归位**！
+   *   `!PG;` 是机械限位搜索动作（仅 X 轴导轨有机械开关，滚筒 Y 轴无开关），
+   *   发 `!PG;` 会使刀头抛弃用户对刀原点、横跨整个导轨去撞右端限位，造成 X 轴疯狂远离原点。
+   *   默认从用户当前对刀原点开始刻绘；仅当明确指定 `options.homeFirst === true` 时才归位。
+   *   刻绘收尾默认抬刀并返回原点 `PA0,0;`，不强行机械撞限位。
    */
   build(path, options = {}) {
     const origin = options.origin || { x: 0, y: 0 };
 
-    // 1. 先归位，让后续所有绝对坐标都有确定的参考点
-    if (options.homeFirst !== false) {
+    // 1. 默认不发 !PG;（保护用户在机器面板设置的对刀原点）
+    if (options.homeFirst === true) {
       this.penUp();
       this.emit('!PG;');
     }
 
-    // 2. 建立坐标系（SC 恒正序，见 setupCoords）
+    // 2. 初始化与设置（IN; SP1; LT;）
     this.setupCoords(origin);
     this.setSpeed(options.speedMmPerSec || 30);
     if (options.force) this.setForce(options.force);
@@ -596,8 +570,13 @@ export class HpglBuilder {
       this.runSubpath(sub, { closeAll: !!options.closeAll });
     }
 
-    // 4. 收尾也归位，保证下次开机位置确定
-    this.home();
+    // 4. 收尾：抬刀回到起点并关笔
+    this.penUp();
+    if (options.homeEnd === true) {
+      this.home();
+    } else {
+      this.emit('PA0,0;');
+    }
     this.end();
 
     const text = this.cmds.join('\n') + '\n';
