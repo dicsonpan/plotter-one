@@ -7,6 +7,7 @@
  */
 
 import * as G from '../geom.js';
+import { t } from './i18n.js';
 
 class Renderer {
     constructor(canvas) {
@@ -175,7 +176,7 @@ class Renderer {
       // 原点标记：机器的物理零点（左下角）
       ctx.fillStyle = '#8b95a3';
       ctx.font = '10px ui-monospace, monospace';
-      ctx.fillText('原点 0,0', x + 3, y + h - 5);
+      ctx.fillText(t('canvas.origin'), x + 3, y + h - 5);
       ctx.beginPath();
       ctx.arc(x, y + h, 3, 0, Math.PI * 2);
       ctx.fillStyle = '#e11d48';

@@ -65,8 +65,20 @@ export class JobEngine extends EventEmitter {
     this.emit('state', { state: s, detail, jobId: this.current?.id || null });
   }
 
-  pushLog(line) {
-    const entry = { t: Date.now(), line };
+  /**
+   * 写一条日志。
+   *
+   * @param {string} line 中文（同时作为兼容字段 `line`）
+   * @param {string} [en]  英文；不给就退化成只显示中文
+   *
+   * 🔴 为什么 `line` 保留中文而不是英文明明在前端选：
+   *   `line` 是这个协议的**既有字段**，任务历史接口、日志面板、
+   *   以及任何直接读 entry.line 的地方都依赖它。改掉它的语义会让
+   *   老前端（浏览器缓存）显示空白——那比重启一次糟糕得多。
+   *   所以：line 保持中文不变，en 作为附加字段并行下发。
+   */
+  pushLog(line, en) {
+    const entry = { t: Date.now(), line, en: en || line };
     this.log.push(entry);
     if (this.log.length > 500) this.log.shift();
     this.emit('log', entry);
@@ -77,6 +89,7 @@ export class JobEngine extends EventEmitter {
     const item = {
       id: job.id,
       name: job.name || '未命名任务',
+      nameEn: job.nameEn || job.name || 'Untitled job',
       text: job.text,
       baud: job.baud || 9600,
       lines: job.text.split('\n').filter(Boolean),
@@ -141,7 +154,9 @@ export class JobEngine extends EventEmitter {
       this.current = { ...job, sent: 0 };
       this.current.status = 'running';
       this.setState(JobState.RUNNING, job.name);
-      this.pushLog(`▶ 开始输出：${job.name}（${job.lines.length} 行 / ${job.text.length} 字节）`);
+      this.pushLog(
+        `▶ 开始输出：${job.name}（${job.lines.length} 行 / ${job.text.length} 字节）`,
+        `▶ Start output: ${job.name} (${job.lines.length} lines / ${job.text.length} bytes)`);
 
       const perLineMs = (() => {
         // 估算单行下发时间：字节数 / 波特率
@@ -165,7 +180,7 @@ export class JobEngine extends EventEmitter {
         } catch (err) {
           this.current.status = 'error';
           this.setState(JobState.ERROR, err.message);
-          this.pushLog(`✕ 输出中断：${err.message}`);
+          this.pushLog(`✕ 输出中断：${err.message}`, `✕ Output aborted: ${err.message}`);
           return;
         }
         this.current.sent = i + 1;
@@ -184,7 +199,7 @@ export class JobEngine extends EventEmitter {
          * （没有资料佐证力宇支持 `PG1;` 之类，发出去只会被当未知指令丢掉）。
          */
         if (line.trim() === '!PG;') {
-          this.pushLog('  机械归位中，等待机器到位…');
+          this.pushLog('  机械归位中，等待机器到位…', '  Homing, waiting for machine…');
           await this._sleep(HOME_DWELL_MS, { capped: false });
         }
 
@@ -205,11 +220,13 @@ export class JobEngine extends EventEmitter {
 
       if (stopped) {
         this.current.status = 'aborted';
-        this.pushLog(`■ 已中止：${job.name}（下发 ${this.current.sent}/${this.current.lines.length} 行）`);
+        this.pushLog(
+            `■ 已中止：${job.name}（下发 ${this.current.sent}/${this.current.lines.length} 行）`,
+            `■ Stopped: ${job.name} (sent ${this.current.sent}/${this.current.lines.length} lines)`);
         this.setState(JobState.ABORTED);
       } else {
         this.current.status = 'done';
-        this.pushLog(`✔ 完成：${job.name}`);
+        this.pushLog(`✔ 完成：${job.name}`, `✔ Done: ${job.name}`);
         // 机器走完最后一段 + 回位
         await this._sleep(800);
         this.setState(JobState.DONE, job.name);
@@ -269,7 +286,7 @@ export class JobEngine extends EventEmitter {
     if (this.state === JobState.RUNNING) {
       this.accumulatedMs = Date.now() - this.startedAt;
       this.setState(JobState.PAUSED);
-      this.pushLog('⏸ 已暂停');
+      this.pushLog('⏸ 已暂停', '⏸ Paused');
     }
   }
 
@@ -277,7 +294,7 @@ export class JobEngine extends EventEmitter {
     if (this.state === JobState.PAUSED) {
       this.startedAt = Date.now() - this.accumulatedMs;
       this.setState(JobState.RUNNING);
-      this.pushLog('▶ 已继续');
+      this.pushLog('▶ 已继续', '▶ Resumed');
     }
   }
 
@@ -285,7 +302,7 @@ export class JobEngine extends EventEmitter {
   stop() {
     if (this.busy) {
       this.setState(JobState.STOPPING);
-      this.pushLog('■ 请求停止…');
+      this.pushLog('■ 请求停止…', '■ Stop requested…');
     }
   }
 
@@ -301,7 +318,8 @@ export class JobEngine extends EventEmitter {
   emergencyStop() {
     this.queue = [];
     this.setState(JobState.STOPPING);
-    this.pushLog('⛔ 急停（已抬刀，未发送任何移动指令）');
+    this.pushLog('⛔ 急停（已抬刀，未发送任何移动指令）',
+      '⛔ E-stop (pen lifted, no motion sent)');
     if (this.transport.open) {
       this.transport.write('PU;\n').catch(() => {});
     }

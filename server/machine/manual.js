@@ -30,6 +30,16 @@ const MAX_STEP = 200;
  *   - speed: 移动速度 mm/s（可选，缺省用 preset 的保守值）
  * @returns {{text: string, notes: string[]}}
  */
+/**
+ * 构造一条双语 note。
+ *
+ * 与 toolpath.js 的 warn() 同构：{zh, en} 由前端按语言挑。
+ * 这样接口返回结构对所有 note 一致，前端只需要一套挑法。
+ */
+function n(zh, en) {
+  return { zh, en: en || zh };
+}
+
 export function buildManualCommand(preset, cmd) {
   const notes = [];
   const b = new HpglBuilder(preset);
@@ -86,16 +96,17 @@ export function buildManualCommand(preset, cmd) {
     case 'move': {
       let dx = Number(cmd.dx) || 0;
       let dy = Number(cmd.dy) || 0;
-      if (dx === 0 && dy === 0) { notes.push('位移为 0，未发送移动指令'); break; }
+      if (dx === 0 && dy === 0) { notes.push(n('位移为 0，未发送移动指令', 'Zero displacement, no move command sent')); break; }
       if (Math.abs(dx) > MAX_STEP || Math.abs(dy) > MAX_STEP) {
         dx = Math.sign(dx) * Math.min(Math.abs(dx), MAX_STEP);
         dy = Math.sign(dy) * Math.min(Math.abs(dy), MAX_STEP);
-        notes.push(`单次位移已限制在 ±${MAX_STEP}mm`);
+        notes.push(n(`单次位移已限制在 ±${MAX_STEP}mm`, `Single move clamped to ±${MAX_STEP}mm`));
       }
       initPrefix();
       b.setSpeed(speed);
       relative(dx, dy);
-      notes.push(`移动 ${dx.toFixed(1)}, ${dy.toFixed(1)} mm（抬刀状态，不划伤材料）`);
+      notes.push(n(`移动 ${dx.toFixed(1)}, ${dy.toFixed(1)} mm（抬刀状态，不划伤材料）`,
+        `Move ${dx.toFixed(1)}, ${dy.toFixed(1)} mm (pen up, will not scratch)`));
       break;
     }
 
@@ -109,7 +120,8 @@ export function buildManualCommand(preset, cmd) {
       initPrefix();
       b.forcePenUp();
       b.emit('!PG;');
-      notes.push('回机械原点（抬刀后归位，不受坐标设置影响）');
+      notes.push(n('回机械原点（抬刀后归位，不受坐标设置影响）',
+        'Mechanical home (pen up, independent of coordinate settings)'));
       break;
     }
 
@@ -124,7 +136,8 @@ export function buildManualCommand(preset, cmd) {
        */
       initPrefix();
       b.forcePenUp();
-      notes.push('抬刀（已强制下发 PU，不依赖软件对刀状态的判断）');
+      notes.push(n('抬刀（已强制下发 PU，不依赖软件对刀状态的判断）',
+        'Pen up (PU forced, does not rely on software pen state)'));
       break;
     }
 
@@ -144,7 +157,8 @@ export function buildManualCommand(preset, cmd) {
       b.emit(`PR${u(d.dx)},${u(d.dy)};`);
       b.emit('PA;');
       b.forcePenUp();
-      notes.push('落刀并在当前位置划入 2mm（用于试刀压）');
+      notes.push(n('落刀并在当前位置划入 2mm（用于试刀压）',
+        'Pen down, cuts 2mm at current position (test press)'));
       break;
     }
 
@@ -154,7 +168,8 @@ export function buildManualCommand(preset, cmd) {
       b.penUp();
       b.emit('PU;');
       b.emit('IP0,0;');
-      notes.push('已把当前位置设为新原点（后续坐标以此为基准）');
+      notes.push(n('已把当前位置设为新原点（后续坐标以此为基准）',
+        'Current position set as new origin (all coordinates relative to it)'));
       break;
     }
 
@@ -171,20 +186,21 @@ export function buildManualCommand(preset, cmd) {
        * 名为「进纸 50mm」实际却是把刀头横移到画面某个位置。
        */
       let d = Math.abs(Number(cmd.distance) || 0);
-      if (d === 0) { notes.push('距离为 0，未发送进纸指令'); break; }
-      if (d > MAX_STEP) { d = MAX_STEP; notes.push(`单次进纸限制在 ${MAX_STEP}mm`); }
+      if (d === 0) { notes.push(n('距离为 0，未发送进纸指令', 'Zero distance, no feed command sent')); break; }
+      if (d > MAX_STEP) { d = MAX_STEP; notes.push(n(`单次进纸限制在 ${MAX_STEP}mm`, `Single feed clamped to ${MAX_STEP}mm`)); }
       const sign = cmd.action === 'feed' ? 1 : -1;
       initPrefix();
       b.setSpeed(speed);
       relative(0, d * sign);
-      notes.push(`${cmd.action === 'feed' ? '进纸' : '出纸'} ${d.toFixed(0)}mm`);
+      notes.push(n(`${cmd.action === 'feed' ? '进纸' : '出纸'} ${d.toFixed(0)}mm`,
+        `${cmd.action === 'feed' ? 'Feed' : 'Eject'} ${d.toFixed(0)}mm`));
       break;
     }
 
     case 'stop': {
       b.emit('PU;');
       b.emit('SP0;');
-      notes.push('抬刀并关笔，停止输出');
+      notes.push(n('抬刀并关笔，停止输出', 'Pen up and deselect pen, stop output'));
       break;
     }
 
@@ -192,7 +208,8 @@ export function buildManualCommand(preset, cmd) {
       // HP-GL 没有标准暂停指令，用注释行占位。
       // 真正暂停应通过任务引擎（暂停会停止下发后续指令）
       b.emit('EC;');
-      notes.push('已发送擦除/暂停指令（建议用「暂停」按钮，切任务更可靠）');
+      notes.push(n('已发送擦除/暂停指令（建议用「暂停」按钮，切任务更可靠）',
+        'Erase/pause command sent (prefer the Pause button — more reliable)'));
       break;
     }
 
@@ -201,12 +218,13 @@ export function buildManualCommand(preset, cmd) {
       b.forcePenUp();
       b.home();
       b.emit('SP0;');
-      notes.push('抬刀并回机械原点，本次控制指令结束');
+      notes.push(n('抬刀并回机械原点，本次控制指令结束',
+        'Pen up and return to mechanical home, control session ended'));
       break;
     }
 
     default:
-      notes.push(`未知指令：${cmd.action}`);
+      notes.push(n(`未知指令：${cmd.action}`, `Unknown command: ${cmd.action}`));
       return { text: '', notes };
   }
 

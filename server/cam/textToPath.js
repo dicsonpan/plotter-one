@@ -156,9 +156,13 @@ export function textToPath(o) {
       unsupported,
       advanceWidth: cursor,
       sizeMm,
+      // 双语：note 保持中文以兼容既有调用方，noteEn 供英文界面使用
       note: unsupported.length
         ? `字符 ${unsupported.join('')} 超出内置单线字体，已用方框占位。中文请用前端轮廓模式。`
         : '内置单线字体输出',
+      noteEn: unsupported.length
+        ? `Characters ${unsupported.join('')} are outside the built-in stroke font and were replaced with boxes. For Chinese use the outline mode.`
+        : 'Built-in stroke font output',
     },
   };
 }

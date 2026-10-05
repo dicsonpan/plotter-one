@@ -21,6 +21,27 @@ const execFileAsync = promisify(execFile);
 
 const PARITY_MAP = { none: '-parenb', even: 'parenb', odd: 'parenb', mark: '', space: '' };
 
+/**
+ * 构造一条带英文的 Error。
+ *
+ * Error 只有 message 一个字段，没地方挂第二种语言。
+ * 这里把英文塞进 `errorEn` 属性，接口层就能按客户端语言取
+ * （见 server/index.js 里 `err(err.message, err.errorEn)`）。
+ *
+ * 保持 message 为中文，是为了不破坏现有的日志与堆栈输出——
+ * 那些地方按约定就是中文。
+ *
+ * ⚠️ 必须定义在**类之前**：模块顶层是 ESM，`const` / `function` 声明虽会提升，
+ * 但这里若定义在文件后部，`new SerialTransport().write()` 在其实例化之后
+ * 才调用没问题，可 `selftest` 里的「未连接就 write」会在模块求值阶段就触发，
+ * 报 `biErr is not defined` ——这类错误只在特定调用顺序下出现，很难联想到是定义位置。
+ */
+export function biErr(zh, en) {
+  const e = new Error(zh);
+  e.errorEn = en;
+  return e;
+}
+
 export class SerialTransport extends EventEmitter {
   constructor(opts = {}) {
     super();
@@ -117,7 +138,8 @@ export class SerialTransport extends EventEmitter {
     try {
       await execFileAsync('stty', args);
     } catch (err) {
-      throw new Error(`stty 配置失败（${this.path}）：${err.message}`);
+      throw biErr(`stty 配置失败（${this.path}）：${err.message}`,
+        `stty configuration failed (${this.path}): ${err.message}`);
     }
   }
 
@@ -150,7 +172,7 @@ export class SerialTransport extends EventEmitter {
   }
 
   async write(data) {
-    if (!this.open || !this.fd) throw new Error('串口未连接');
+    if (!this.open || !this.fd) throw biErr('串口未连接', 'Serial port not connected');
     const buf = typeof data === 'string' ? Buffer.from(data, 'ascii') : data;
     // 写入必须走 FileHandle.write（this.fd.write）。
     // 早期这里写的是 `const { write } = await import('node:fs/promises')`，
@@ -205,13 +227,13 @@ export class TcpTransport extends EventEmitter {
       s.on('close', () => { this.open = false; this.emit('close'); });
       this.socket = s;
       setTimeout(() => {
-        if (!this.open) { s.destroy(); reject(new Error('TCP 连接超时')); }
+        if (!this.open) { s.destroy(); reject(biErr('TCP 连接超时', 'TCP connection timed out')); }
       }, 8000);
     });
   }
 
   async write(data) {
-    if (!this.open || !this.socket) throw new Error('TCP 未连接');
+    if (!this.open || !this.socket) throw biErr('TCP 未连接', 'TCP not connected');
     return new Promise((resolve, reject) => {
       this.socket.write(Buffer.from(data, 'ascii'), (err) => (err ? reject(err) : resolve(data.length)));
     });
@@ -260,7 +282,7 @@ export class VirtualPlotter extends EventEmitter {
   }
 
   async write(data) {
-    if (!this.open) throw new Error('虚拟机未连接');
+    if (!this.open) throw biErr('虚拟机未连接', 'Virtual plotter not connected');
     const text = typeof data === 'string' ? data : data.toString('ascii');
     this.emit('tx', text);
     // 异步回包，模拟真实设备延迟

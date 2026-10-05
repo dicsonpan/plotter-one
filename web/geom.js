@@ -303,6 +303,54 @@ export function isSimilarity(m, tol = 1e-6) {
   return Math.abs(dot) < tol * l1 * l2;
 }
 
+/**
+ * 用「逐点函数」变换整条路径，原地修改。
+ *
+ * 与 `applyMatrixToPath` 的区别：那个只接受 2×3 矩阵（线性 + 平移），
+ * 而版面旋转这类变换的平移量**依赖输入坐标之外的画布尺寸**
+ * （顺时针 90° 是 `(x,y) → (y, W-x)`，那个 `W` 是画布宽，不在点自己身上）。
+ * 矩阵表达不了这种「绕画布中心/角旋转」，所以走这个函数式入口。
+ *
+ * @param {object} path
+ * @param {(x:number,y:number)=>{x:number,y:number}} fn
+ * @param {boolean} [flipWinding=false] 变换是否含反射（镜像）。
+ *        反射会把圆弧的绕向翻过来，必须交换 a0/a1，否则弧刻反。
+ *        纯旋转不翻——这是本函数最容易漏的参数。
+ */
+export function mapPathPoints(path, fn, flipWinding = false) {
+  for (const sub of path.subpaths) {
+    const ns = fn(sub.start.x, sub.start.y);
+    let px = ns.x, py = ns.y;          // 当前点，用于给 line 补齐起点
+    sub.start = { x: px, y: py };
+    const out = [];
+    for (const e of sub.elems) {
+      if (e.type === 'line') {
+        const p2 = fn(e.x2, e.y2);
+        // 起点用「上一段终点」而不是变换 e.x1：
+        // HPGL 解析回来的 line 未必带 x1/y1，且逐段独立变换会累积误差。
+        out.push({ type: 'line', x1: px, y1: py, x2: p2.x, y2: p2.y });
+        px = p2.x; py = p2.y;
+      } else if (e.type === 'arc') {
+        const c = fn(e.cx, e.cy);
+        const a0 = flipWinding ? e.a1 : e.a0;
+        const a1 = flipWinding ? e.a0 : e.a1;
+        out.push({ type: 'arc', cx: c.x, cy: c.y, r: e.r, a0, a1 });
+        px = c.x + e.r * Math.cos(a1);
+        py = c.y + e.r * Math.sin(a1);
+      } else if (e.type === 'ellipse') {
+        const c = fn(e.cx, e.cy);
+        const a0 = flipWinding ? e.a1 : e.a0;
+        const a1 = flipWinding ? e.a0 : e.a1;
+        out.push({ type: 'ellipse', cx: c.x, cy: c.y, rx: e.rx, ry: e.ry, a0, a1 });
+        px = c.x + e.rx * Math.cos(a1);
+        py = c.y + e.ry * Math.sin(a1);
+      }
+    }
+    sub.elems = out;
+  }
+  return path;
+}
+
 export function applyMatrixToPath(path, m) {
   const similar = isSimilarity(m);
   const s = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c));

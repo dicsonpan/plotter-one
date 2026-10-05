@@ -21,13 +21,12 @@ import { SerialTransport, TcpTransport, VirtualPlotter, NullTransport, createTra
 import { JobEngine, JobState } from './machine/jobEngine.js';
 import { MACHINE_PRESETS, MATERIAL_PRESETS, compileToPlotterLanguage, HpglBuilder } from './machine/hpgl.js';
 import { buildManualCommand } from './machine/manual.js';
-import { buildCalibrationStep, CALIBRATION_STEPS } from './machine/calibrate.js';
 import { compileToolpath, analyze, estimateTime, Direction } from './cam/toolpath.js';
 import { parseDxf } from './import/dxf.js';
 import { parseSvg, parseSvgPath } from './import/svg.js';
 import { parseHpgl } from './import/hpglReader.js';
 import { textToPath } from './cam/textToPath.js';
-import { pathBBox, pathLength, applyMatrixToPath, makePath, polylineToPath, matrixTranslate, matrixScale, matrixRotate, makeSubpath, addLine, circleToPath, ellipseToPath } from './geom/path.js';
+import { pathBBox, pathLength, applyMatrixToPath, mapPathPoints, makePath, polylineToPath, matrixTranslate, matrixScale, matrixRotate, makeSubpath, addLine, circleToPath, ellipseToPath } from './geom/path.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -95,21 +94,26 @@ function getPreset(id) {
 }
 
 /**
- * 当前生效的轴向配置。
+ * 当前生效的机器朝向配置。
  *
- * 优先级：用户在界面/校准向导里保存的值（config）> 机型预设默认值。
- * 所有生成指令的入口都必须经过这里，避免「界面改了但指令没变」。
+ * 🔴 2026-10-05 起：**一律以机型预设为唯一来源，不再读 config。**
  *
- * 三个维度是正交的，可以任意组合：
- *   swapAxes：物理 X/Y 是否接反
- *   axisX/-Y：各轴方向是否相反
+ * 之前是 `config > preset`，本项目因此踩过一次很隐蔽的坑：
+ * 改了预设里的默认值，但板子上 `data/config.json` 里存着上一轮校准保存的
+ * 旧值，优先级更高，于是**新预设静默失效**——表现是「代码改了、界面没报错、
+ * 但机器上还是老样子」，第一反应会误判成机器或固件的问题。
+ *
+ * 既然界面上已经没有这些开关（实机全部确认后移除），
+ * 留着 config 覆盖层就只剩「静默吃掉新预设」这一个作用，纯属负收益。
+ * 换机器/改朝向 = 改 `machine/hpgl.js` 里的预设，那里有完整注释。
  */
 function axisOptions() {
   const preset = getPreset(config.machineId);
   return {
-    axisX: config.axisX !== undefined ? config.axisX : (preset.axisX ?? 1),
-    axisY: config.axisY !== undefined ? config.axisY : (preset.axisY ?? 1),
-    swapAxes: config.swapAxes !== undefined ? !!config.swapAxes : !!preset.swapAxes,
+    axisX: preset.axisX ?? 1,
+    axisY: preset.axisY ?? 1,
+    swapAxes: !!preset.swapAxes,
+    layoutRotate: preset.layoutRotate ?? 0,
   };
 }
 
@@ -285,7 +289,7 @@ const routes = {
     try {
       let t;
       if (type === 'serial') {
-        if (!body.path) return sendJson(res, 400, { error: '缺少串口路径' });
+        if (!body.path) return sendJson(res, 400, err('缺少串口路径', 'Missing serial port path'));
         t = new SerialTransport({
           path: body.path,
           baud: +(body.baud || 9600),
@@ -303,9 +307,9 @@ const routes = {
       } else if (type === 'virtual') {
         t = new VirtualPlotter({ width: getPreset(config.machineId).width, stepsPerInch: getPreset(config.machineId).stepsPerInch });
         await t.connect();
-        deviceInfo = { path: '内置虚拟刻字机（不驱动真实硬件）' };
+        deviceInfo = { path: '内置虚拟刻字机（不驱动真实硬件）', pathEn: 'Built-in virtual plotter (no real hardware)' };
       } else {
-        return sendJson(res, 400, { error: '未知连接类型' });
+        return sendJson(res, 400, err('未知连接类型', 'Unknown connection type'));
       }
       attachTransport(t);
       connected = true;
@@ -319,7 +323,7 @@ const routes = {
       sendJson(res, 200, { ok: true, device: deviceInfo });
     } catch (err) {
       connected = false;
-      sendJson(res, 400, { error: err.message });
+      sendJson(res, 400, err(err.message, err.errorEn));
     }
   },
 
@@ -386,7 +390,7 @@ const routes = {
       const info = analyze(path, preset);
       sendJson(res, 200, { path: pathToClient(path), info });
     } catch (err) {
-      sendJson(res, 400, { error: err.message });
+      sendJson(res, 400, err(err.message, err.errorEn));
     }
   },
 
@@ -394,7 +398,7 @@ const routes = {
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
     const preset = getPreset(body.machineId || config.machineId);
     const items = body.items || [];
-    if (!items.length) return sendJson(res, 400, { error: '没有可输出的内容' });
+    if (!items.length) return sendJson(res, 400, err('没有可输出的内容', 'Nothing to output'));
 
     // 1. 合并所有几何
     const merged = makePath();
@@ -409,7 +413,7 @@ const routes = {
         for (const s of it.path.subpaths || []) merged.subpaths.push(s);
       }
     }
-    if (!merged.subpaths.length) return sendJson(res, 400, { error: '合并后没有有效路径' });
+    if (!merged.subpaths.length) return sendJson(res, 400, err('合并后没有有效路径', 'No valid path after merging'));
 
     // 2. 施加每个对象的变换（前端已算好，这里用矩阵）
     //    若前端传的是已变换坐标则忽略；统一约定传 path + matrix
@@ -468,39 +472,10 @@ const routes = {
    *  2. 界面能拿到进度与日志，操作结果可追溯
    *  3. 急停对手动指令同样有效——这是安全底线，不能有绕过急停的路径
    */
-  /**
-   * 原点校准：只抬刀、每次只走 5mm，用来确认 X/Y 的真实方向。
-   * 方向错会撞机，所以必须能安全地试——这正是这个接口存在的意义。
-   */
-  'POST /api/calibrate': async (req, res) => {
-    if (!connected) return sendJson(res, 400, { error: '设备未连接' });
-    const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
-    const preset = getPreset(config.machineId);
-    const dir = body.dir;
-    if (!['x+', 'x-', 'y+', 'y-'].includes(dir)) {
-      return sendJson(res, 400, { error: 'dir 必须是 x+/x-/y+/y-' });
-    }
-
-    const text = buildCalibrationStep(preset, {
-      dir,
-      ...axisOptions(),
-    });
-    const id = engine.enqueue({
-      name: `校准·${dir}`,
-      text,
-      baud: preset.serialDefault.baud,
-      priority: true,
-      meta: { bytes: text.length, manual: true, calibration: true },
-    });
-    engine.run();
-    const step = CALIBRATION_STEPS.find((s) => s.dir === dir);
-    sendJson(res, 200, { ok: true, jobId: id, gcode: text, ask: step?.ask || '' });
-  },
-
   'POST /api/manual': async (req, res) => {
-    if (!connected) return sendJson(res, 400, { error: '设备未连接' });
+    if (!connected) return sendJson(res, 400, err('设备未连接', 'Device not connected'));
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
-    if (!body.action) return sendJson(res, 400, { error: '缺少 action' });
+    if (!body.action) return sendJson(res, 400, err('缺少 action', 'Missing action'));
 
     const preset = getPreset(config.machineId);
     let built;
@@ -509,9 +484,9 @@ const routes = {
       // 否则会出现「画布上往右、方向键往左」的错位。
       built = buildManualCommand({ ...preset, ...axisOptions() }, body);
     } catch (err) {
-      return sendJson(res, 400, { error: '指令生成失败：' + err.message });
+      return sendJson(res, 400, err('指令生成失败：' + err.message, 'Command build failed: ' + err.message));
     }
-    if (!built.text) return sendJson(res, 400, { error: '未生成任何指令' });
+    if (!built.text) return sendJson(res, 400, err('未生成任何指令', 'No commands generated'));
 
     // 每条手动指令都短小，直接插队但仍走引擎，保证限速与急停有效
     const id = engine.enqueue({
@@ -526,9 +501,9 @@ const routes = {
   },
 
   'POST /api/send': async (req, res) => {
-    if (!connected) return sendJson(res, 400, { error: '设备未连接' });
+    if (!connected) return sendJson(res, 400, err('设备未连接', 'Device not connected'));
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
-    if (!body.gcode) return sendJson(res, 400, { error: '没有指令内容' });
+    if (!body.gcode) return sendJson(res, 400, err('没有指令内容', 'No command content'));
     const preset = getPreset(config.machineId);
     const id = engine.enqueue({
       name: body.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,
@@ -549,12 +524,30 @@ const routes = {
   'GET /api/preview': async (req, res, url) => {
     // 回显自检：把自己生成的 HPGL 读回来，验证解析器与生成器一致
     const q = url.searchParams.get('gcode');
-    if (!q) return sendJson(res, 400, { error: '缺少 gcode 参数' });
+    if (!q) return sendJson(res, 400, err('缺少 gcode 参数', 'Missing gcode parameter'));
     const preset = getPreset(config.machineId);
     const r = parseHpgl(q, { stepsPerInch: preset.stepsPerInch });
+    // 读回来的是**机器坐标**，必须逆变换回设计坐标才能画到画布上。
+    // 漏掉这一步：版面旋转 90° 时预览会横躺，与设计稿对不上，
+    // 而指令本身完全正确——属于「预览骗人」而不是「刻错」的错误，
+    // 会让人反复改设计去迁就一个其实没问题的预览。
+    const b = new HpglBuilder(preset, axisOptions());
+    mapPathPoints(r.path, (x, y) => b.toUser(x, y), b.isReflection);
     sendJson(res, 200, { path: pathToClient(r.path), stats: r.stats, warnings: r.warnings });
   },
 };
+
+/**
+ * 构造一条双语错误响应体。
+ *
+ * 🔴 `error` 字段保持**中文**不动：它是这个 API 的既有契约，
+ * 前端、curl、甚至别的设备都在读它。改成按请求头返回对应语言会让
+ * 「同一个请求换个客户端就拿到不同文案」，排查时非常难对齐。
+ * 所以中文留在 `error`，英文加挂在 `errorEn`，由前端自行挑选。
+ */
+function err(zh, en) {
+  return { error: zh, errorEn: en || zh };
+}
 
 function pathToClient(path) {
   // 圆弧/椭圆在 JSON 里原样传输即可，前端用同一套渲染
@@ -630,13 +623,13 @@ const server = http.createServer(async (req, res) => {
       await routes[key](req, res, url);
     } catch (err) {
       console.error(`[${key}]`, err);
-      if (!res.headersSent) sendJson(res, 500, { error: err.message });
+      if (!res.headersSent) sendJson(res, 500, err(err.message, err.errorEn));
     }
     return;
   }
 
   if (url.pathname.startsWith('/api/')) {
-    sendJson(res, 404, { error: '接口不存在' });
+    sendJson(res, 404, err('接口不存在', 'No such endpoint'));
     return;
   }
 

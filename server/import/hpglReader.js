@@ -147,7 +147,10 @@ export function parseHpgl(text, opts = {}) {
       continue;
     }
     if (c === 'L' && mnemonic.startsWith('LB')) {
-      warnings.push('文件含 LB 文本指令，刻字机场景建议在设计端转为路径后输出');
+      warnings.push({
+        zh: '文件含 LB 文本指令，刻字机场景建议在设计端转为路径后输出',
+        en: 'File contains LB text commands — convert text to paths in the design app for engraving',
+      });
       continue;
     }
     if (c === '!' && cmd.startsWith('!')) continue;
@@ -156,7 +159,10 @@ export function parseHpgl(text, opts = {}) {
   }
 
   if (stats.unknown.length) {
-    warnings.push(`忽略了 ${stats.unknown.length} 类不认识的指令：${[...new Set(stats.unknown)].join(' ')}`);
+    warnings.push({
+      zh: `忽略了 ${stats.unknown.length} 类不认识的指令：${[...new Set(stats.unknown)].join(' ')}`,
+      en: `Ignored ${stats.unknown.length} unrecognised command(s): ${[...new Set(stats.unknown)].join(' ')}`,
+    });
   }
   void scActive; void sx; void sy;
   return { path, warnings, stats };

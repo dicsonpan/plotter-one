@@ -274,7 +274,9 @@ export function parseSvg(svgText, opts = {}) {
       path.subpaths.push(s);
     }
   }
-  if (!path.subpaths.length) warnings.push('SVG 中未找到可用的路径数据');
+  if (!path.subpaths.length) {
+    warnings.push({ zh: 'SVG 中未找到可用的路径数据', en: 'No usable path data found in the SVG' });
+  }
 
   return { path, warnings, meta: { viewBox: vb, scale, offset: { x: ox, y: oy } } };
 }

@@ -20,6 +20,23 @@ import {
 
 export const Direction = { CW: 'cw', CCW: 'ccw', ALTERNATE: 'alternate' };
 
+/**
+ * 构造一条双语警告。
+ *
+ * 返回 `{ zh, en }` 而不是纯字符串，是为了让它能原样序列化给前端，
+ * 由前端按当前语言挑选（见 web/js/app.js 的 pickLang）。
+ * 保留字符串形态的兼容性很重要：任何还在 `warnings.push('...')` 的地方
+ * 都不会崩，只是英文界面下会显示中文——**降级而不是崩溃**。
+ *
+ * @param {string} zh 中文
+ * @param {string} en 英文
+ * @returns {{zh:string, en:string}}
+ */
+function warn(zh, en) {
+  return { zh, en };
+}
+
+
 export function analyze(path, preset) {
   const bbox = pathBBox(path);
   const length = pathLength(path);
@@ -65,12 +82,23 @@ export function compileToolpath(inputPath, preset, options = {}) {
 
   const info = analyze(path, preset);
   if (info.oversize.x || info.oversize.y) {
-    warnings.push(`图形超出幅面：X 最大 ${info.bbox.maxX.toFixed(1)}mm / Y 最大 ${info.bbox.maxY.toFixed(1)}mm，机器上限 ${preset.width}×${preset.height}mm`);
+    warnings.push(warn(
+      `图形超出幅面：X 最大 ${info.bbox.maxX.toFixed(1)}mm / Y 最大 ${info.bbox.maxY.toFixed(1)}mm，机器上限 ${preset.width}×${preset.height}mm`,
+      `Design exceeds bed: max X ${info.bbox.maxX.toFixed(1)}mm / max Y ${info.bbox.maxY.toFixed(1)}mm, machine limit ${preset.width}×${preset.height}mm`,
+    ));
   }
   if (info.oversize.left || info.oversize.bottom) {
-    warnings.push('图形有部分位于原点左下方（负坐标），请先移动到材料区域内');
+    warnings.push(warn(
+      '图形有部分位于原点左下方（负坐标），请先移动到材料区域内',
+      'Part of the design lies left/below the origin (negative coords) — move it into the material area',
+    ));
   }
-  if (info.length === 0) warnings.push('刀路为空，请检查图形是否过小或已全部被清理');
+  if (info.length === 0) {
+    warnings.push(warn(
+      '刀路为空，请检查图形是否过小或已全部被清理',
+      'Toolpath is empty — check the design is not too small or was fully pruned',
+    ));
+  }
 
   return { path, info, warnings };
 }

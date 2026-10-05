@@ -146,11 +146,16 @@ export function clampLayerIntoBed(layer, width, height, margin = 2) {
 
 /**
  * 整层复制。复制出来的新图层紧邻原图层，便于做小幅调整再对比。
+ *
+ * ⚠️ 这里**不**给副本加「副本」后缀——图层名是要显示给用户看的，
+ * 而「副本」这个词属于语言问题。调用方（app.js）用当前语言自己起名，
+ * 否则这里写死中文，英文界面就会露出一个中文图层名。
+ * 所以只复制，命名权交给调用方。
  */
 export function duplicateLayer(layer) {
   return {
     id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6),
-    name: layer.name + ' 副本',
+    name: layer.name,
     subpaths: JSON.parse(JSON.stringify(layer.subpaths)),
     hidden: false,
   };

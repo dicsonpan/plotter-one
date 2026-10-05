@@ -212,7 +212,10 @@ export function parseDxf(text) {
           const sub = makeSubpath(+xs[0], +ys[0]);
           for (let i = 1; i < xs.length; i++) addLine(sub, +xs[i], +ys[i]);
           path.subpaths.push(sub);
-          warnings.push('检测到 SPLINE 样条曲线，已按控制点折线处理。若曲线不圆滑，请在设计软件中先转为多段线。');
+          warnings.push({
+            zh: '检测到 SPLINE 样条曲线，已按控制点折线处理。若曲线不圆滑，请在设计软件中先转为多段线。',
+            en: 'SPLINE curves found, approximated by control polygon. If curves look faceted, convert to polylines in your design app first.',
+          });
         }
         break;
       }
