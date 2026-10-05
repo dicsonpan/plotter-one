@@ -6,6 +6,7 @@
 import * as G from '../geom.js';
 import { Renderer } from './render.js';
 import * as T from './transform.js';
+import { t, lang, initLang, setLang, onLangChange } from './i18n.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('stage');
@@ -41,8 +42,10 @@ if (typeof window !== 'undefined') {
     const box = $('logView');
     const div = document.createElement('div');
     if (kind) div.className = 'log-line-' + kind;
-    const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-    div.textContent = `[${t}] ${text}`;
+    // 变量名别叫 t —— 模块顶层的 t() 是取词函数，被局部变量遮蔽后
+    // 这个函数里就再也调不到它了（而且不报错，只是 logLine 里全部取不到词）。
+    const stamp = new Date().toLocaleTimeString(lang() === 'en' ? 'en-GB' : 'zh-CN', { hour12: false });
+    div.textContent = `[${stamp}] ${text}`;
     box.appendChild(div);
     box.scrollTop = box.scrollHeight;
     while (box.children.length > 200) box.firstChild.remove();
@@ -56,7 +59,12 @@ if (typeof window !== 'undefined') {
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `请求失败 ${res.status}`);
+    if (!res.ok) {
+      // 服务端把中文放在 error（既有契约）、英文挂在 errorEn。
+      // 这里按语言挑；都没有才退回状态码文案。
+      const msg = (lang() === 'en' ? (data.errorEn || data.error) : data.error);
+      throw new Error(msg || t('srv.httpFail', { code: res.status }));
+    }
     return data;
   }
 
@@ -70,11 +78,24 @@ if (typeof window !== 'undefined') {
     // 再等一帧，确保 grid 布局已生效
     await new Promise((r) => requestAnimationFrame(r));
 
+    // 语言必须在任何渲染之前定下来：静态文案靠 applyI18n 刷，
+    // 动态文案（统计、状态、下拉）则由下面的 onLangChange 回调重刷。
+    initLang();
+
     renderer.resize();
     if (!renderer.vw) renderer.resize();
     renderer.fit();
     wireCanvas();
     wireUI();
+    // 切语言后要重画一切动态文案。只刷 HTML 会出现
+    // 「按钮已是英文、统计数字还是中文」的半截状态，比不切还让人困惑。
+    onLangChange(() => {
+      refreshState();
+      renderLayerList();
+      updateStats();
+      updateTransformPanel();
+      renderer.dirty = true;
+    });
     await refreshState();
     fitToContent();
     connectWS();
@@ -90,32 +111,38 @@ if (typeof window !== 'undefined') {
       state.materials = s.materials;
       state.connected = s.device.connected;
 
-      // 机器下拉
+      // 机器下拉。nameEn 由服务端一并下发，避免在前端再维护一份机型名对照表——
+      // 两份表必然会漂移，改了一处忘了另一处，界面就会显示错型号（且不报错）。
       const sel = $('machineSel');
-      if (sel.options.length === 0) {
+      const en = lang() === 'en';
+      if (sel.options.length === 0 || sel.dataset.lang !== lang()) {
+        sel.innerHTML = '';
         for (const [id, p] of Object.entries(s.presets)) {
           const o = document.createElement('option');
           o.value = id;
-          o.textContent = `${p.name} · ${p.width}×${p.height}mm`;
+          o.textContent = `${en ? (p.nameEn || p.name) : p.name} · ${p.width}×${p.height}mm`;
           sel.appendChild(o);
         }
+        sel.dataset.lang = lang();
       }
       // 下拉框同理：聚焦时不回写，否则用户正打开着选项就被刷掉
       if (document.activeElement !== sel) sel.value = s.config.machineId;
       renderer.setPreset(s.preset);
       renderer.dirty = true;
 
-      // 材料下拉
+      // 材料下拉（nameEn 同样由服务端下发，理由同机器下拉）
       const ms = $('matSel');
-      if (ms.options.length === 0) {
+      if (ms.options.length === 0 || ms.dataset.lang !== lang()) {
+        ms.innerHTML = '';
         for (const m of s.materials) {
           const o = document.createElement('option');
           o.value = m.id;
-          o.textContent = `${m.name} — ${m.speed}mm/s ${m.force}g`;
+          o.textContent = `${en ? (m.nameEn || m.name) : m.name} — ${m.speed}mm/s ${m.force}g`;
           o.dataset.speed = m.speed;
           o.dataset.force = m.force;
           ms.appendChild(o);
         }
+        ms.dataset.lang = lang();
         // 恢复上次选择的材料。若配置里的速度/刀压与该预设一致（说明用户没手动改过），
         // 就把滑块也归位到预设值；否则保留用户的手动设置——
         // 否则会出现「下拉写着 3mm 亚克力、滑块却是薄纸参数」这种自相矛盾。
@@ -143,16 +170,6 @@ if (typeof window !== 'undefined') {
         $('forceRange').value = s.config.defaultForce;
         $('forceVal').textContent = s.config.defaultForce;
         $('dirSel').value = s.config.direction;
-        // 轴向：config 优先（用户校准过），否则用机型预设的默认值
-        const ax = s.config.axisX !== undefined ? s.config.axisX : (s.preset.axisX ?? 1);
-        const ay = s.config.axisY !== undefined ? s.config.axisY : (s.preset.axisY ?? 1);
-        const sw = s.config.swapAxes !== undefined ? !!s.config.swapAxes : !!s.preset.swapAxes;
-        $('axisXSel').value = String(ax);
-        $('axisYSel').value = String(ay);
-        $('axisSwapSel').value = sw ? '1' : '0';
-        state.config.axisX = ax;
-        state.config.axisY = ay;
-        state.config.swapAxes = sw;
       }
 
       $('serverInfo').textContent = `${s.server.hostname} · :${s.server.port}`;
@@ -162,10 +179,10 @@ if (typeof window !== 'undefined') {
       const busy = s.job.state === 'running';
       pill.className = 'conn-pill' + (busy ? ' busy' : s.device.connected ? ' on' : '');
       $('connText').textContent = busy
-        ? (state.jobState === 'paused' ? '已暂停' : '输出中')
-        : s.device.connected ? '已连接' : '未连接';
+        ? t(state.jobState === 'paused' ? 'conn.paused' : 'conn.outputting')
+        : t(s.device.connected ? 'btn.connected' : 'btn.disconnected');
       $('btnDisconnect').disabled = !s.device.connected;
-      $('btnConnectTop').textContent = s.device.connected ? '已连接' : '连接设备';
+      $('btnConnectTop').textContent = t(s.device.connected ? 'btn.connected' : 'btn.connect');
 
       // 手动控制只有连上机器才有意义，未连接时置灰。
       // .pad-key 是 button，disabled 有效；用 class 让样式一起变灰。
@@ -173,13 +190,12 @@ if (typeof window !== 'undefined') {
       document.querySelectorAll('[data-manual]').forEach((b) => { b.disabled = padOff; });
       document.querySelectorAll('.pad-key').forEach((b) => { b.disabled = padOff; b.classList.toggle('off', padOff); });
 
-      $('qrHint').innerHTML =
-        `同一 Wi-Fi 下，手机浏览器打开 <b>http://${location.hostname}:${location.port || 80}</b> 即可控制这台刻字机，无需安装 App。` +
-        `<br>把本页「添加到主屏幕」，用起来跟 App 一样。`;
+      // 地址由 t() 内部替换 {{host}}，不写死 IP——换网络时提示才准确
+      $('qrHint').innerHTML = t('srv.qrHint') + `<br>${t('srv.qrHint2')}`;
 
       updateStats();
     } catch (e) {
-      $('serverInfo').textContent = '服务未响应';
+      $('serverInfo').textContent = t('srv.unresponsive');
     }
   }
 
@@ -201,14 +217,16 @@ if (typeof window !== 'undefined') {
         onJobState(payload);
         return;
       }
-      if (type === 'job:log') { logLine(payload.line); return; }
+      // 服务端日志同时带两种语言，按当前语言取。
+      // 回退到 line 是为了兼容旧服务端（只发单语）时不至于显示空白。
+      if (type === 'job:log') { logLine(pickLang(payload)); return; }
       if (type === 'device:data') {
         if (payload.data && payload.data.trim()) logLine('← ' + payload.data.trim().slice(0, 60), 'ok');
         return;
       }
-      if (type === 'device:connected') { toast('设备已连接', 'ok'); refreshState(); return; }
-      if (type === 'device:closed') { toast('设备已断开', 'err'); refreshState(); return; }
-      if (type === 'device:error') { toast('设备错误：' + payload.message, 'err'); return; }
+      if (type === 'device:connected') { toast(t('toast.deviceConnected'), 'ok'); refreshState(); return; }
+      if (type === 'device:closed') { toast(t('toast.deviceClosed'), 'err'); refreshState(); return; }
+      if (type === 'device:error') { toast(t('toast.deviceError', { msg: payload.message }), 'err'); return; }
       if (type === 'config:updated') { state.config = payload; return; }
     };
 
@@ -216,6 +234,24 @@ if (typeof window !== 'undefined') {
       setTimeout(connectWS, 3000);
     };
     ws.onerror = () => { /* onclose 会重连 */ };
+  }
+
+  /**
+   * 从服务端消息里取当前语言的那一份。
+   *
+   * 服务端对每条面向用户的文案都同时下发中英两份，字段名有两套约定：
+   *   - 日志 / 警告：`{ zh, en }`（还有 `line` 兼容旧前端）
+   *   - meta.note：`{ note, noteEn }`（note 是既有字段，保留中文语义）
+   * 两种都支持，取不到就返回空串由调用方决定兜底——
+   * 宁可少显示，也不要给用户一串 undefined。
+   */
+  function pickLang(p) {
+    if (p === null || p === undefined) return '';
+    if (typeof p === 'string') return p;
+    const en = lang() === 'en';
+    if (p.note !== undefined) return en ? (p.noteEn || p.note) : p.note;
+    if (en) return p.en || p.zh || p.line || '';
+    return p.zh || p.en || p.line || '';
   }
 
   function onSync(s) {
@@ -229,28 +265,34 @@ if (typeof window !== 'undefined') {
   function onProgress(p) {
     const fill = $('progFill');
     fill.style.width = p.percent + '%';
-    $('progText').textContent = `${p.percent}% · ${p.sent}/${p.total} 行`;
+    $('progText').textContent = t('job.progress', {
+      pct: p.percent, sent: p.sent, total: p.total,
+    });
     const eta = p.etaMs || 0;
-    $('progEta').textContent = eta > 0 ? '剩余约 ' + fmtTime(eta) : '';
+    $('progEta').textContent = eta > 0 ? t('job.eta', { time: fmtTime(eta) }) : '';
   }
 
   function onJobState(s) {
     $('jobPanel').style.display = 'block';
     const fill = $('progFill');
     fill.className = 'progress-fill' + (s.state === 'done' ? ' ok' : s.state === 'aborted' ? ' stop' : '');
-    if (s.state === 'idle') { $('btnPause').textContent = '暂停'; }
-    if (s.state === 'paused') { $('btnPause').textContent = '继续'; }
-    if (s.state === 'running') { $('btnPause').textContent = '暂停'; }
+    // 按钮文案不能靠 data-i18n 自动刷：它是按状态动态切换的，
+    // 必须每次进这里都重设一遍，否则切语言后会与当前状态不符
+    // （比如暂停中却显示英文「Pause」）。
+    if (s.state === 'idle') { $('btnPause').textContent = t('btn.pause'); }
+    if (s.state === 'paused') { $('btnPause').textContent = t('btn.resume'); }
+    if (s.state === 'running') { $('btnPause').textContent = t('btn.pause'); }
     if (s.state === 'done') { fill.style.width = '100%'; }
     refreshState();
   }
 
+  /** 毫秒 → 「1分 20秒」/「1m 20s」这类可读时长 */
   function fmtTime(ms) {
     const s = Math.round(ms / 1000);
-    if (s < 60) return s + ' 秒';
+    if (s < 60) return t('time.sec', { n: s });
     const m = Math.floor(s / 60);
-    if (m < 60) return m + ' 分 ' + (s % 60) + ' 秒';
-    return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+    if (m < 60) return t('time.minSec', { m, s: s % 60 });
+    return t('time.hourMin', { h: Math.floor(m / 60), m: m % 60 });
   }
 
   // ---------------------------------------------------------------- 画布交互
@@ -547,7 +589,7 @@ if (typeof window !== 'undefined') {
     const list = renderer.layers;
     box.innerHTML = '';
     $('layerEmpty').style.display = list.length ? 'none' : '';
-    $('layerCount').textContent = list.length ? list.length + ' 项' : '';
+    $('layerCount').textContent = list.length ? t('layers.count', { n: list.length }) : '';
     $('btnSend').disabled = list.length === 0;
 
     for (const layer of list.slice().reverse()) {
@@ -558,8 +600,8 @@ if (typeof window !== 'undefined') {
       el.innerHTML = `
         <span class="nm">${escapeHtml(layer.name)}</span>
         <span class="meta">${len.toFixed(0)}mm</span>
-        <button class="btn btn-sm" data-act="vis" title="显示/隐藏">${layer.hidden ? '○' : '●'}</button>
-        <button class="btn btn-sm" data-act="del" title="删除">×</button>`;
+        <button class="btn btn-sm" data-act="vis" title="${t('layer.hidden')}">${layer.hidden ? '○' : '●'}</button>
+        <button class="btn btn-sm" data-act="del" title="${t('prop.del')}">×</button>`;
       el.querySelector('[data-act=vis]').addEventListener('click', (e) => {
         e.stopPropagation();
         layer.hidden = !layer.hidden;
@@ -609,7 +651,7 @@ if (typeof window !== 'undefined') {
     } else if (len > 0) {
       const spd = +$('speedRange').value;
       $('statTime').textContent = fmtTime((len / spd) * 1000);
-      $('statBytes').textContent = '待生成';
+      $('statBytes').textContent = t('stat.pending');
     } else {
       $('statTime').textContent = '—';
       $('statBytes').textContent = '—';
@@ -719,6 +761,8 @@ if (typeof window !== 'undefined') {
     $('btnDupLayer').addEventListener('click', () => {
       const l = selectedLayer(); if (!l) return;
       const copy = T.duplicateLayer(l);
+      // 副本名带语言后缀，所以每次都重算——切语言后再次复制应该显示新语言
+      copy.name = t('prop.copySuffix', { name: l.name });
       T.translateLayer(copy, 10, -10);
       renderer.layers.push(copy);
       state.selectedId = copy.id;
@@ -743,115 +787,6 @@ if (typeof window !== 'undefined') {
       updateStats();
     });
   }
-
-  // ---------------------------------------------------------------- 坐标轴校准
-  /**
-   * 原点校准向导：一次只走 5mm，全程抬刀。
-   * 方向猜错会撞机，所以必须能安全地一小步一小步试。
-   */
-  async function runCalibration(dir) {
-    if (!state.connected) { toast('设备未连接', 'err'); return; }
-    const askText = {
-      'x+': '刀头是往「右」移动了吗？',
-      'y+': '材料是往「里」走（远离你）了吗？',
-    }[dir];
-    const ans = await confirmSafe(
-      `即将测试：${dir[0] === 'x' ? '刀头' : '材料'}向${dir[0] === 'x' ? '右' : '里'}移动 5mm，然后自动返回。\n` +
-      `全程抬刀，不落刀、不划伤材料；用的是相对移动，没归位也安全。\n\n准备好了点「确定」。`
-    );
-    if (!ans) return;
-    try {
-      const r = await api('/api/calibrate', { method: 'POST', body: { dir } });
-      logLine(`校准指令已下发：${dir}`, 'ok');
-      // 指令跑完后再问，避免用户手忙脚乱
-      setTimeout(() => showCalibResult(dir, askText), 1600);
-    } catch (e) {
-      logLine('校准失败：' + e.message, 'err');
-      toast(e.message, 'err');
-    }
-  }
-
-  function showCalibResult(dir, askText) {
-    const box = document.createElement('div');
-    box.className = 'modal-bg';
-    const yesLabel = dir === 'x+' ? '是，往右走了' : '是，往里走了';
-    box.innerHTML = `
-      <div class="modal" style="width:min(420px,100%)">
-        <div class="modal-head">校准结果</div>
-        <div class="modal-body">
-          <p style="margin:0 0 14px; font-size:14px">${askText}</p>
-          <div class="btn-grid" style="grid-template-columns:1fr 1fr">
-            <button class="btn btn-ok" data-r="yes">${yesLabel}</button>
-            <button class="btn btn-warn" data-r="no">不是，方向反了</button>
-          </div>
-          <p style="margin:14px 0 0;font-size:12px;color:var(--text-2)">
-            选「不是」会自动翻转该轴并保存，下次就对了。
-          </p>
-        </div>
-      </div>`;
-    document.body.appendChild(box);
-    box.querySelectorAll('[data-r]').forEach((b) => {
-      b.addEventListener('click', async () => {
-        // 🔴 写回哪个字段由服务端决定：轴交换时「按右」实际测的是机器 Y，
-        //    前端自己按 dir 猜 axis 会在交换模式下翻错那根轴。
-        const swap = !!state.config.swapAxes;
-        const axis = dir[0] === 'x' ? (swap ? 'axisY' : 'axisX')
-                                 : (swap ? 'axisX' : 'axisY');
-        const current = +(b.dataset.r === 'yes' ? 1 : -1);
-        const existing = state.config[axis] !== undefined ? state.config[axis] : current;
-        // 「是」→ 设为 1；「不是」→ 若当前是 1 就改 -1
-        const want = b.dataset.r === 'yes' ? 1 : (existing > 0 ? -1 : 1);
-        await api('/api/config', { method: 'POST', body: { [axis]: want } });
-        state.config[axis] = want;
-        $(axis === 'axisX' ? 'axisXSel' : 'axisYSel').value = String(want);
-        logLine(`已设置 ${axis} = ${want}`, 'ok');
-        box.remove();
-        toast('已保存，可以继续测试另一轴', 'ok');
-      });
-    });
-  }
-
-  const confirmSafe = (msg) => confirm(msg);
-
-  function wireAxisCalibration() {
-    /**
-     * 校准向导：依次测 X、Y 两步。
-     * 原来只测 X 就结束，用户以为校准完了，实际 Y 方向仍是猜的——
-     * 而这台机器的走纸（Y）方向恰恰是最容易设反的那个。
-     */
-    $('btnCalibrate').addEventListener('click', async () => {
-      if (!state.connected) { toast('设备未连接', 'err'); return; }
-      await runCalibration('x+');
-      // 第一步答完后再问要不要继续测 Y，避免一次性弹两个框把人搞晕
-      if (await confirmSafe('X 轴已确认。\n\n接着测 Y 轴（走纸方向）吗？\n同样是 5mm、抬刀、来回一次。')) {
-        await runCalibration('y+');
-      } else {
-        toast('已跳过 Y 轴。方向没确认前不要上料刻字。', 'warn');
-      }
-    });
-    $('axisXSel').addEventListener('change', () => {
-      api('/api/config', { method: 'POST', body: { axisX: +$('axisXSel').value } })
-        .then(() => { state.config.axisX = +$('axisXSel').value; logLine('X 轴方向已改为 ' + $('axisXSel').value, 'ok'); })
-        .catch((e) => logLine('保存失败：' + e.message, 'err'));
-    });
-    $('axisYSel').addEventListener('change', () => {
-      api('/api/config', { method: 'POST', body: { axisY: +$('axisYSel').value } })
-        .then(() => { state.config.axisY = +$('axisYSel').value; logLine('Y 轴方向已改为 ' + $('axisYSel').value, 'ok'); })
-        .catch((e) => logLine('保存失败：' + e.message, 'err'));
-    });
-    $('axisSwapSel').addEventListener('change', () => {
-      const sw = $('axisSwapSel').value === '1';
-      api('/api/config', { method: 'POST', body: { swapAxes: sw } })
-        .then(() => {
-          state.config.swapAxes = sw;
-          logLine('X/Y 轴' + (sw ? '已设为交换' : '已恢复正常对应'), 'ok');
-          // 交换会改变两轴的物理含义，方向设置需要重新确认
-          if (sw) toast('已交换。方向可能也要重设，建议重新跑一次校准。', 'warn');
-        })
-        .catch((e) => logLine('保存失败：' + e.message, 'err'));
-    });
-  }
-
   // ---------------------------------------------------------------- UI 绑定
   function wireUI() {
     // 移动端标签
@@ -886,7 +821,7 @@ if (typeof window !== 'undefined') {
     // 文字
     $('btnAddText').addEventListener('click', async () => {
       const text = $('txtContent').value.trim();
-      if (!text) { toast('请输入内容', 'err'); return; }
+      if (!text) { toast(t('toast.emptyText'), 'err'); return; }
       try {
         const r = await api('/api/text-to-path', {
           method: 'POST',
@@ -898,8 +833,10 @@ if (typeof window !== 'undefined') {
             y: +$('txtY').value,
           },
         });
-        addLayer('文字「' + text.slice(0, 8) + '」', r.path);
-        toast(r.path.meta?.note || '已加入', r.path.meta?.unsupported?.length ? 'err' : 'ok');
+        addLayer(t('layer.text', { text: text.slice(0, 8) }), r.path);
+        // 服务端 note 也是双语的（meta.noteZh / meta.noteEn）
+        const note = pickLang(r.path.meta?.note);
+        toast(note || t('toast.added'), r.path.meta?.unsupported?.length ? 'err' : 'ok');
       } catch (e) { toast(e.message, 'err'); }
     });
 
@@ -912,28 +849,34 @@ if (typeof window !== 'undefined') {
       const body = { type, x: cx - size / 2, y: cy - size / 2, w: size, h: size, r: size / 2, rx: size / 2, ry: size / 3, x1: cx - size / 2, y1: cy, x2: cx + size / 2, y2: cy };
       try {
         const r = await api('/api/geometry', { method: 'POST', body: { items: [body] } });
-        const names = { rect: '矩形', circle: '圆形', ellipse: '椭圆', line: '直线' };
-        addLayer(names[type], r.path);
+        // 形状名直接用下拉项自己的文案，所见即所得
+        addLayer($('shpType').selectedOptions[0].textContent, r.path);
       } catch (e) { toast(e.message, 'err'); }
     });
 
     // 连接
     $('connType').addEventListener('change', () => {
-      const t = $('connType').value;
-      $('portWrap').style.display = t === 'serial' ? '' : 'none';
-      $('tcpWrap').style.display = t === 'tcp' ? '' : 'none';
+      const kind = $('connType').value;
+      $('portWrap').style.display = kind === 'serial' ? '' : 'none';
+      $('tcpWrap').style.display = kind === 'tcp' ? '' : 'none';
     });
     $('btnScanPorts').addEventListener('click', scanPorts);
     $('btnConnect').addEventListener('click', doConnect);
     $('btnDisconnect').addEventListener('click', async () => {
       await api('/api/disconnect', { method: 'POST' });
-      toast('已断开');
+      toast(t('toast.disconnected'));
       refreshState();
+    });
+
+    // 语言切换。setLang 内部会：刷 HTML 静态文案 → 触发 onLangChange 回调
+    // → 回调里重刷动态文案与画布。所以这里不用自己做任何刷新动作。
+    $('btnLang').addEventListener('click', () => {
+      setLang(lang() === 'zh' ? 'en' : 'zh');
     });
 
     $('machineSel').addEventListener('change', async () => {
       await api('/api/config', { method: 'POST', body: { machineId: $('machineSel').value } });
-      toast('已切换机型');
+      toast(t('toast.machineChanged'));
       refreshState();
     });
 
@@ -961,22 +904,25 @@ if (typeof window !== 'undefined') {
     $('btnSend').addEventListener('click', doSend);
 
     $('btnPause').addEventListener('click', async () => {
-      const pausing = $('btnPause').textContent === '暂停';
+      // ⚠️ 判据必须用 state.jobState，**不能**比按钮文案。
+      // 按钮文案会随语言变化（中文「暂停」/ 英文「Pause」），
+      // 拿文案判状态在英文下必然失效——症状是「点了没反应」或「暂停/继续反了」。
+      const pausing = state.jobState !== 'paused';
       await api(pausing ? '/api/job/pause' : '/api/job/resume', { method: 'POST' });
     });
     $('btnStop').addEventListener('click', () => api('/api/job/stop', { method: 'POST' }));
     $('btnEstop').addEventListener('click', () => {
-      if (confirm('急停会立即中断输出并抬刀。确定吗？')) {
+      if (confirm(t('btn.estopTitle'))) {
         api('/api/job/estop', { method: 'POST' });
-        toast('已急停', 'err');
+        toast(t('toast.estopped'), 'err');
       }
     });
 
     $('btnCopyCode').addEventListener('click', async () => {
-      if (!state.gcode) { toast('还没有生成指令', 'err'); return; }
+      if (!state.gcode) { toast(t('toast.needCompile'), 'err'); return; }
       try {
         await navigator.clipboard.writeText(state.gcode);
-        toast('已复制', 'ok');
+        toast(t('toast.copied'), 'ok');
       } catch {
         const ta = document.createElement('textarea');
         ta.value = state.gcode;
@@ -984,11 +930,11 @@ if (typeof window !== 'undefined') {
         ta.select();
         document.execCommand('copy');
         ta.remove();
-        toast('已复制', 'ok');
+        toast(t('toast.copied'), 'ok');
       }
     });
     $('btnSaveCode').addEventListener('click', () => {
-      if (!state.gcode) { toast('还没有生成指令', 'err'); return; }
+      if (!state.gcode) { toast(t('toast.needCompile'), 'err'); return; }
       const blob = new Blob([state.gcode], { type: 'text/plain' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -1000,7 +946,6 @@ if (typeof window !== 'undefined') {
     scanPorts();
     wirePad();
     wireTransformPanel();
-    wireAxisCalibration();
     updateTransformPanel();
     renderLayerList();
   }
@@ -1024,12 +969,14 @@ if (typeof window !== 'undefined') {
    * 这样能限速、能看日志、并且急停依然有效——不能有绕过急停的路径。
    */
   async function sendManual(cmd, label) {
-    if (!state.connected) { toast('设备未连接', 'err'); return; }
+    if (!state.connected) { toast(t('toast.noDevice'), 'err'); return; }
     try {
       const r = await api('/api/manual', { method: 'POST', body: cmd });
-      if (r.notes && r.notes.length) logLine(r.notes.join('；'), 'ok');
+      if (r.notes && r.notes.length) {
+        logLine(r.notes.map((x) => pickLang(x)).join(lang() === 'en' ? '; ' : '；'), 'ok');
+      }
     } catch (e) {
-      logLine('手动控制失败：' + e.message, 'err');
+      logLine(t('log.manualFail', { msg: e.message }), 'err');
       toast(e.message, 'err');
     }
   }
@@ -1072,8 +1019,8 @@ if (typeof window !== 'undefined') {
     const center = document.querySelector('.pad-key.center');
     if (center) {
       center.addEventListener('click', () => {
-        if (!state.connected) { toast('设备未连接', 'err'); return; }
-        if (!confirm('落刀会在当前位置划入 2mm 试刀压。\n请确认下面是废料，不是成品。')) return;
+        if (!state.connected) { toast(t('toast.noDevice'), 'err'); return; }
+        if (!confirm(t('confirm.pendown'))) return;
         sendManual({ action: 'pendown' }, 'pendown');
       });
     }
@@ -1082,8 +1029,7 @@ if (typeof window !== 'undefined') {
     document.querySelectorAll('[data-manual]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const action = btn.dataset.manual;
-        if (action === 'setorigin' && !confirm(
-          '把当前位置设为新原点？\n\n之前的坐标全部作废，后续按新位置计算。\n不确定就别点——先在机身面板上校准。')) return;
+        if (action === 'setorigin' && !confirm(t('confirm.setorigin'))) return;
         const cmd = { action };
         if (btn.dataset.dist) cmd.distance = +btn.dataset.dist;
         sendManual(cmd, action);
@@ -1103,6 +1049,20 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 串口
+  /**
+   * 串口下拉里那一行「未检测到串口设备」是**占位项**，不是真实串口。
+   *
+   * 它在 scanPorts 时写进去，但切语言时不会被 data-i18n 刷到
+   * （那是 JS 生成的 option，不带 data-i18n 属性）——
+   * 症状就是「界面都切成中文了，串口下拉里还挂着英文 No serial port found」。
+   *
+   * 解决办法：给这个 option 打上 data-i18n，让 applyI18n 也能扫到它。
+   * 真实串口（/dev/ttyACM0 之类）没有文案，不需要也不能翻译。
+   */
+  function emptyPortOption() {
+    return `<option value="" data-i18n="port.none">${t('port.none')}</option>`;
+  }
+
   async function scanPorts() {
     try {
       const r = await api('/api/serial-ports');
@@ -1110,8 +1070,8 @@ if (typeof window !== 'undefined') {
       const prev = sel.value;
       sel.innerHTML = '';
       if (!r.ports.length) {
-        sel.innerHTML = '<option value="">未检测到串口设备</option>';
-        logLine('未检测到串口设备。若是 USB 转串口，请确认驱动已装、线缆已插', 'err');
+        sel.innerHTML = emptyPortOption();
+        logLine(t('log.portNone'), 'err');
         return;
       }
       for (const p of r.ports) {
@@ -1122,8 +1082,8 @@ if (typeof window !== 'undefined') {
         sel.appendChild(o);
       }
       if (prev) sel.value = prev;
-      logLine(`检测到 ${r.ports.length} 个串口`);
-    } catch (e) { logLine('串口扫描失败：' + e.message, 'err'); }
+      logLine(t('log.portFound', { n: r.ports.length }));
+    } catch (e) { logLine(t('log.scanFail', { msg: e.message }), 'err'); }
   }
 
   async function doConnect() {
@@ -1131,24 +1091,26 @@ if (typeof window !== 'undefined') {
     const body = { type };
     if (type === 'serial') {
       const path = $('portSel').value;
-      if (!path) { toast('请选择串口', 'err'); return; }
+      if (!path) { toast(t('toast.needPort'), 'err'); return; }
       Object.assign(body, { path, baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false });
     } else if (type === 'tcp') {
       Object.assign(body, { host: $('tcpHost').value, port: +$('tcpPort').value });
     }
     try {
       $('btnConnect').disabled = true;
-      $('btnConnect').textContent = '连接中…';
+      $('btnConnect').textContent = t('btn.connecting');
       const r = await api('/api/connect', { method: 'POST', body });
-      toast('已连接：' + (r.device?.path || type), 'ok');
-      logLine('已连接 ' + (r.device?.path || type), 'ok');
+      // pathEn 存在时说明这是内置虚拟机的标签（唯一一处非真实路径的中文文案）
+      const dev = (lang() === 'en' ? (r.device?.pathEn || r.device?.path) : r.device?.path) || type;
+      toast(t('toast.connectOk', { dev }), 'ok');
+      logLine(t('log.connectOk', { dev }), 'ok');
       await refreshState();
     } catch (e) {
-      toast('连接失败：' + e.message, 'err');
-      logLine('连接失败：' + e.message, 'err');
+      toast(t('toast.connectFail', { msg: e.message }), 'err');
+      logLine(t('log.connectFail', { msg: e.message }), 'err');
     } finally {
       $('btnConnect').disabled = false;
-      $('btnConnect').textContent = '连接';
+      $('btnConnect').textContent = t('btn.connect');
     }
   }
 
@@ -1156,7 +1118,7 @@ if (typeof window !== 'undefined') {
   async function onFile(e) {
     const f = e.target.files[0];
     if (!f) return;
-    logLine('正在解析 ' + f.name + '…');
+    logLine(t('toast.parsing', { name: f.name }));
     try {
       const text = await f.text();
       const r = await api('/api/import', {
@@ -1164,18 +1126,18 @@ if (typeof window !== 'undefined') {
         body: { content: text, filename: f.name },
       });
       if (!r.path.subpaths.length) {
-        toast('文件里没找到可用的路径', 'err');
+        toast(t('toast.noPath'), 'err');
         return;
       }
       addLayer(f.name, r.path);
-      toast('已导入 ' + f.name, 'ok');
-      logLine(`导入成功：${r.path.subpaths.length} 条路径，长度 ${r.info.length.toFixed(0)}mm`);
-      for (const w of r.warnings || []) { logLine('注意：' + w); }
+      toast(t('toast.imported', { name: f.name }), 'ok');
+      logLine(t('log.importOk', { n: r.path.subpaths.length, len: r.info.length.toFixed(0) }));
+      for (const w of r.warnings || []) { logLine(t('log.notice', { msg: pickLang(w) || w })); }
       fitToContent();
       updateStats();
     } catch (err) {
-      toast('解析失败：' + err.message, 'err');
-      logLine('解析失败：' + err.message, 'err');
+      toast(t('toast.parseFail', { msg: err.message }), 'err');
+      logLine(t('log.parseFail', { msg: err.message }), 'err');
     } finally {
       e.target.value = '';
     }
@@ -1214,7 +1176,7 @@ if (typeof window !== 'undefined') {
       for (const sub of G.circleToPath(235 + i * 16, 300, 5).subpaths) p.subpaths.push(sub);
     }
 
-    addLayer('示例招牌', p);
+    addLayer(t('demo.sign'), p);
 
     // 文字：42mm 高时宽约 356mm，起点 137 正好居中（中心 315）
     fetch('/api/text-to-path', {
@@ -1225,8 +1187,8 @@ if (typeof window !== 'undefined') {
       .then((r) => r.json())
       .then((r) => {
         if (r.path) {
-          addLayer('文字「SPARKMINDS」', r.path);
-          logLine('示例已载入');
+          addLayer(t('layer.text', { text: 'SPARKMINDS' }), r.path);
+          logLine(t('toast.demoLoaded'));
         }
         fitToContent();
         updateStats();
@@ -1243,7 +1205,7 @@ if (typeof window !== 'undefined') {
 
   async function doCompile() {
     const items = buildItems();
-    if (!items.length) { toast('版面是空的', 'err'); return; }
+    if (!items.length) { toast(t('toast.emptyLayout'), 'err'); return; }
     try {
       $('btnCompile').disabled = true;
       const r = await api('/api/compile', {
@@ -1265,14 +1227,17 @@ if (typeof window !== 'undefined') {
       for (const w of r.warnings || []) {
         const d = document.createElement('div');
         d.className = 'notice notice-warn';
-        d.textContent = w;
+        d.textContent = pickLang(w) || w;
         warnBox.appendChild(d);
       }
-      toast(`已生成 ${(r.bytes / 1024).toFixed(1)} KB 指令`, 'ok');
-      logLine(`编译完成：${r.commandCount} 条指令，${(r.bytes / 1024).toFixed(1)}KB，预计 ${fmtTime(r.estimate.wallSeconds * 1000)}`);
+      const kb = (r.bytes / 1024).toFixed(1);
+      toast(t('toast.generated', { kb }), 'ok');
+      logLine(t('log.compileDone', {
+        n: r.commandCount, kb, time: fmtTime(r.estimate.wallSeconds * 1000),
+      }));
     } catch (e) {
-      toast('生成失败：' + e.message, 'err');
-      logLine('生成失败：' + e.message, 'err');
+      toast(t('toast.compileFail', { msg: e.message }), 'err');
+      logLine(t('toast.compileFail', { msg: e.message }), 'err');
     } finally {
       $('btnCompile').disabled = false;
     }
@@ -1280,7 +1245,7 @@ if (typeof window !== 'undefined') {
 
   async function previewAnim() {
     const items = buildItems();
-    if (!items.length) { toast('版面是空的', 'err'); return; }
+    if (!items.length) { toast(t('toast.emptyLayout'), 'err'); return; }
     try {
       const r = await api('/api/compile', {
         method: 'POST',
@@ -1295,39 +1260,39 @@ if (typeof window !== 'undefined') {
       const back = await api('/api/preview?gcode=' + encodeURIComponent(r.gcode));
       const merged = { subpaths: back.path.subpaths };
       renderer.startAnim(merged, +$('speedRange').value);
-      renderer.onAnimEnd = () => { logLine('预览完成'); };
-      toast('开始预览刀路');
-    } catch (e) { toast('预览失败：' + e.message, 'err'); }
+      renderer.onAnimEnd = () => { logLine(t('log.previewDone')); };
+      toast(t('toast.previewStart'));
+    } catch (e) { toast(t('toast.previewFail', { msg: e.message }), 'err'); }
   }
 
   async function doSend() {
     if (!state.gcode) {
-      toast('请先生成指令', 'err');
+      toast(t('toast.compileFirst'), 'err');
       return;
     }
     if (!state.connected) {
-      toast('设备未连接', 'err');
+      toast(t('toast.noDevice'), 'err');
       return;
     }
     const items = buildItems();
-    if (items.length > 1 && !confirm(`当前版面有 ${items.length} 项内容，确定要一起输出吗？`)) return;
-    if (!confirm('确定开始刻绘？请确认材料已放好、刀压速度合适。')) return;
+    if (items.length > 1 && !confirm(t('confirm.multi', { n: items.length }))) return;
+    if (!confirm(t('confirm.go'))) return;
 
     try {
       await api('/api/send', {
         method: 'POST',
-        body: { gcode: state.gcode, name: `刻绘 ${items.length} 项` },
+        body: { gcode: state.gcode, name: t('job.name', { n: items.length }) },
       });
       $('jobPanel').style.display = 'block';
-      toast('已开始输出', 'ok');
-      logLine('开始输出到刻字机');
+      toast(t('toast.outputStarted'), 'ok');
+      logLine(t('log.outputStart'));
     } catch (e) {
-      toast('输出失败：' + e.message, 'err');
+      toast(t('toast.outputFail', { msg: e.message }), 'err');
     }
   }
 
   // ---------------------------------------------------------------- 启动
   boot().catch((e) => {
-    logLine('初始化失败：' + e.message, 'err');
-    toast('初始化失败', 'err');
+    logLine(t('log.initFail', { msg: e.message }), 'err');
+    toast(t('toast.bootFail'), 'err');
   });

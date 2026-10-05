@@ -14,7 +14,7 @@ import {
   flattenPath, optimizeOrder, setDirection, signedArea, pruneDegenerate, countElements,
   subpathLength,
 } from './geom/path.js';
-import { MACHINE_PRESETS, HpglBuilder, compileToPlotterLanguage } from './machine/hpgl.js';
+import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
 import { buildManualCommand } from './machine/manual.js';
 import { readFileSync } from 'node:fs';
@@ -341,7 +341,12 @@ section('CAM 与输出');
   // 负坐标必须报警
   const neg = circleToPath(-50, 100, 20);
   const c3 = compileToolpath(neg, preset, {});
-  check('负坐标被拦截', c3.warnings.some((w) => w.includes('负坐标')), JSON.stringify(c3.warnings));
+  // 警告是 {zh, en} 对象（前端按语言挑），所以要分别验两种语言都有内容。
+  // 之前这里写的是 w.includes(...) —— 警告改成对象后直接 TypeError，
+  // 说明这条断言确实在守着「警告的形态」，不是摆设。
+  check('负坐标被拦截（中英文都在）',
+    c3.warnings.some((w) => w && w.zh && w.zh.includes('负坐标') && w.en && w.en.includes('negative')),
+    JSON.stringify(c3.warnings));
 
   const est = estimateTime(c.path, 30);
   check('时间估算为正', est.totalSeconds > 0, `${est.totalSeconds.toFixed(1)}s`);
@@ -430,7 +435,12 @@ section('串口写入路径（曾经从未被测到）');
 
 section('坐标轴方向与不发 SC 安全性');
 {
-  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  // 🔴 本节只测「轴方向」，所以必须把 layoutRotate 钉死为 0。
+  // 力宇预设现在带 layoutRotate:90（实机确认版面要转 90°），
+  // 不钉死的话下面每条断言都会因为多了一次 90° 旋转而失效——
+  // 而失效的方式是「悄悄算出不同的数」，不是报错。
+  // 这是本项目反复踩的坑：断言没锁住维度，改了无关功能就一片红。
+  const au = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
   const seg = { subpaths: [{ start: { x: 0, y: 0 }, elems: [{ type: 'line', x1: 0, y1: 0, x2: 100, y2: 0 }], closed: false }] };
 
   /**
@@ -540,7 +550,9 @@ section('坐标轴方向与不发 SC 安全性');
 
 section('镜像下的几何往返（反射会翻转圆弧绕向）');
 {
-  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  // 锁定 layoutRotate:0：本节只测「方向」对几何的影响。
+  // 换轴与版面旋转另有一节，不锁的话断言就不成立了。
+  const au = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
   // 锁定不交换：本节只测「方向」对几何的影响，交换轴另有一节。
   // 不锁的话预设的 swapAxes:true 会把包围盒也旋转，断言就不成立了。
   const auMirror = { ...au, swapAxes: false };
@@ -571,7 +583,8 @@ section('镜像下的几何往返（反射会翻转圆弧绕向）');
 
 section('轴交换（支持 X/Y 交换配置）');
 {
-  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  // 同样锁定 layoutRotate:0——本节测的是「换轴」，与版面旋转正交。
+  const au = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
   // machineSpanX/Y 是各轴物理跨度的来源
   const bSwap = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: true });
   const bNo = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: false });
@@ -633,6 +646,217 @@ section('轴交换（支持 X/Y 交换配置）');
     prs.length === 2 && (Math.abs(prs[0][0]) === 197 || Math.abs(prs[0][1]) === 197)
     && (prs[0][0] === 0 || prs[0][1] === 0),
     JSON.stringify(prs));
+}
+
+section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时针 90°）');
+{
+  const W = 600, H = 710;   // 画布 600×710（幅面宽 × 进纸长）
+  const base = { width: W, height: H, stepsPerInch: 1000, dialect: 'hpgl' };
+
+  /**
+   * 🔴 这组断言锁的是 2026-10-05 实机结论：
+   * 「SparkMinds」横排刻出来整版逆时针歪 90°，方向正确（不镜像）。
+   * 补偿 = 顺时针 90°。
+   *
+   * 判据用**一条水平线**：
+   * 顺时针 90° 后，原来的水平线必须变成**垂直线**。
+   * 如果哪天改回成镜像（swapAxes）而不是旋转，这条约 400×0 的线
+   * 仍然会变成垂直的——所以额外断言了方向（见下），
+   * 两者合起来才能唯一确定是「顺时针 90°」而不是「任意 90°」。
+   */
+  const b90 = new HpglBuilder({ ...base, layoutRotate: 90 }, { axisX: 1, axisY: 1, swapAxes: false });
+
+  // 画布左下角 (0,0) 经顺时针 90° 后应落到新框的左下角
+  check('旋转 90°：原点映射到 (0, 画布宽)', (() => {
+    const p = b90.toMachine(0, 0);
+    return p.x === 0 && p.y === W;
+  })(), JSON.stringify(b90.toMachine(0, 0)));
+
+  // 画布右下角 (W,0) → 新框左下 (0,0)：原「下边」变成新「左边」
+  check('旋转 90°：原右下角映射到 (0,0)', (() => {
+    const p = b90.toMachine(W, 0);
+    return p.x === 0 && p.y === 0;
+  })(), JSON.stringify(b90.toMachine(W, 0)));
+
+  // 原左边 (0,y) → 新上边 (y, W)：原 x=0 那条边变成新 y=W 那条边
+  check('旋转 90°：原左边变成新上边', (() => {
+    const p = b90.toMachine(0, 100);
+    return p.x === 100 && p.y === W;
+  })(), JSON.stringify(b90.toMachine(0, 100)));
+
+  // 关键判据：水平线 → 垂直线
+  const hLine = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 0); p.subpaths.push(s); return p; };
+  const back90 = parseHpgl(
+    compileToPlotterLanguage(hLine(), { ...base, layoutRotate: 90 },
+      { axisX: 1, axisY: 1, swapAxes: false }).text,
+    { stepsPerInch: 1000 }).path;
+  const bb90 = pathBBox(back90);
+  check('旋转 90°：水平线变垂直线（宽高对调）',
+    Math.abs(bb90.w) < 1 && Math.abs(bb90.h - 400) < 0.5,
+    `${bb90.w.toFixed(1)}×${bb90.h.toFixed(1)}`);
+  check('旋转 90°：线长守恒（400mm）', Math.abs(pathLength(back90) - 400) < 0.5,
+    `${pathLength(back90).toFixed(2)}mm`);
+
+  // 「顺时针」而非「逆时针」：原左下角必须去新框的**左上**。
+  // 顺时针：原左边 → 新上边，故 (0,0) 在新框 y=W（顶部）。
+  // 逆时针则会让 (0,0) 落到 y=0（底部）——这一条把方向钉死。
+  check('旋转 90° 方向为顺时针（原左下 → 新左上）', b90.toMachine(0, 0).y === W);
+
+  // 旋转是 det=+1 的纯旋转，**不翻转圆弧绕向**
+  check('旋转不计入反射（isReflection 仍为 false）', b90.isReflection === false);
+  // 90° 旋转不改变 det，所以「旋转 + 换轴」= 一次反射（不是两次相乘）
+  check('旋转 + 换轴 仍为反射（旋转不抵反射）',
+    new HpglBuilder({ ...base, layoutRotate: 90 }, { swapAxes: true }).isReflection === true);
+  // 真正抵掉反射的是「换轴 + 单轴反向」两次 det=-1
+  check('换轴 + 单轴反向 = 旋转（两次反射相抵）',
+    new HpglBuilder(base, { axisX: -1, axisY: 1, swapAxes: true }).isReflection === false);
+
+  // 圆弧在旋转下往返无损（绕向不变，长度守恒）
+  const cRot = circleToPath(300, 300, 25);
+  const cBack = parseHpgl(
+    compileToPlotterLanguage(cRot, { ...base, layoutRotate: 90 },
+      { axisX: 1, axisY: 1, swapAxes: false }).text,
+    { stepsPerInch: 1000 }).path;
+  check('旋转 90°：整圆往返长度误差 <1%',
+    Math.abs(pathLength(cBack) - pathLength(cRot)) / pathLength(cRot) < 0.01,
+    `${((pathLength(cBack) - pathLength(cRot)) / pathLength(cRot) * 100).toFixed(3)}%`);
+
+  // 相对位移必须与绝对坐标同向：画布「往右 5mm」在旋转后是机器 Y 方向
+  const d = b90.toMachineDelta(5, 0);
+  check('旋转 90°：画布往右 → 机器 Y 负向（与绝对变换自洽）', d.dx === 0 && d.dy === -5,
+    JSON.stringify(d));
+  const dAbs = b90.toMachine(10, 0), dAbs0 = b90.toMachine(5, 0);
+  check('旋转 90°：相对位移与绝对变换自洽',
+    (dAbs.x - dAbs0.x) === d.dx && (dAbs.y - dAbs0.y) === d.dy,
+    `Δ=${JSON.stringify({ dx: dAbs.x - dAbs0.x, dy: dAbs.y - dAbs0.y })} vs ${JSON.stringify(d)}`);
+
+  // 跨度：旋转 90° 后 X/Y 角色对调，机器 X 应拿到 710（进纸长）
+  check('旋转 90° 后 machineSpanX 为进纸长 710', b90.machineSpanX === H, `${b90.machineSpanX}`);
+  check('旋转 90° 后 machineSpanY 为幅面宽 600', b90.machineSpanY === W, `${b90.machineSpanY}`);
+  check('旋转 0 时跨度不换', new HpglBuilder(base, { layoutRotate: 0 }).machineSpanX === W);
+
+  // 旋转 + 换轴相互抵消（异或）：跨度应回到不换
+  const bBoth = new HpglBuilder({ ...base, layoutRotate: 90 }, { swapAxes: true });
+  check('旋转 90° + 换轴相互抵消（跨度回到 600）', bBoth.machineSpanX === W, `${bBoth.machineSpanX}`);
+
+  // 归一化：非 90° 倍数被收敛，不允许悄悄生效
+  check('旋转角归一化到 90 的倍数（37° → 0）',
+    new HpglBuilder({ ...base, layoutRotate: 37 }).layoutRotate === 0);
+  check('旋转角归一化支持负值与超圈（-90 → 270）',
+    new HpglBuilder({ ...base, layoutRotate: -90 }).layoutRotate === 270);
+  check('旋转 450° → 90', new HpglBuilder({ ...base, layoutRotate: 450 }).layoutRotate === 90);
+
+  // 逆变换必须严格可逆——预览靠它把机器坐标还原回设计坐标。
+  // 不可逆的表现是「预览横躺」，而不是报错，所以必须显式断言。
+  for (const rot of [0, 90, 180, 270]) {
+    const b = new HpglBuilder({ ...base, layoutRotate: rot }, { axisX: 1, axisY: 1, swapAxes: false });
+    let ok = true, bad = '';
+    for (const [x, y] of [[0, 0], [100, 200], [W, H], [W, 0], [0, H], [321.5, 654.3]]) {
+      const m = b.toMachine(x, y);
+      const u = b.toUser(m.x, m.y);
+      if (Math.abs(u.x - x) > 1e-6 || Math.abs(u.y - y) > 1e-6) {
+        ok = false; bad = `(${x},${y})→(${m.x},${m.y})→(${u.x},${u.y})`; break;
+      }
+    }
+    check(`旋转 ${rot}°：toUser 是 toMachine 的严格逆变换`, ok, bad);
+  }
+
+  // 逆变换在「旋转 + 镜像」同时存在时也必须成立（顺序反了就会算错且不报错）
+  {
+    const b = new HpglBuilder({ ...base, layoutRotate: 90 }, { axisX: -1, axisY: 1, swapAxes: true });
+    let ok = true, bad = '';
+    for (const [x, y] of [[0, 0], [100, 200], [W, H], [250, 400]]) {
+      const m = b.toMachine(x, y);
+      const u = b.toUser(m.x, m.y);
+      if (Math.abs(u.x - x) > 1e-6 || Math.abs(u.y - y) > 1e-6) {
+        ok = false; bad = `(${x},${y})→(${m.x},${m.y})→(${u.x},${u.y})`; break;
+      }
+    }
+    check('旋转+镜像+换轴：逆变换仍严格可逆', ok, bad);
+  }
+
+  // 实机预设必须带着这个补偿值，否则改了代码也不生效
+  check('力宇 SC631-AU 预设有 layoutRotate:90（实机确认）',
+    MACHINE_PRESETS['liyue-sc631-au'].layoutRotate === 90,
+    `${MACHINE_PRESETS['liyue-sc631-au'].layoutRotate}`);
+}
+
+section('服务端双语（每条面向用户的文案都要有中英两份）');
+{
+  /**
+   * 🔴 这组断言防的是「英文界面里悄悄夹着中文」。
+   *
+   * 那类问题最阴险的地方在于：所有其他检查都是绿的——
+   * 语法对、服务起得来、按钮能点、刻字正常。
+   * 只有真机操作者才会看到「界面上有句话是中文的」。
+   * 所以凡是会走到界面上的文案，都必须有英文，且不能是空串。
+   */
+  const preset = MACHINE_PRESETS['liyue-sc631-au'];
+
+  // 机型预设
+  for (const [id, p] of Object.entries(MACHINE_PRESETS)) {
+    check(`机型 ${id} 有英文名`, !!p.nameEn && !/[一-鿿]/.test(p.nameEn), p.nameEn || '(缺失)');
+  }
+  // 材料预设
+  for (const m of MATERIAL_PRESETS) {
+    check(`材料 ${m.id} 有英文名`, !!m.nameEn && !/[一-鿿]/.test(m.nameEn), m.nameEn || '(缺失)');
+  }
+
+  // CAM 警告
+  const over = compileToolpath(circleToPath(700, 400, 100), preset, {});
+  check('超幅面警告中英俱全',
+    over.warnings.length > 0
+    && over.warnings.every((w) => w && w.zh && w.en && !/[一-鿿]/.test(w.en)),
+    JSON.stringify(over.warnings));
+  const neg = compileToolpath(circleToPath(-50, 100, 20), preset, {});
+  check('负坐标警告中英俱全',
+    neg.warnings.every((w) => w && w.zh && w.en && !/[一-鿿]/.test(w.en)),
+    JSON.stringify(neg.warnings));
+
+  // 手动控制 note
+  for (const act of [
+    { action: 'move', dx: 5, dy: 0 },
+    { action: 'home' },
+    { action: 'penup' },
+    { action: 'pendown' },
+    { action: 'setorigin' },
+    { action: 'feed', distance: 50 },
+    { action: 'eject', distance: 50 },
+    { action: 'end' },
+    { action: 'bogus' },
+  ]) {
+    const built = buildManualCommand(preset, act);
+    check(`手动 ${act.action} 的 note 中英俱全`,
+      built.notes.every((n) => n && n.zh && n.en && !/[一-鿿]/.test(n.en)),
+      JSON.stringify(built.notes));
+  }
+
+  // 文字转路径的 meta
+  const tp = textToPath({ text: 'AB', sizeMm: 20 });
+  check('text-to-path 的 note 中英俱全',
+    !!tp.meta.note && !!tp.meta.noteEn && !/[一-鿿]/.test(tp.meta.noteEn),
+    `${tp.meta.note} / ${tp.meta.noteEn}`);
+  const tpBad = textToPath({ text: '中A', sizeMm: 20 });
+  // ⚠️ 这里刻意**不**断言「英文里没有中文」：
+  // 缺字提示必须点名是哪几个字，而那个字本身就是中文（如「中」）。
+  // 译文里出现这个字是正确行为，不是漏翻译。
+  // 真正要守的是：英文句子本身完整、且点名了缺字。
+  check('缺字提示有英文且点名了缺字',
+    !!tpBad.meta.noteEn && /outside the built-in stroke font/.test(tpBad.meta.noteEn)
+    && tpBad.meta.unsupported.length > 0,
+    `${tpBad.meta.unsupported.join('')} / ${tpBad.meta.noteEn}`);
+
+  // 任务日志：pushLog(line, en) 两份都要落库，且 line 仍是中文（兼容既有前端）
+  const vt = new VirtualPlotter({ width: 600, stepsPerInch: 1000 });
+  await vt.connect();
+  const eng2 = new JobEngine(vt);
+  eng2.pushLog('中文消息', 'English message');
+  check('pushLog 同时记录中英', eng2.log.at(-1)?.line === '中文消息' && eng2.log.at(-1)?.en === 'English message',
+    JSON.stringify(eng2.log.at(-1)));
+  eng2.pushLog('只有中文');
+  check('pushLog 省略英文时退化为中文（不产生 undefined）',
+    eng2.log.at(-1)?.en === '只有中文', JSON.stringify(eng2.log.at(-1)));
+  await vt.disconnect();
 }
 
 section('安全操作必须无条件下发（不能因「软件以为已经抬刀」而空转）');
