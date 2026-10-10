@@ -435,9 +435,10 @@ A pad mirroring the basic operations of Ucancam / 文泰:
 
 ### Output control
 
-- Job queue with live per-line progress
+- **Kinematic Virtual Pacing**: Because commercial plotter firmwares operate as open-loop, simplex receivers without bi-directional status reporting, the platform features a kinematic motion model that simulates physical cutting and rapid travel speeds, pen up/down latencies, and homing dwell time. This decouples **buffer transfer progress** from **physical execution progress**, providing true real-time cutting progress and remaining time countdowns.
+- **Job queue with dual-stage progress**: Live display of onboard buffer load alongside physical cutting percentage and countdown
 - Pause / resume / stop / e-stop
-- Live toolpath preview during output
+- Live toolpath preview and cutting path length metrics during output
 
 ---
 

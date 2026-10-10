@@ -826,3 +826,137 @@ export function compileToPlotterLanguage(path, preset, options = {}) {
   }
   return res;
 }
+
+/**
+ * 刻字机运动学物理耗时估算：
+ * 基于指令流（HP-GL / DMPL）中的实际物理运动位移、落刀切割速度、
+ * 抬刀快移速度、抬落刀机械时延与机械归位驻留耗时，进行物理执行时间仿真。
+ */
+export function estimateHpglMotion(text, options = {}) {
+  const stepsPerInch = options.stepsPerInch || 1000;
+  const mmPerUnit = 25.4 / stepsPerInch;
+  let cutSpeed = options.defaultSpeed || 30; // mm/s
+  const rapidRatio = options.rapidRatio || 4;
+  let rapidSpeed = Math.max(cutSpeed * rapidRatio, 150); // mm/s
+
+  let cutLengthMm = 0;
+  let rapidLengthMm = 0;
+  let penDrops = 0;
+  let penLifts = 0;
+  let homingCount = 0;
+
+  let penDown = false;
+  let curX = 0, curY = 0;
+
+  const commands = text.split(';').map((s) => s.trim()).filter(Boolean);
+  for (const raw of commands) {
+    if (raw === '!PG' || raw === 'H') {
+      homingCount++;
+      curX = 0; curY = 0;
+      penDown = false;
+      continue;
+    }
+    const vsM = raw.match(/^(?:VS|V)(\d+)/);
+    if (vsM) {
+      cutSpeed = Math.max(1, +vsM[1] * 10);
+      rapidSpeed = Math.max(cutSpeed * rapidRatio, 150);
+      continue;
+    }
+    if (raw.startsWith('PU') || raw === 'U') {
+      if (penDown) { penLifts++; penDown = false; }
+      const coords = raw.startsWith('PU') ? raw.slice(2).trim() : '';
+      if (coords) {
+        const nums = coords.split(',').map(Number);
+        for (let i = 0; i + 1 < nums.length; i += 2) {
+          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
+            const nx = nums[i] * mmPerUnit, ny = nums[i + 1] * mmPerUnit;
+            rapidLengthMm += Math.hypot(nx - curX, ny - curY);
+            curX = nx; curY = ny;
+          }
+        }
+      }
+      continue;
+    }
+    if (raw.startsWith('PD') || raw === 'D') {
+      if (!penDown) { penDrops++; penDown = true; }
+      const coords = raw.startsWith('PD') ? raw.slice(2).trim() : '';
+      if (coords) {
+        const nums = coords.split(',').map(Number);
+        for (let i = 0; i + 1 < nums.length; i += 2) {
+          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
+            const nx = nums[i] * mmPerUnit, ny = nums[i + 1] * mmPerUnit;
+            cutLengthMm += Math.hypot(nx - curX, ny - curY);
+            curX = nx; curY = ny;
+          }
+        }
+      }
+      continue;
+    }
+    if (raw.startsWith('PA') || raw.startsWith('A')) {
+      const prefix = raw.startsWith('PA') ? 2 : 1;
+      const coords = raw.slice(prefix).trim();
+      if (coords) {
+        const nums = coords.split(',').map(Number);
+        for (let i = 0; i + 1 < nums.length; i += 2) {
+          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
+            const nx = nums[i] * mmPerUnit, ny = nums[i + 1] * mmPerUnit;
+            const dist = Math.hypot(nx - curX, ny - curY);
+            if (penDown) cutLengthMm += dist;
+            else rapidLengthMm += dist;
+            curX = nx; curY = ny;
+          }
+        }
+      }
+      continue;
+    }
+    if (raw.startsWith('PR') || raw.startsWith('R')) {
+      const prefix = raw.startsWith('PR') ? 2 : 1;
+      const coords = raw.slice(prefix).trim();
+      if (coords) {
+        const nums = coords.split(',').map(Number);
+        for (let i = 0; i + 1 < nums.length; i += 2) {
+          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
+            const dx = nums[i] * mmPerUnit, dy = nums[i + 1] * mmPerUnit;
+            const dist = Math.hypot(dx, dy);
+            if (penDown) cutLengthMm += dist;
+            else rapidLengthMm += dist;
+            curX += dx; curY += dy;
+          }
+        }
+      }
+      continue;
+    }
+    if (raw.startsWith('AA')) {
+      const parts = raw.slice(2).split(',').map(Number);
+      if (parts.length >= 3 && !parts.some(isNaN)) {
+        const cx = parts[0] * mmPerUnit, cy = parts[1] * mmPerUnit;
+        const angle = parts[2];
+        const r = Math.hypot(curX - cx, curY - cy);
+        const arcLen = Math.abs(angle) * (Math.PI / 180) * r;
+        if (penDown) cutLengthMm += arcLen;
+        else rapidLengthMm += arcLen;
+        const rad = angle * (Math.PI / 180);
+        const cos = Math.cos(rad), sin = Math.sin(rad);
+        const rx = curX - cx, ry = curY - cy;
+        curX = cx + rx * cos - ry * sin;
+        curY = cy + rx * sin + ry * cos;
+      }
+      continue;
+    }
+  }
+
+  const cutSeconds = cutLengthMm / Math.max(1, cutSpeed);
+  const rapidSeconds = rapidLengthMm / Math.max(1, rapidSpeed);
+  const latencySeconds = (penDrops * 0.04) + (penLifts * 0.03) + (homingCount * 3.0);
+  const totalSeconds = cutSeconds + rapidSeconds + latencySeconds;
+
+  return {
+    cutLengthMm,
+    rapidLengthMm,
+    cutSeconds,
+    rapidSeconds,
+    latencySeconds,
+    totalSeconds,
+    totalMs: Math.max(200, Math.round(totalSeconds * 1000)),
+  };
+}
