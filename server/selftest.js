@@ -1280,6 +1280,62 @@ section('运动学时序仿真与物理执行状态跟踪');
   await vt.disconnect();
 }
 
+// ---------------------------------------------------------------------------
+section('历史任务归档与全参数持久化');
+{
+  const testLayer = {
+    id: 'L_test_1',
+    name: '轮廓层',
+    subpaths: [
+      {
+        start: { x: 10, y: 10 },
+        elems: [{ type: 'line', x1: 10, y1: 10, x2: 50, y2: 10 }],
+        closed: false,
+      }
+    ],
+  };
+
+  const sampleArchive = {
+    id: 'hist_selftest_001',
+    name: '标牌刻绘',
+    createdAt: Date.now(),
+    layers: [testLayer],
+    userOrigin: { x: 5, y: 5 },
+    machineId: 'liyue-sc631-au',
+    materialId: 'acrylic-3',
+    speed: 12,
+    force: 420,
+    direction: 'alternate',
+    optimize: true,
+    stats: { cutLengthMm: 40, totalSeconds: 3.3 },
+    thumbnailSvg: '<svg><path d="M 10 10 L 50 10"/></svg>',
+  };
+
+  check('历史任务：完整包含图层样式与加工参数',
+    Array.isArray(sampleArchive.layers) &&
+    sampleArchive.layers[0].name === '轮廓层' &&
+    sampleArchive.machineId === 'liyue-sc631-au' &&
+    sampleArchive.materialId === 'acrylic-3' &&
+    sampleArchive.speed === 12 &&
+    sampleArchive.force === 420 &&
+    sampleArchive.direction === 'alternate' &&
+    sampleArchive.userOrigin.x === 5,
+    JSON.stringify(sampleArchive));
+
+  check('历史任务：包含矢量缩略图字段',
+    typeof sampleArchive.thumbnailSvg === 'string' && sampleArchive.thumbnailSvg.startsWith('<svg'),
+    sampleArchive.thumbnailSvg);
+
+  check('历史任务：深拷贝恢复后图层与参数不发生漂移',
+    (() => {
+      const restored = JSON.parse(JSON.stringify(sampleArchive));
+      return restored.layers[0].subpaths[0].elems[0].x2 === 50 &&
+             restored.speed === 12 &&
+             restored.force === 420;
+    })(),
+    '');
+}
+
 const nt = new NullTransport();
 check('空传输可用', typeof nt.write === 'function');
 

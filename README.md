@@ -433,8 +433,10 @@ A pad mirroring the basic operations of Ucancam / 文泰:
 - **Pen up / pen down / home / set origin / reset origin / feed / eject / pen-up-and-home**
 - 200mm cap per move, so a slip of the hand cannot run away
 
-### Output control
+### Output Control & Job History
 
+- **SparkMinds Branding**: Browser tab favicon with the geometric cube icon, and top navigation bar integrated with the horizontal "SparkMinds 创智实验室" brand logo.
+- **Job History & Parameter Archive**: All cut jobs automatically archived (or saved as templates) with complete layer geometries, user origin, machine preset, material, cut speed, force, and direction; supports one-click recall & edit, re-cutting, and card-based vector thumbnail previews.
 - **Kinematic Virtual Pacing**: Because commercial plotter firmwares operate as open-loop, simplex receivers without bi-directional status reporting, the platform features a kinematic motion model that simulates physical cutting and rapid travel speeds, pen up/down latencies, and homing dwell time. This decouples **buffer transfer progress** from **physical execution progress**, providing true real-time cutting progress and remaining time countdowns.
 - **Job queue with dual-stage progress**: Live display of onboard buffer load alongside physical cutting percentage and countdown
 - Pause / resume / stop / e-stop
