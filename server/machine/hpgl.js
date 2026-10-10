@@ -69,7 +69,7 @@
  *   LB text;  标签输出（本服务一般不用，文本在上位机转路径更可控）
  */
 
-import { DEG, normAngle, currentPoint } from '../geom/path.js';
+import { DEG, normAngle, currentPoint, mapPathPoints } from '../geom/path.js';
 
 // ---------------------------------------------------------------------------
 // 机器预设
@@ -715,8 +715,12 @@ export class HpglBuilder {
     if (options.force) this.setForce(options.force);
     this.penSelectOn();
 
-    // 3. 图形本体
-    for (const sub of path.subpaths) {
+    // 3. 图形本体：若有自定义工作原点，平移到工作原点相对坐标
+    const workPath = (origin && (origin.x || origin.y))
+      ? mapPathPoints(path, (x, y) => ({ x: x - origin.x, y: y - origin.y }))
+      : path;
+
+    for (const sub of workPath.subpaths) {
       this.runSubpath(sub, { closeAll: !!options.closeAll });
     }
 

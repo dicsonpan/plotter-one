@@ -37,15 +37,16 @@ function warn(zh, en) {
 }
 
 
-export function analyze(path, preset) {
+export function analyze(path, preset, origin = { x: 0, y: 0 }) {
   const bbox = pathBBox(path);
   const length = pathLength(path);
   const elems = countElements(path);
+  const ox = origin?.x || 0, oy = origin?.y || 0;
   const oversize = {
     x: bbox.maxX > preset.width,
     y: bbox.maxY > preset.height,
-    left: bbox.minX < 0,
-    bottom: bbox.minY < 0,
+    left: bbox.minX < ox,
+    bottom: bbox.minY < oy,
   };
   return {
     bbox, length, elems,
@@ -76,11 +77,12 @@ export function compileToolpath(inputPath, preset, options = {}) {
     setDirection(path, dir === Direction.CCW);
   }
 
+  const origin = options.origin || { x: 0, y: 0 };
   if (options.optimize !== false) {
-    optimizeOrder(path, { x: 0, y: 0 });
+    optimizeOrder(path, origin);
   }
 
-  const info = analyze(path, preset);
+  const info = analyze(path, preset, origin);
   if (info.oversize.x || info.oversize.y) {
     warnings.push(warn(
       `图形超出幅面：X 最大 ${info.bbox.maxX.toFixed(1)}mm / Y 最大 ${info.bbox.maxY.toFixed(1)}mm，机器上限 ${preset.width}×${preset.height}mm`,

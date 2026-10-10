@@ -45,6 +45,11 @@ export function translateLayer(layer, dx, dy) {
   if (!dx && !dy) return layer;
   const m = matrixTranslate(snap(dx), snap(dy));
   layer.subpaths = applyMatrixToPath({ subpaths: layer.subpaths }, m).subpaths;
+  if (layer.children) {
+    for (const c of layer.children) {
+      c.subpaths = applyMatrixToPath({ subpaths: c.subpaths }, m).subpaths;
+    }
+  }
   return layer;
 }
 
@@ -78,6 +83,11 @@ export function scaleLayer(layer, sx, sy, cx, cy, minSize = 0.05) {
     matrixMultiply(matrixScale(fx, fy), matrixTranslate(-px, -py))
   );
   layer.subpaths = applyMatrixToPath({ subpaths: layer.subpaths }, m).subpaths;
+  if (layer.children) {
+    for (const c of layer.children) {
+      c.subpaths = applyMatrixToPath({ subpaths: c.subpaths }, m).subpaths;
+    }
+  }
   return layer;
 }
 
@@ -97,6 +107,11 @@ export function rotateLayer(layer, deg, cx, cy) {
     matrixMultiply(matrixRotate(deg), matrixTranslate(-px, -py))
   );
   layer.subpaths = applyMatrixToPath({ subpaths: layer.subpaths }, m).subpaths;
+  if (layer.children) {
+    for (const c of layer.children) {
+      c.subpaths = applyMatrixToPath({ subpaths: c.subpaths }, m).subpaths;
+    }
+  }
   return layer;
 }
 
@@ -158,6 +173,8 @@ export function duplicateLayer(layer) {
     name: layer.name,
     subpaths: JSON.parse(JSON.stringify(layer.subpaths)),
     hidden: false,
+    isGroup: !!layer.isGroup,
+    children: layer.children ? JSON.parse(JSON.stringify(layer.children)) : null,
   };
 }
 

@@ -1,12 +1,19 @@
 /**
- * SVG path 解析（d 属性）。
- * 覆盖 SVG 1.1 全部路径命令：M L H V C S Q T A Z（及其小写相对形式）。
+ * SVG 解析（d 属性与完整 SVG 文件解析）。
+ * 覆盖 SVG 1.1 全部路径命令：M L H V C S Q T A Z（及其小写相对形式），
+ * 以及 <circle>, <ellipse>, <rect>, <line>, <polyline>, <polygon>，
+ * 支持 <g> 分组与 transform 矩阵级联。
  *
- * 注意坐标系：SVG 的 Y 轴向下，我们的内部模型 Y 轴向上。
- * 解析阶段保持 SVG 原始数值，由调用方决定是否翻转；这里用 flipY 选项。
+ * 注意坐标系：SVG 的 Y 轴向下，内部模型 Y 轴向上。
+ * 解析阶段保持 SVG 原始数值，由调用方决定是否翻转；这里默认按 flipY 选项翻转。
  */
 
-import { makePath, makeSubpath, addLine, addArc, DEG, TAU, normAngle } from '../geom/path.js';
+import {
+  makePath, makeSubpath, addLine, DEG, TAU,
+  circleToPath, ellipseToPath, polylineToPath,
+  matrixTranslate, matrixScale, matrixRotate, matrixMultiply,
+  matrixTranslateXY, applyMatrixToPath, IDENTITY, normAngle,
+} from '../geom/path.js';
 
 function tokenizePath(d) {
   const out = [];
@@ -62,7 +69,6 @@ function ellipticalArcTo(x0, y0, rx, ry, xRotDeg, largeArc, sweep, x1, y1, sub) 
   if (!sweep && dTheta > 0) dTheta -= TAU;
   if (sweep && dTheta < 0) dTheta += TAU;
 
-  // 圆在旋转后的世界坐标里不再是正圆 → 只能离散
   if (Math.abs(rx - ry) < 1e-6 && Math.abs(phi % (Math.PI / 2)) < 1e-6) {
     sub.elems.push({ type: 'arc', cx, cy, r: rx, a0: theta1, a1: theta1 + dTheta });
   } else {
@@ -81,14 +87,10 @@ export function parseSvgPath(d, opts = {}) {
   const toks = tokenizePath(d || '');
   const fy = (y) => (flipY ? -y : y);
 
-  // 关键：cx/cy/sx/sy 一律保存「SVG 原始坐标」，
-  // 这样相对偏移（y += cy）在同一坐标系里计算；
-  // 只在写入路径时才用 fy() 翻转到内部坐标系（Y 向上）。
-  // 若把翻转后的值存进 cy 再做相对运算，会被翻转两次，路径错乱。
   let sub = null;
   let cx = 0, cy = 0;      // 当前点（SVG 原始坐标）
   let sx = 0, sy = 0;      // 子路径起点（SVG 原始坐标）
-  let lastCtrlX = null, lastCtrlY = null; // 上一段控制点，用于 S/T
+  let lastCtrlX = null, lastCtrlY = null;
   let prevCmd = '';
   let i = 0;
 
@@ -152,7 +154,6 @@ export function parseSvgPath(d, opts = {}) {
         if (lastCtrlX === null) { c1x = cx; c1y = cy; }
         else { c1x = 2 * cx - lastCtrlX; c1y = 2 * cy - lastCtrlY; }
       }
-      // 三次贝塞尔离散
       const dist = Math.hypot(c2x - cx, c2y - cy) + Math.hypot(x - c2x, y - c2y);
       const steps = Math.max(2, Math.min(120, Math.ceil(dist / 1.2)));
       for (let k = 1; k <= steps; k++) {
@@ -190,12 +191,10 @@ export function parseSvgPath(d, opts = {}) {
       const laf = nextNum(), sf = nextNum();
       let x = nextNum(), y = nextNum();
       if (rel) { x += cx; y += cy; }
-      // 弧线计算在内部坐标系（Y 向上）里做，sweep 的符号需相应翻转
       ellipticalArcTo(cx, fy(cy), rx, ry, rot, laf, flipY ? !sf : sf, x, fy(y), sub);
       cx = x; cy = y;
       lastCtrlX = lastCtrlY = null;
     } else if (C === 'Z') {
-      // sx/sy 是 SVG 原始坐标，需翻转后写入
       addLine(sub, sx, fy(sy));
       sub.closed = true;
       cx = sx; cy = sy;
@@ -206,9 +205,72 @@ export function parseSvgPath(d, opts = {}) {
   return path;
 }
 
-/** 解析整个 SVG 文件，取出所有 path 的 d 与 transform 叠加 */
+/** 属性提取：支持任意顺序、双引号或单引号 */
+function parseAttributes(tagStr) {
+  const attrs = {};
+  const attrRe = /([a-zA-Z0-9:_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
+  let m;
+  while ((m = attrRe.exec(tagStr))) {
+    attrs[m[1].toLowerCase()] = m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : m[4]);
+  }
+  return attrs;
+}
+
+/** 解析 transform 属性：matrix, translate, scale, rotate */
+function parseTransform(str) {
+  if (!str) return IDENTITY;
+  let current = IDENTITY;
+  const re = /(matrix|translate|scale|rotate)\s*\(([^)]+)\)/gi;
+  let m;
+  while ((m = re.exec(str))) {
+    const type = m[1].toLowerCase();
+    const args = m[2].trim().split(/[\s,]+/).map(Number);
+    let mat = IDENTITY;
+    if (type === 'matrix' && args.length >= 6) {
+      mat = { a: args[0], b: args[1], c: args[2], d: args[3], e: args[4], f: args[5] };
+    } else if (type === 'translate') {
+      mat = matrixTranslate(args[0] || 0, args[1] !== undefined ? args[1] : 0);
+    } else if (type === 'scale') {
+      mat = matrixScale(args[0] || 1, args[1] !== undefined ? args[1] : args[0]);
+    } else if (type === 'rotate') {
+      mat = matrixRotate(args[0] || 0, args[1] || 0, args[2] || 0);
+    }
+    current = matrixMultiply(current, mat);
+  }
+  return current;
+}
+
+/** 把 SVG 空间变换矩阵转为内部 Y-up 空间的等价矩阵 */
+function toInternalMatrix(mSvg, flipY) {
+  if (!flipY) return mSvg;
+  return {
+    a: mSvg.a,
+    b: -mSvg.b,
+    c: -mSvg.c,
+    d: mSvg.d,
+    e: mSvg.e,
+    f: -mSvg.f,
+  };
+}
+
+/** 解析 points 属性："x1,y1 x2,y2 ..." 或 "x1 y1 x2 y2" */
+function parsePoints(str) {
+  if (!str) return [];
+  const nums = str.trim().split(/[\s,]+/).map(Number).filter((n) => !isNaN(n));
+  const pts = [];
+  for (let i = 0; i < nums.length - 1; i += 2) {
+    pts.push({ x: nums[i], y: nums[i + 1] });
+  }
+  return pts;
+}
+
+/** 解析整个 SVG 文件，提取全部图元，支持 Group/Ungroup 元数据 */
 export function parseSvg(svgText, opts = {}) {
+  const flipY = opts.flipY !== false;
   const path = makePath();
+  const elements = [];
+  const warnings = [];
+
   const viewBox = /viewBox\s*=\s*["']([\d.\-\s]+)["']/i.exec(svgText);
   const widthAttr = /<svg[^>]*\bwidth\s*=\s*["']([\d.]+)([a-z%]*)["']/i.exec(svgText);
   const heightAttr = /<svg[^>]*\bheight\s*=\s*["']([\d.]+)([a-z%]*)["']/i.exec(svgText);
@@ -223,7 +285,6 @@ export function parseSvg(svgText, opts = {}) {
   const wAttr = widthAttr ? unitToPx(widthAttr[1]) : 0;
   const hAttr = heightAttr ? unitToPx(heightAttr[1]) : 0;
 
-  // 归一化到 1 用户单位 = 1mm，后面统一按毫米处理
   let scale = 1;
   let ox = 0, oy = 0;
   if (vb) {
@@ -234,51 +295,188 @@ export function parseSvg(svgText, opts = {}) {
     scale = 1;
   }
 
-  const dRe = /<path[^>]*\bd\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  // 标签扫描器，按文档流顺序识别标签与 <g> 嵌套
+  const tagRe = /<(\/?[a-zA-Z0-9:_-]+)([^>]*?)(\/?)>/g;
   let m;
-  const warnings = [];
-  while ((m = dRe.exec(svgText))) {
-    const sub = parseSvgPath(m[1], { flipY: opts.flipY !== false });
-    for (const s of sub.subpaths) {
+  const groupStack = []; // 存 { tag, transform, id }
+  let elemCounter = 0;
+
+  // 偏移平移辅助：把路径从 SVG 原点平移 ox, oy（已考虑 flipY）
+  const applyOffset = (p) => {
+    for (const s of p.subpaths) {
       for (const e of s.elems) {
-        if (e.type === 'line') { e.x1 -= ox; e.x2 -= ox; e.y1 -= oy; e.y2 -= oy; }
-        else { e.cx -= ox; e.cy -= oy; }
+        if (e.type === 'line') {
+          e.x1 -= ox; e.x2 -= ox;
+          e.y1 += (flipY ? oy : -oy);
+          e.y2 += (flipY ? oy : -oy);
+        } else {
+          e.cx -= ox;
+          e.cy += (flipY ? oy : -oy);
+        }
       }
-      s.start.x -= ox; s.start.y -= oy;
-      path.subpaths.push(s);
+      s.start.x -= ox;
+      s.start.y += (flipY ? oy : -oy);
+    }
+  };
+
+  while ((m = tagRe.exec(svgText))) {
+    const rawTag = m[1].toLowerCase();
+    const attrsStr = m[2];
+    const isSelfClosing = m[3] === '/' || attrsStr.trim().endsWith('/');
+    const isClosing = rawTag.startsWith('/');
+
+    if (isClosing) {
+      const realTag = rawTag.slice(1);
+      if (groupStack.length && groupStack[groupStack.length - 1].tag === realTag) {
+        groupStack.pop();
+      }
+      continue;
+    }
+
+    const attrs = parseAttributes(attrsStr);
+    const elemTransform = parseTransform(attrs.transform);
+
+    // 检查是否在非渲染容器内（defs, clipPath, mask, pattern, style）
+    const inNonRenderable = groupStack.some((g) => ['defs', 'clippath', 'mask', 'pattern', 'style'].includes(g.tag));
+
+    if (rawTag === 'g' || rawTag === 'defs' || rawTag === 'clippath' || rawTag === 'mask' || rawTag === 'pattern') {
+      const parentMat = groupStack.length ? groupStack[groupStack.length - 1].accumTransform : IDENTITY;
+      const accumTransform = matrixMultiply(parentMat, elemTransform);
+      groupStack.push({ tag: rawTag, accumTransform, id: attrs.id || null });
+      if (isSelfClosing) groupStack.pop();
+      continue;
+    }
+
+    if (inNonRenderable) continue;
+    if (attrs.display === 'none' || attrs.visibility === 'hidden') continue;
+
+    // 计算当前元素在 SVG 空间的累计变换矩阵
+    const parentMat = groupStack.length ? groupStack[groupStack.length - 1].accumTransform : IDENTITY;
+    const totalSvgMat = matrixMultiply(parentMat, elemTransform);
+    const hasTransform = !(totalSvgMat.a === 1 && totalSvgMat.b === 0 && totalSvgMat.c === 0 && totalSvgMat.d === 1 && totalSvgMat.e === 0 && totalSvgMat.f === 0);
+
+    let elemPath = null;
+    let elemType = rawTag;
+    let elemDefaultName = '';
+
+    if (rawTag === 'path') {
+      const d = attrs.d;
+      if (d) {
+        elemPath = parseSvgPath(d, { flipY });
+        elemType = 'path';
+        elemDefaultName = '路径';
+      }
+    } else if (rawTag === 'circle') {
+      const cx = parseFloat(attrs.cx || 0);
+      const cy = parseFloat(attrs.cy || 0);
+      const r = parseFloat(attrs.r || 0);
+      if (r > 0) {
+        elemPath = circleToPath(cx, flipY ? -cy : cy, r);
+        elemType = 'circle';
+        elemDefaultName = '圆形';
+      }
+    } else if (rawTag === 'ellipse') {
+      const cx = parseFloat(attrs.cx || 0);
+      const cy = parseFloat(attrs.cy || 0);
+      const rx = parseFloat(attrs.rx || 0);
+      const ry = parseFloat(attrs.ry || 0);
+      if (rx > 0 && ry > 0) {
+        elemPath = ellipseToPath(cx, flipY ? -cy : cy, rx, ry);
+        elemType = 'ellipse';
+        elemDefaultName = '椭圆';
+      }
+    } else if (rawTag === 'rect') {
+      const x = parseFloat(attrs.x || 0);
+      const y = parseFloat(attrs.y || 0);
+      const w = parseFloat(attrs.width || 0);
+      const h = parseFloat(attrs.height || 0);
+      const rx = Math.max(0, parseFloat(attrs.rx || 0));
+      const ry = Math.max(0, parseFloat(attrs.ry || attrs.rx || 0));
+      if (w > 0 && h > 0) {
+        elemPath = makePath();
+        const topY = flipY ? -y : y;
+        const botY = flipY ? -(y + h) : (y + h);
+        if (rx > 0 || ry > 0) {
+          // 圆角矩形
+          const effRx = Math.min(rx, w / 2);
+          const effRy = Math.min(ry || effRx, h / 2);
+          const s = makeSubpath(x + effRx, topY);
+          addLine(s, x + w - effRx, topY);
+          s.elems.push({ type: 'arc', cx: x + w - effRx, cy: flipY ? topY + effRy : topY - effRy, r: effRx, a0: flipY ? -Math.PI / 2 : Math.PI / 2, a1: 0 });
+          addLine(s, x + w, botY - (flipY ? effRy : -effRy));
+          s.elems.push({ type: 'arc', cx: x + w - effRx, cy: flipY ? botY - effRy : botY + effRy, r: effRx, a0: 0, a1: flipY ? Math.PI / 2 : -Math.PI / 2 });
+          addLine(s, x + effRx, botY);
+          s.elems.push({ type: 'arc', cx: x + effRx, cy: flipY ? botY - effRy : botY + effRy, r: effRx, a0: flipY ? Math.PI / 2 : -Math.PI / 2, a1: Math.PI });
+          addLine(s, x, topY + (flipY ? effRy : -effRy));
+          s.elems.push({ type: 'arc', cx: x + effRx, cy: flipY ? topY + effRy : topY - effRy, r: effRx, a0: Math.PI, a1: flipY ? 3 * Math.PI / 2 : Math.PI / 2 });
+          s.closed = true;
+          elemPath.subpaths.push(s);
+        } else {
+          // 标准直角矩形
+          const s = makeSubpath(x, topY);
+          addLine(s, x + w, topY);
+          addLine(s, x + w, botY);
+          addLine(s, x, botY);
+          s.closed = true;
+          elemPath.subpaths.push(s);
+        }
+        elemType = 'rect';
+        elemDefaultName = '矩形';
+      }
+    } else if (rawTag === 'line') {
+      const x1 = parseFloat(attrs.x1 || 0);
+      const y1 = parseFloat(attrs.y1 || 0);
+      const x2 = parseFloat(attrs.x2 || 0);
+      const y2 = parseFloat(attrs.y2 || 0);
+      elemPath = makePath();
+      const s = makeSubpath(x1, flipY ? -y1 : y1);
+      addLine(s, x2, flipY ? -y2 : y2);
+      elemPath.subpaths.push(s);
+      elemType = 'line';
+      elemDefaultName = '直线';
+    } else if (rawTag === 'polyline' || rawTag === 'polygon') {
+      const pts = parsePoints(attrs.points);
+      if (pts.length >= 2) {
+        elemPath = polylineToPath(
+          pts.map((p) => ({ x: p.x, y: flipY ? -p.y : p.y })),
+          rawTag === 'polygon'
+        );
+        elemType = rawTag;
+        elemDefaultName = rawTag === 'polygon' ? '多边形' : '折线';
+      }
+    }
+
+    if (elemPath && elemPath.subpaths.length) {
+      elemCounter++;
+      // 若有变换矩阵，将其转为内部 Y-up 矩阵并应用
+      if (hasTransform) {
+        const matInt = toInternalMatrix(totalSvgMat, flipY);
+        applyMatrixToPath(elemPath, matInt);
+      }
+      // 减去 viewBox 原点偏移
+      applyOffset(elemPath);
+
+      const elemId = attrs.id || `elem_${elemCounter}`;
+      const elemName = attrs.id || `${elemDefaultName} ${elemCounter}`;
+
+      elements.push({
+        id: elemId,
+        name: elemName,
+        type: elemType,
+        subpaths: elemPath.subpaths,
+      });
+
+      for (const s of elemPath.subpaths) {
+        path.subpaths.push(s);
+      }
     }
   }
 
-  // 没有 path 就退而找 <line>/<rect>/<circle>/<polyline>
-  if (!path.subpaths.length) {
-    const lineRe = /<line[^>]*x1\s*=\s*["']([-\d.]+)["'][^>]*y1\s*=\s*["']([-\d.]+)["'][^>]*x2\s*=\s*["']([-\d.]+)["'][^>]*y2\s*=\s*["']([-\d.]+)["']/gi;
-    while ((m = lineRe.exec(svgText))) {
-      const s = makeSubpath(+m[1] - ox, -(+m[2] - oy));
-      addLine(s, +m[3] - ox, -(+m[4] - oy));
-      path.subpaths.push(s);
-    }
-    const rectRe = /<rect[^>]*x\s*=\s*["']([-\d.]+)["'][^>]*y\s*=\s*["']([-\d.]+)["'][^>]*width\s*=\s*["']([\d.]+)["'][^>]*height\s*=\s*["']([\d.]+)["']/gi;
-    while ((m = rectRe.exec(svgText))) {
-      const x = +m[1] - ox, y = -(+m[2] - oy), w = +m[3], h = +m[4];
-      const s = makeSubpath(x, y);
-      addLine(s, x + w, y); addLine(s, x + w, y - h); addLine(s, x, y - h);
-      s.closed = true;
-      path.subpaths.push(s);
-    }
-    const circRe = /<circle[^>]*cx\s*=\s*["']([-\d.]+)["'][^>]*cy\s*=\s*["']([-\d.]+)["'][^>]*r\s*=\s*["']([\d.]+)["']/gi;
-    while ((m = circRe.exec(svgText))) {
-      const cx = +m[1] - ox, cy = -(+m[2] - oy), r = +m[3];
-      const s = makeSubpath(cx + r, cy);
-      s.elems.push({ type: 'arc', cx, cy, r, a0: 0, a1: TAU });
-      s.closed = true;
-      path.subpaths.push(s);
-    }
-  }
   if (!path.subpaths.length) {
     warnings.push({ zh: 'SVG 中未找到可用的路径数据', en: 'No usable path data found in the SVG' });
   }
 
-  return { path, warnings, meta: { viewBox: vb, scale, offset: { x: ox, y: oy } } };
+  return { path, elements, warnings, meta: { viewBox: vb, scale, offset: { x: ox, y: oy } } };
 }
 
 void normAngle;

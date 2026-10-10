@@ -56,6 +56,8 @@ const DICT = {
     'log.importOk': '导入成功：{n} 条路径，长度 {len}mm',
     'log.notice': '注意：{msg}',
     'toast.demoLoaded': '示例已载入',
+    'toast.grouped': '已将 {n} 项编组',
+    'toast.ungrouped': '已解组为 {n} 项独立内容',
 
     // ---- 对象属性
     'sect.props': '对象属性',
@@ -78,6 +80,8 @@ const DICT = {
     'prop.dup': '复制',
     'prop.front': '置顶',
     'prop.del': '删除',
+    'prop.group': '编组',
+    'prop.ungroup': '解组',
     'prop.copySuffix': '{name} 副本',
 
     // ---- 快速文字
@@ -117,10 +121,16 @@ const DICT = {
     'tool.fit': '适应窗口',
     'tool.grid': '网格',
     'canvas.hint': '滚轮缩放 · 拖拽平移',
-    'canvas.origin': '原点 0,0',
+    'canvas.origin': '原点',
+    'canvas.mechOrigin': '机械 0,0',
+    'canvas.knife': '刀头',
 
     // ---- 设备连接
     'sect.device': '设备连接',
+    'dev.settingsToggle': '设置',
+    'dev.autoConn': '正在自动连接设备…',
+    'dev.autoConnSub': '开机或插上 USB 将自动连接',
+    'dev.connectedSub': '已自动连接 · 准备就绪',
     'dev.machine': '机器型号',
     'dev.connType': '连接方式',
     'dev.serial': 'USB / 串口（推荐）',
@@ -166,9 +176,14 @@ const DICT = {
     'pad.stepMm': '步长 mm',
     'pad.stepFine': '0.1（微调）',
     'pad.hint': '按住 Shift 反向 · 连续点击可连续移动',
+    'manual.knifePos': '刀头位置',
+    'manual.userOrigin': '当前原点',
     'btn.penup': '抬刀',
     'btn.home': '回原点',
     'btn.setorigin': '设原点',
+    'btn.resetOrigin': '重置原点',
+    'toast.originSet': '已设新原点：({x}, {y}) mm',
+    'toast.originReset': '已重置原点为 (0, 0)',
     'btn.feed50': '进纸50',
     'btn.eject50': '出纸50',
     'btn.penupHome': '抬刀回位',
@@ -321,6 +336,8 @@ const DICT = {
     'log.importOk': 'Imported {n} paths, total length {len}mm',
     'log.notice': 'Note: {msg}',
     'toast.demoLoaded': 'Sample loaded',
+    'toast.grouped': 'Grouped {n} items',
+    'toast.ungrouped': 'Ungrouped into {n} items',
 
     // ---- Object properties
     'sect.props': 'Properties',
@@ -343,6 +360,8 @@ const DICT = {
     'prop.dup': 'Duplicate',
     'prop.front': 'Bring to front',
     'prop.del': 'Delete',
+    'prop.group': 'Group',
+    'prop.ungroup': 'Ungroup',
     'prop.copySuffix': '{name} copy',
 
     // ---- Quick text
@@ -382,10 +401,16 @@ const DICT = {
     'tool.fit': 'Fit',
     'tool.grid': 'Grid',
     'canvas.hint': 'Scroll to zoom · Drag to pan',
-    'canvas.origin': 'Origin 0,0',
+    'canvas.origin': 'Origin',
+    'canvas.mechOrigin': 'Machine 0,0',
+    'canvas.knife': 'Knife',
 
     // ---- Device connection
     'sect.device': 'Device',
+    'dev.settingsToggle': 'Settings',
+    'dev.autoConn': 'Auto-connecting…',
+    'dev.autoConnSub': 'Will connect once powered on or plugged in',
+    'dev.connectedSub': 'Connected · Ready',
     'dev.machine': 'Machine model',
     'dev.connType': 'Connection',
     'dev.serial': 'USB / serial (recommended)',
@@ -431,9 +456,14 @@ const DICT = {
     'pad.stepMm': 'Step mm',
     'pad.stepFine': '0.1 (fine)',
     'pad.hint': 'Hold Shift to reverse · Click repeatedly to move continuously',
+    'manual.knifePos': 'Knife Pos',
+    'manual.userOrigin': 'Origin',
     'btn.penup': 'Pen up',
     'btn.home': 'Home',
     'btn.setorigin': 'Set origin',
+    'btn.resetOrigin': 'Reset origin',
+    'toast.originSet': 'Origin set to: ({x}, {y}) mm',
+    'toast.originReset': 'Origin reset to (0, 0)',
     'btn.feed50': 'Feed 50',
     'btn.eject50': 'Eject 50',
     'btn.penupHome': 'Pen up & home',

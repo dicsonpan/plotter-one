@@ -12,7 +12,7 @@
  */
 
 import { exec, execFile } from 'node:child_process';
-import { open, readFile } from 'node:fs/promises';
+import { open, readFile, access } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
 
@@ -110,6 +110,18 @@ export class SerialTransport extends EventEmitter {
     this.fd = await open(this.path, 'r+');
     this._startRx();
     this.open = true;
+    // 定期检查设备节点是否存在（应对关机断电或 USB 拔出的情况）
+    this._healthTimer = setInterval(async () => {
+      if (!this.open) return;
+      try {
+        await access(this.path);
+      } catch (err) {
+        if (err.code === 'ENOENT' || err.code === 'ENODEV') {
+          await this.disconnect();
+        }
+      }
+    }, 1500);
+    if (this._healthTimer.unref) this._healthTimer.unref();
     this.emit('open', { path: this.path, baud: this.baud });
   }
 
@@ -164,6 +176,7 @@ export class SerialTransport extends EventEmitter {
             continue;
           }
           this.emit('error', err);
+          await this.disconnect();
           break;
         }
       }
@@ -174,26 +187,31 @@ export class SerialTransport extends EventEmitter {
   async write(data) {
     if (!this.open || !this.fd) throw biErr('串口未连接', 'Serial port not connected');
     const buf = typeof data === 'string' ? Buffer.from(data, 'ascii') : data;
-    // 写入必须走 FileHandle.write（this.fd.write）。
-    // 早期这里写的是 `const { write } = await import('node:fs/promises')`，
-    // 但 node:fs/promises 根本没有 write 导出（只有 open），
-    // 解构出来是 undefined，调用即报 "write is not a function"。
-    // 而连接是成功的，所以表现为「显示已连接、一开始刻就失败」，很像连接问题。
     let written = 0;
-    while (written < buf.length) {
-      const r = await this.fd.write(buf, written, buf.length - written);
-      written += r.bytesWritten;
+    try {
+      while (written < buf.length) {
+        const r = await this.fd.write(buf, written, buf.length - written);
+        written += r.bytesWritten;
+      }
+    } catch (err) {
+      await this.disconnect();
+      throw err;
     }
     return written;
   }
 
   async disconnect() {
+    if (this._healthTimer) {
+      clearInterval(this._healthTimer);
+      this._healthTimer = null;
+    }
+    const wasOpen = this.open;
     this.open = false;
     if (this.fd) {
       try { await this.fd.close(); } catch { /* 已关闭 */ }
       this.fd = null;
     }
-    this.emit('close');
+    if (wasOpen) this.emit('close');
   }
 }
 

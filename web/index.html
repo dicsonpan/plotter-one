@@ -94,6 +94,10 @@
         <button class="btn btn-sm" id="btnFrontLayer" data-i18n="prop.front">置顶</button>
         <button class="btn btn-sm" id="btnDelLayer" data-i18n="prop.del">删除</button>
       </div>
+      <div class="btn-grid" style="margin-top:7px">
+        <button class="btn btn-sm" id="btnGroup" data-i18n="prop.group">编组</button>
+        <button class="btn btn-sm" id="btnUngroup" data-i18n="prop.ungroup">解组</button>
+      </div>
     </div>
 
     <div class="sect">
@@ -172,39 +176,51 @@
   <aside class="panel panel-right" id="panelRight">
 
     <div class="sect">
-      <h3 class="sect-title" data-i18n="sect.device">设备连接</h3>
-      <div class="field">
-        <label class="field-label" for="machineSel" data-i18n="dev.machine">机器型号</label>
-        <select id="machineSel"></select>
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px">
+        <h3 class="sect-title" style="margin:0" data-i18n="sect.device">设备连接</h3>
+        <button class="btn btn-sm" id="btnToggleConn" data-i18n="dev.settingsToggle" title="展开/折叠连接设置" style="font-size:11px; padding:2px 8px">⚙ 设置</button>
       </div>
-      <div class="field">
-        <label class="field-label" for="connType" data-i18n="dev.connType">连接方式</label>
-        <select id="connType">
-          <option value="serial" data-i18n="dev.serial">USB / 串口（推荐）</option>
-          <option value="tcp" data-i18n="dev.tcp">网口 TCP</option>
-          <option value="virtual" data-i18n="dev.virtual">内置虚拟机（调试用）</option>
-        </select>
-      </div>
-      <div class="field" id="portWrap">
-        <label class="field-label" for="portSel" data-i18n="dev.port">串口设备</label>
-        <div class="row">
-          <select id="portSel" style="flex:3"></select>
-          <button class="btn btn-sm" id="btnScanPorts" style="flex:1" data-i18n="dev.refresh">刷新</button>
+      <div class="conn-card" id="connCard">
+        <div class="conn-card-status">
+          <span class="conn-dot" id="connCardDot"></span>
+          <span class="conn-card-title" id="connCardTitle" data-i18n="dev.autoConn">正在自动连接设备…</span>
         </div>
+        <div class="conn-card-sub" id="connCardSub" data-i18n="dev.autoConnSub">开机或插上 USB 将自动连接</div>
       </div>
-      <div class="row" id="tcpWrap" style="display:none">
+      <div id="connDetails" style="display:none; margin-top:10px">
         <div class="field">
-          <label class="field-label" for="tcpHost" data-i18n="dev.ip">IP</label>
-          <input type="text" id="tcpHost" value="192.168.1.100">
+          <label class="field-label" for="machineSel" data-i18n="dev.machine">机器型号</label>
+          <select id="machineSel"></select>
         </div>
         <div class="field">
-          <label class="field-label" for="tcpPort" data-i18n="dev.portNum">端口</label>
-          <input type="number" id="tcpPort" value="9100">
+          <label class="field-label" for="connType" data-i18n="dev.connType">连接方式</label>
+          <select id="connType">
+            <option value="serial" data-i18n="dev.serial">USB / 串口（推荐）</option>
+            <option value="tcp" data-i18n="dev.tcp">网口 TCP</option>
+            <option value="virtual" data-i18n="dev.virtual">内置虚拟机（调试用）</option>
+          </select>
         </div>
-      </div>
-      <div class="btn-grid">
-        <button class="btn btn-primary" id="btnConnect" data-i18n="btn.connect">连接</button>
-        <button class="btn" id="btnDisconnect" disabled data-i18n="btn.disconnect">断开</button>
+        <div class="field" id="portWrap">
+          <label class="field-label" for="portSel" data-i18n="dev.port">串口设备</label>
+          <div class="row">
+            <select id="portSel" style="flex:3"></select>
+            <button class="btn btn-sm" id="btnScanPorts" style="flex:1" data-i18n="dev.refresh">刷新</button>
+          </div>
+        </div>
+        <div class="row" id="tcpWrap" style="display:none">
+          <div class="field">
+            <label class="field-label" for="tcpHost" data-i18n="dev.ip">IP</label>
+            <input type="text" id="tcpHost" value="192.168.1.100">
+          </div>
+          <div class="field">
+            <label class="field-label" for="tcpPort" data-i18n="dev.portNum">端口</label>
+            <input type="number" id="tcpPort" value="9100">
+          </div>
+        </div>
+        <div class="btn-grid">
+          <button class="btn btn-primary" id="btnConnect" data-i18n="btn.connect">连接</button>
+          <button class="btn" id="btnDisconnect" disabled data-i18n="btn.disconnect">断开</button>
+        </div>
       </div>
     </div>
 
@@ -235,6 +251,17 @@
     <div class="sect">
       <h3 class="sect-title" data-i18n="sect.manual">手动控制</h3>
 
+      <div class="pad-coords">
+        <div class="coord-item">
+          <span class="coord-k" data-i18n="manual.knifePos">刀头位置</span>
+          <span class="coord-v" id="knifePosVal">X: 0.0, Y: 0.0 mm</span>
+        </div>
+        <div class="coord-item">
+          <span class="coord-k" data-i18n="manual.userOrigin">当前原点</span>
+          <span class="coord-v" id="userOriginVal">X: 0.0, Y: 0.0 mm</span>
+        </div>
+      </div>
+
       <!-- 方向键：中心是落刀，四周移动。压感强的方块键，
            跟 Ucancam / 文泰那类软件的操作习惯一致 -->
       <div class="pad-wrap">
@@ -263,6 +290,7 @@
         <button class="btn btn-sm" data-manual="penup" data-i18n="btn.penup">抬刀</button>
         <button class="btn btn-sm" data-manual="home" data-i18n="btn.home">回原点</button>
         <button class="btn btn-sm btn-warn" data-manual="setorigin" data-i18n="btn.setorigin">设原点</button>
+        <button class="btn btn-sm" id="btnResetOrigin" data-i18n="btn.resetOrigin">重置原点</button>
         <button class="btn btn-sm" data-manual="feed" data-dist="50" data-i18n="btn.feed50">进纸50</button>
         <button class="btn btn-sm" data-manual="eject" data-dist="50" data-i18n="btn.eject50">出纸50</button>
         <button class="btn btn-sm" data-manual="end" data-i18n="btn.penupHome">抬刀回位</button>
