@@ -12,7 +12,7 @@ import {
   makePath, makeSubpath, addLine, DEG, TAU,
   circleToPath, ellipseToPath, polylineToPath,
   matrixTranslate, matrixScale, matrixRotate, matrixMultiply,
-  matrixTranslateXY, applyMatrixToPath, IDENTITY, normAngle,
+  matrixTranslateXY, applyMatrixToPath, IDENTITY, normAngle, pathBBox,
 } from '../geom/path.js';
 
 function tokenizePath(d) {
@@ -358,7 +358,6 @@ export function parseSvg(svgText, opts = {}) {
       continue;
     }
 
-    if (inNonRenderable) continue;
     if (attrs.display === 'none' || attrs.visibility === 'hidden') continue;
 
     // 计算当前元素在 SVG 空间的累计变换矩阵
@@ -478,6 +477,9 @@ export function parseSvg(svgText, opts = {}) {
       });
     }
 
+    // 处于 defs/clippath/mask 等非渲染容器内时，仅登记到 defElements，不直接输出到画布
+    if (inNonRenderable) continue;
+
     if (elemPath && elemPath.subpaths.length) {
       elemCounter++;
       // 若有变换矩阵，将其转为内部 Y-up 矩阵并应用
@@ -488,18 +490,38 @@ export function parseSvg(svgText, opts = {}) {
       // 减去 viewBox 原点偏移
       applyOffset(elemPath);
 
-      const elemId = attrs.id || `elem_${elemCounter}`;
-      const elemName = attrs.id || `${elemDefaultName} ${elemCounter}`;
-
-      elements.push({
-        id: elemId,
-        name: elemName,
-        type: elemType,
-        subpaths: elemPath.subpaths,
+      // 去重检查：防止在同一位置重复添加几何完全一致的冗余图元（如 use 原位复用或双层重叠 path）
+      const bbox = pathBBox(elemPath);
+      const isDuplicate = elements.some((existing) => {
+        if (existing.subpaths.length !== elemPath.subpaths.length) return false;
+        const eb = pathBBox({ subpaths: existing.subpaths });
+        if (Math.abs(eb.minX - bbox.minX) > 1e-3 || Math.abs(eb.minY - bbox.minY) > 1e-3 ||
+            Math.abs(eb.maxX - bbox.maxX) > 1e-3 || Math.abs(eb.maxY - bbox.maxY) > 1e-3) {
+          return false;
+        }
+        for (let sIdx = 0; sIdx < elemPath.subpaths.length; sIdx++) {
+          const s1 = elemPath.subpaths[sIdx];
+          const s2 = existing.subpaths[sIdx];
+          if (s1.elems.length !== s2.elems.length) return false;
+          if (Math.hypot(s1.start.x - s2.start.x, s1.start.y - s2.start.y) > 1e-3) return false;
+        }
+        return true;
       });
 
-      for (const s of elemPath.subpaths) {
-        path.subpaths.push(s);
+      if (!isDuplicate) {
+        const elemId = attrs.id || `elem_${elemCounter}`;
+        const elemName = attrs.id || `${elemDefaultName} ${elemCounter}`;
+
+        elements.push({
+          id: elemId,
+          name: elemName,
+          type: elemType,
+          subpaths: elemPath.subpaths,
+        });
+
+        for (const s of elemPath.subpaths) {
+          path.subpaths.push(s);
+        }
       }
     }
   }

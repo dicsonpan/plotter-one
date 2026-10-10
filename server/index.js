@@ -436,75 +436,80 @@ const routes = {
   },
 
   'POST /api/compile': async (req, res) => {
-    const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
-    const preset = getPreset(body.machineId || config.machineId);
-    const items = body.items || [];
-    if (!items.length) return sendJson(res, 400, err('没有可输出的内容', 'Nothing to output'));
+    try {
+      const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+      const preset = getPreset(body.machineId || config.machineId);
+      const items = body.items || [];
+      if (!items.length) return sendJson(res, 400, err('没有可输出的内容', 'Nothing to output'));
 
-    // 1. 合并所有几何
-    const merged = makePath();
-    const warnings = [];
-    for (const it of items) {
-      if (it.hidden) continue;
-      if (it.kind === 'import') {
-        const { path: p, warnings: w } = importVector(it.content || '', it.filename || '');
-        warnings.push(...w);
-        for (const s of p.subpaths) merged.subpaths.push(s);
-      } else if (it.path) {
-        for (const s of it.path.subpaths || []) merged.subpaths.push(s);
+      // 1. 合并所有几何
+      const merged = makePath();
+      const warnings = [];
+      for (const it of items) {
+        if (it.hidden) continue;
+        if (it.kind === 'import') {
+          const { path: p, warnings: w } = importVector(it.content || '', it.filename || '');
+          warnings.push(...w);
+          for (const s of p.subpaths) merged.subpaths.push(s);
+        } else if (it.path) {
+          for (const s of it.path.subpaths || []) merged.subpaths.push(s);
+        }
       }
+      if (!merged.subpaths.length) return sendJson(res, 400, err('合并后没有有效路径', 'No valid path after merging'));
+
+      // 2. 施加每个对象的变换（前端已算好，这里用矩阵）
+      //    若前端传的是已变换坐标则忽略；统一约定传 path + matrix
+      for (const it of items) {
+        if (it.hidden || !it.path || !it.matrix) continue;
+        const m = it.matrix;
+        applyMatrixToPath(it.path, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f });
+      }
+
+      // 3. CAM：清理、方向、排序
+      const origin = body.origin || { x: 0, y: 0 };
+      const compiled = compileToolpath(merged, preset, {
+        direction: body.direction || config.direction,
+        optimize: body.optimize !== undefined ? body.optimize : config.optimize,
+        origin,
+      });
+      warnings.push(...compiled.warnings);
+
+      // 4. 生成指令
+      const speed = +(body.speed || config.defaultSpeed);
+      const force = +(body.force || config.defaultForce);
+      const result = compileToPlotterLanguage(compiled.path, preset, {
+        speedMmPerSec: speed,
+        force,
+        origin: body.origin || { x: 0, y: 0 },
+        // 🔴 必须把轴向配置传进去。
+        // 之前这里漏传，界面上的「坐标轴方向」下拉框对实际输出毫无作用——
+        // 改完看着没变化，很容易误判成「机器有问题」。
+        ...axisOptions(),
+      });
+
+      const time = estimateTime(compiled.path, speed);
+      const timeText = result.text;
+      const transferSec = (timeText.length / 100) / 0.88;
+
+      sendJson(res, 200, {
+        gcode: timeText,
+        bytes: result.bytes,
+        commandCount: result.commandCount,
+        info: compiled.info,
+        warnings,
+        preset: { id: preset.id, name: preset.name, width: preset.width, height: preset.height },
+        estimate: {
+          ...time,
+          totalSeconds: time.totalSeconds,
+          transferSeconds: transferSec,
+          // 实际耗时取「刻绘」与「传输」的较大者——两者并行发生
+          wallSeconds: Math.max(time.totalSeconds, transferSec),
+        },
+      });
+    } catch (e) {
+      console.error('[POST /api/compile] 编译失败：', e);
+      sendJson(res, 500, err('刀路生成失败：' + (e.message || '未知错误'), 'Toolpath compile failed: ' + (e.message || 'Unknown error')));
     }
-    if (!merged.subpaths.length) return sendJson(res, 400, err('合并后没有有效路径', 'No valid path after merging'));
-
-    // 2. 施加每个对象的变换（前端已算好，这里用矩阵）
-    //    若前端传的是已变换坐标则忽略；统一约定传 path + matrix
-    for (const it of items) {
-      if (it.hidden || !it.path || !it.matrix) continue;
-      const m = it.matrix;
-      applyMatrixToPath(it.path, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f });
-    }
-
-    // 3. CAM：清理、方向、排序
-    const origin = body.origin || { x: 0, y: 0 };
-    const compiled = compileToolpath(merged, preset, {
-      direction: body.direction || config.direction,
-      optimize: body.optimize !== undefined ? body.optimize : config.optimize,
-      origin,
-    });
-    warnings.push(...compiled.warnings);
-
-    // 4. 生成指令
-    const speed = +(body.speed || config.defaultSpeed);
-    const force = +(body.force || config.defaultForce);
-    const result = compileToPlotterLanguage(compiled.path, preset, {
-      speedMmPerSec: speed,
-      force,
-      origin: body.origin || { x: 0, y: 0 },
-      // 🔴 必须把轴向配置传进去。
-      // 之前这里漏传，界面上的「坐标轴方向」下拉框对实际输出毫无作用——
-      // 改完看着没变化，很容易误判成「机器有问题」。
-      ...axisOptions(),
-    });
-
-    const time = estimateTime(compiled.path, speed);
-    const timeText = result.text;
-    const transferSec = (timeText.length / 100) / 0.88;
-
-    sendJson(res, 200, {
-      gcode: timeText,
-      bytes: result.bytes,
-      commandCount: result.commandCount,
-      info: compiled.info,
-      warnings,
-      preset: { id: preset.id, name: preset.name, width: preset.width, height: preset.height },
-      estimate: {
-        ...time,
-        totalSeconds: time.totalSeconds,
-        transferSeconds: transferSec,
-        // 实际耗时取「刻绘」与「传输」的较大者——两者并行发生
-        wallSeconds: Math.max(time.totalSeconds, transferSec),
-      },
-    });
   },
 
   /**
@@ -675,9 +680,9 @@ const server = http.createServer(async (req, res) => {
   if (routes[key]) {
     try {
       await routes[key](req, res, url);
-    } catch (err) {
-      console.error(`[${key}]`, err);
-      if (!res.headersSent) sendJson(res, 500, err(err.message, err.errorEn));
+    } catch (routeErr) {
+      console.error(`[${key}]`, routeErr);
+      if (!res.headersSent) sendJson(res, 500, err(routeErr.message, routeErr.errorEn || routeErr.message));
     }
     return;
   }
