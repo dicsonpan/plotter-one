@@ -541,8 +541,8 @@ section('力宇 SC631-AU 机型（用户实际机型）');
   check('分辨率为 1000 步/英寸（0.0254mm/step）', au.stepsPerInch === 1000, `实际 ${au.stepsPerInch}`);
   check('刀压范围 10-500g', au.force.min === 10 && au.force.max === 500, JSON.stringify(au.force));
   check('指令集为 HP-GL', au.dialect === 'hpgl');
-  check('串口默认 9600 8N1 无流控',
-    au.serialDefault.baud === 9600 && au.serialDefault.dataBits === 8
+  check('串口默认 115200 8N1 无流控',
+    au.serialDefault.baud === 115200 && au.serialDefault.dataBits === 8
     && au.serialDefault.stopBits === 1 && au.serialDefault.parity === 'none');
 
   // 关键安全性质：超框必须被拦下

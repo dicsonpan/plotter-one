@@ -207,6 +207,17 @@
             <button class="btn btn-sm" id="btnScanPorts" style="flex:1" data-i18n="dev.refresh">刷新</button>
           </div>
         </div>
+        <div class="field" id="baudWrap">
+          <label class="field-label" for="baudSel" data-i18n="dev.baud">波特率</label>
+          <select id="baudSel">
+            <option value="115200" selected>115200（高速 CDC / 推荐默认）</option>
+            <option value="57600">57600</option>
+            <option value="38400">38400</option>
+            <option value="19200">19200</option>
+            <option value="9600">9600（旧版串口兼容）</option>
+            <option value="230400">230400</option>
+          </select>
+        </div>
         <div class="row" id="tcpWrap" style="display:none">
           <div class="field">
             <label class="field-label" for="tcpHost" data-i18n="dev.ip">IP</label>
