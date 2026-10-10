@@ -10,7 +10,7 @@
 
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, access } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -132,8 +132,21 @@ function attachTransport(t) {
   engine.transport = t;
   t.on('data', (d) => broadcast('device:data', { data: String(d).slice(0, 400) }));
   t.on('status', (s) => broadcast('device:status', s));
-  t.on('error', (e) => broadcast('device:error', { message: e.message }));
-  t.on('close', () => { connected = false; broadcast('device:closed', {}); });
+  t.on('error', (e) => {
+    broadcast('device:error', { message: e.message });
+    if (!t.open) {
+      connected = false;
+      deviceInfo = null;
+      broadcast('device:closed', {});
+      startReconnectLoop();
+    }
+  });
+  t.on('close', () => {
+    connected = false;
+    deviceInfo = null;
+    broadcast('device:closed', {});
+    startReconnectLoop();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +184,8 @@ async function currentSerialCandidates() {
 }
 
 async function tryReconnect() {
-  if (connected) return true;
+  if (connected && transport && transport.open) return true;
+  connected = false;
   const candidates = await currentSerialCandidates();
   for (const path of candidates) {
     try {
@@ -207,6 +221,23 @@ function startReconnectLoop() {
   reconnectTimer = setInterval(async () => {
     // 服务正在退出时别再连
     if (shuttingDown) return;
+    if (connected) {
+      if (!transport || !transport.open) {
+        connected = false;
+        deviceInfo = null;
+        broadcast('device:closed', {});
+      } else if (transport instanceof SerialTransport && transport.path) {
+        try {
+          await access(transport.path);
+        } catch {
+          console.log(`  ! 串口设备 ${transport.path} 离线，标记断开`);
+          try { await transport.disconnect(); } catch {}
+          connected = false;
+          deviceInfo = null;
+          broadcast('device:closed', {});
+        }
+      }
+    }
     const ok = await tryReconnect();
     if (ok !== lastConnected) {
       lastConnected = ok;
@@ -219,7 +250,6 @@ function startReconnectLoop() {
 
 let shuttingDown = false;
 function stopReconnectLoop() {
-  shuttingDown = true;
   if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
 }
 
@@ -252,22 +282,26 @@ function importVector(text, filename) {
   const lower = (filename || '').toLowerCase();
   const warnings = [];
   let path;
+  let elements = null;
   if (lower.endsWith('.dxf')) {
     const r = parseDxf(text);
     path = r.path; warnings.push(...r.warnings);
   } else if (lower.endsWith('.svg')) {
     const r = parseSvg(text);
-    path = r.path; warnings.push(...r.warnings);
+    path = r.path; elements = r.elements; warnings.push(...r.warnings);
   } else if (/\.(plt|hgl|hpgl|camm|dmpl)$/.test(lower)) {
     const r = parseHpgl(text, { stepsPerInch: getPreset(config.machineId).stepsPerInch });
     path = r.path; warnings.push(...r.warnings);
   } else {
     // 猜：DXF 以 0\nSECTION 开头，SVG 以 < 开头，HPGL 以 IN; 开头
     if (/^\s*0\s*[\r\n]+\s*SECTION/.test(text)) { path = parseDxf(text).path; }
-    else if (/^\s*</.test(text)) { path = parseSvg(text).path; }
+    else if (/^\s*</.test(text)) {
+      const r = parseSvg(text);
+      path = r.path; elements = r.elements; warnings.push(...r.warnings);
+    }
     else { path = parseHpgl(text, { stepsPerInch: getPreset(config.machineId).stepsPerInch }).path; }
   }
-  return { path, warnings };
+  return { path, elements, warnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +347,9 @@ const routes = {
       }
       attachTransport(t);
       connected = true;
-      // 用户主动连上了 → 停掉自动重连，避免两套逻辑抢占同一块串口
+      // 用户主动连上了 → 停掉自动重连，由 attachTransport 的 close/error 重新触发
       stopReconnectLoop();
+      setTimeout(() => { if (!shuttingDown) startReconnectLoop(); }, 1000);
       if (type === 'serial') {
         config.serial = { ...config.serial, ...body };
         await saveConfig();
@@ -352,17 +387,23 @@ const routes = {
       // 直接传文件内容
       const filename = req.headers['x-filename'] || 'unknown.dxf';
       const text = raw.toString('utf8');
-      const { path, warnings } = importVector(text, filename);
+      const { path, elements, warnings } = importVector(text, filename);
       const preset = getPreset(config.machineId);
       const info = analyze(path, preset);
       return sendJson(res, 200, {
-        path: pathToClient(path), info, warnings, preset: preset.id,
+        path: pathToClient(path),
+        elements: elements ? pathToClient(elements) : null,
+        info, warnings, preset: preset.id,
       });
     }
-    const { path, warnings } = importVector(body.content || '', body.filename || '');
+    const { path, elements, warnings } = importVector(body.content || '', body.filename || '');
     const preset = getPreset(config.machineId);
     const info = analyze(path, preset);
-    sendJson(res, 200, { path: pathToClient(path), info, warnings, preset: preset.id });
+    sendJson(res, 200, {
+      path: pathToClient(path),
+      elements: elements ? pathToClient(elements) : null,
+      info, warnings, preset: preset.id,
+    });
   },
 
   'POST /api/geometry': async (req, res) => {
@@ -424,9 +465,11 @@ const routes = {
     }
 
     // 3. CAM：清理、方向、排序
+    const origin = body.origin || { x: 0, y: 0 };
     const compiled = compileToolpath(merged, preset, {
       direction: body.direction || config.direction,
       optimize: body.optimize !== undefined ? body.optimize : config.optimize,
+      origin,
     });
     warnings.push(...compiled.warnings);
 

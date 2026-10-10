@@ -404,6 +404,69 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   color: var(--text-3); font-weight: 500;
 }
 
+/* ---------------------------------------------------------------- 设备连接卡片 & 坐标面板 */
+.conn-card {
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.conn-card:hover {
+  border-color: var(--accent);
+}
+.conn-card-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+.conn-card-title {
+  color: var(--text);
+}
+.conn-card-sub {
+  font-size: 11px;
+  color: var(--text-2);
+  margin-top: 3px;
+  margin-left: 16px;
+}
+.pad-coords {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 9px;
+  padding: 6px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.coord-item {
+  display: flex;
+  flex-direction: column;
+}
+.coord-k {
+  font-size: 10px;
+  color: var(--text-2);
+}
+.coord-v {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+.group-tag {
+  display: inline-block;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  margin-left: 4px;
+}
+
 /* ---------------------------------------------------------------- 移动端 */
 .mobile-tabs { display: none; }
 

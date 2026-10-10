@@ -397,30 +397,33 @@ its own.
 ### Import and edit
 
 - **Import DXF / SVG / HP-GL**, or paste HP-GL commands directly
-- **Direct canvas editing**: drag to move, drag a corner to scale, drag the top handle to
-  rotate (Shift locks ratio / snaps to 15°)
-- **Precise numeric control**: X / Y / width / height / angle, with aspect lock,
-  six-way alignment, flip, duplicate
-- **Quick text**: a built-in single-stroke font (Stroker) designed for engraving — ordinary
-  fonts turned into outlines blob together on 3mm acrylic, single-stroke letters stay legible
-- 6 material presets (ivory board / PVC foam / acrylic / vinyl / KT board + foil / thin paper),
-  each with its own speed and force
+- **Full SVG Primitives & Matrix Cascade**: Full support for `<path>`, `<circle>`, `<rect>`, `<ellipse>`, `<line>`, `<polyline>`, and `<polygon>`, along with nested `<g>` group handling and matrix transform cascades. Fixes missing circle and rectangle geometries when importing multi-element SVGs.
+- **Group & Ungroup**:
+  - Complex multi-element vector imports are organized as groups by default to keep the layer tree neat.
+  - Supports one-click Ungroup for selected layers to split them into independent editable vector paths.
+  - Supports multi-selection (Shift / Cmd click) and one-click Grouping.
+  - While grouped, translation, scaling, and rotation transformations recursively synchronize all child geometries, ensuring children preserve their relative positions upon ungrouping.
+- **Direct canvas editing**: drag to move, drag a corner to scale, drag the top handle to rotate (Shift locks ratio / snaps to 15°)
+- **Dynamic Work Origin & Knife Crosshair**:
+  - **Live Knife Position Tracking**: Real-time crosshair (⌖) and coordinate display on canvas and control panel tracking the physical blade tip position.
+  - **Custom Work Origin (Set Origin / Reset Origin)**: Jog the blade to any target starting position and click "Set Origin" to establish a local working coordinate frame with prominent red origin dot and axis markers; easily reset back to machine zero.
+  - **Relative Origin CAM Compilation**: CAM toolpath generation automatically offsets coordinates relative to the active work origin, guaranteeing absolute cutting alignment with canvas layouts.
+- **Precise numeric control**: X / Y / width / height / angle, with aspect lock, six-way alignment, flip, duplicate
+- **Quick text**: a built-in single-stroke font (Stroker) designed for engraving — ordinary fonts turned into outlines blob together on 3mm acrylic, single-stroke letters stay legible
+- 6 material presets (ivory board / PVC foam / acrylic / vinyl / KT board + foil / thin paper), each with its own speed and force
 
-### Manual control
+### Device Connection and Manual Control
 
 A pad mirroring the basic operations of Ucancam / 文泰:
 
+- **Minimalist Collapsible Device Card**: Designed for transparent operation by default, showing only current status and machine name, with advanced serial port parameters collapsible on demand.
+- **True Connection Health Check & Auto Reconnect**:
+  - 1.5s periodic health heartbeat and proactive disconnection handling on read/write errors. Turning off or unplugging the engraver immediately sets the UI status to disconnected, eliminating misleading "connected" indicators.
+  - Silent background auto-detection and self-healing reconnection upon power-on or USB re-plug.
 - **Direction pad** (▲◀●▶▼), step 0.1 / 1 / 5 / 10 / 25 / 50 mm
   - press-and-hold to move continuously, Shift to reverse; arrow keys work on desktop
-- **Pen up / pen down / home / set origin / feed / eject / pen-up-and-home**
+- **Pen up / pen down / home / set origin / reset origin / feed / eject / pen-up-and-home**
 - 200mm cap per move, so a slip of the hand cannot run away
-- **Serial auto-reconnect**: reconnecting after a service restart, and recovering from a
-  USB re-plug, with no need to press "Connect" by hand
-
-All manual actions go through the job queue and **never bypass rate limiting or e-stop**.
-Manual directions are sent in **canvas orientation** (pressing "right" moves the head
-right), decoupled from the machine's internal axis numbering — so the operating intuition
-stays correct even when the physical X/Y are transposed.
 
 ### Output control
 

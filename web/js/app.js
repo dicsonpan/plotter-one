@@ -27,6 +27,10 @@ if (typeof window !== 'undefined') {
     ws: null,
     jobState: 'idle',
     compiled: null,
+    selectedId: null,
+    selectedIds: new Set(),
+    knifePos: { x: 0, y: 0 },
+    userOrigin: { x: 0, y: 0 },
   };
 
   // ---------------------------------------------------------------- 提示
@@ -183,6 +187,22 @@ if (typeof window !== 'undefined') {
         : t(s.device.connected ? 'btn.connected' : 'btn.disconnected');
       $('btnDisconnect').disabled = !s.device.connected;
       $('btnConnectTop').textContent = t(s.device.connected ? 'btn.connected' : 'btn.connect');
+
+      // 更新折叠卡片连接状态
+      const dot = $('connCardDot');
+      const title = $('connCardTitle');
+      const sub = $('connCardSub');
+      if (dot && title && sub) {
+        if (s.device.connected) {
+          dot.className = 'conn-dot on';
+          title.textContent = `${s.preset.name} · ${t('dev.connectedSub')}`;
+          sub.textContent = s.device.info?.path || t('btn.connected');
+        } else {
+          dot.className = 'conn-dot';
+          title.textContent = t('dev.autoConn');
+          sub.textContent = t('dev.autoConnSub');
+        }
+      }
 
       // 手动控制只有连上机器才有意义，未连接时置灰。
       // .pad-key 是 button，disabled 有效；用 class 让样式一起变灰。
@@ -360,13 +380,29 @@ if (typeof window !== 'undefined') {
       const m = renderer.toModel(p.x, p.y);
       const hit = renderer.hitTest(m.x, m.y);
       if (hit) {
-        state.selectedId = hit.id;
-        renderer.selectedId = hit.id;
+        if (e.shiftKey || e.metaKey || e.ctrlKey) {
+          if (state.selectedIds.has(hit.id)) {
+            state.selectedIds.delete(hit.id);
+            state.selectedId = [...state.selectedIds][0] || null;
+          } else {
+            state.selectedIds.add(hit.id);
+            state.selectedId = hit.id;
+          }
+        } else {
+          state.selectedId = hit.id;
+          state.selectedIds = new Set([hit.id]);
+        }
+        renderer.selectedId = state.selectedId;
+        renderer.selectedIds = state.selectedIds;
         dragLayer = hit;
         mode = 'move';
       } else {
-        state.selectedId = null;
-        renderer.selectedId = null;
+        if (!e.shiftKey && !e.metaKey && !e.ctrlKey) {
+          state.selectedId = null;
+          state.selectedIds = new Set();
+          renderer.selectedId = null;
+          renderer.selectedIds = state.selectedIds;
+        }
         mode = 'pan';   // 空白处拖动 = 平移画布
       }
       renderer.dirty = true;
@@ -514,12 +550,15 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 图层
-  function addLayer(name, path) {
+  function addLayer(name, path, extra = {}) {
     const layer = {
       id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6),
       name,
       subpaths: path.subpaths,
       hidden: false,
+      isGroup: !!extra.isGroup,
+      children: extra.children || null,
+      ...extra,
     };
     renderer.layers.push(layer);
     renderer.dirty = true;
@@ -594,11 +633,13 @@ if (typeof window !== 'undefined') {
 
     for (const layer of list.slice().reverse()) {
       const el = document.createElement('div');
+      const isSel = state.selectedId === layer.id || state.selectedIds.has(layer.id);
       el.className = 'layer-item' + (layer.hidden ? ' hidden' : '') +
-        (state.selectedId === layer.id ? ' active' : '');
+        (isSel ? ' active' : '');
       const len = layer.subpaths.reduce((a, s) => a + G.subpathLength(s), 0);
+      const groupBadge = layer.isGroup ? `<span class="group-tag">${t('prop.group')}</span>` : '';
       el.innerHTML = `
-        <span class="nm">${escapeHtml(layer.name)}</span>
+        <span class="nm">${escapeHtml(layer.name)}${groupBadge}</span>
         <span class="meta">${len.toFixed(0)}mm</span>
         <button class="btn btn-sm" data-act="vis" title="${t('layer.hidden')}">${layer.hidden ? '○' : '●'}</button>
         <button class="btn btn-sm" data-act="del" title="${t('prop.del')}">×</button>`;
@@ -612,19 +653,97 @@ if (typeof window !== 'undefined') {
       el.querySelector('[data-act=del]').addEventListener('click', (e) => {
         e.stopPropagation();
         renderer.layers = renderer.layers.filter((x) => x.id !== layer.id);
+        state.selectedIds.delete(layer.id);
+        if (state.selectedId === layer.id) {
+          state.selectedId = [...state.selectedIds][0] || null;
+          renderer.selectedId = state.selectedId;
+        }
         renderer.dirty = true;
         renderLayerList();
+        updateTransformPanel();
         updateStats();
       });
-      el.addEventListener('click', () => {
-        state.selectedId = layer.id;
-        renderer.selectedId = layer.id;
+      el.addEventListener('click', (e) => {
+        if (e.shiftKey || e.metaKey || e.ctrlKey) {
+          if (state.selectedIds.has(layer.id)) {
+            state.selectedIds.delete(layer.id);
+            if (state.selectedId === layer.id) {
+              state.selectedId = [...state.selectedIds][0] || null;
+            }
+          } else {
+            state.selectedIds.add(layer.id);
+            state.selectedId = layer.id;
+          }
+        } else {
+          state.selectedIds = new Set([layer.id]);
+          state.selectedId = layer.id;
+        }
+        renderer.selectedId = state.selectedId;
+        renderer.selectedIds = state.selectedIds;
         renderer.dirty = true;
         renderLayerList();
         updateTransformPanel();
       });
       box.appendChild(el);
     }
+  }
+
+  function ungroupLayer(layer) {
+    if (!layer) return;
+    const idx = renderer.layers.indexOf(layer);
+    if (idx === -1) return;
+    let newLayers = [];
+    if (layer.children && layer.children.length > 0) {
+      newLayers = layer.children.map((child, i) => ({
+        id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6) + '_' + i,
+        name: child.name || `${layer.name} #${i + 1}`,
+        subpaths: structuredClone(child.subpaths),
+        hidden: false,
+      }));
+    } else if (layer.subpaths.length > 1) {
+      newLayers = layer.subpaths.map((sub, i) => ({
+        id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6) + '_' + i,
+        name: `${layer.name} #${i + 1}`,
+        subpaths: [structuredClone(sub)],
+        hidden: false,
+      }));
+    }
+    if (newLayers.length <= 1) return;
+    renderer.layers.splice(idx, 1, ...newLayers);
+    state.selectedIds = new Set(newLayers.map((l) => l.id));
+    state.selectedId = newLayers[0].id;
+    renderer.selectedId = state.selectedId;
+    renderer.selectedIds = state.selectedIds;
+    renderer.dirty = true;
+    renderLayerList();
+    updateTransformPanel();
+    updateStats();
+    toast(t('toast.ungrouped', { n: newLayers.length }), 'ok');
+  }
+
+  function groupSelectedLayers() {
+    const toGroup = renderer.layers.filter((l) => state.selectedIds.has(l.id));
+    if (toGroup.length <= 1) return;
+    const firstIdx = renderer.layers.indexOf(toGroup[0]);
+    renderer.layers = renderer.layers.filter((l) => !state.selectedIds.has(l.id));
+    const newGroup = {
+      id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6),
+      name: `${t('prop.group')} (${toGroup.length})`,
+      isGroup: true,
+      hidden: false,
+      subpaths: toGroup.flatMap((l) => structuredClone(l.subpaths)),
+      children: toGroup.map((l) => ({ name: l.name, subpaths: structuredClone(l.subpaths) })),
+    };
+    renderer.layers.splice(firstIdx, 0, newGroup);
+    state.selectedId = newGroup.id;
+    state.selectedIds = new Set([newGroup.id]);
+    renderer.selectedId = newGroup.id;
+    renderer.selectedIds = state.selectedIds;
+    renderer.dirty = true;
+    renderLayerList();
+    updateTransformPanel();
+    updateStats();
+    toast(t('toast.grouped', { n: toGroup.length }), 'ok');
   }
 
   function escapeHtml(s) {
@@ -676,6 +795,11 @@ if (typeof window !== 'undefined') {
     if (document.activeElement !== $('propW')) $('propW').value = round1(bb.w);
     if (document.activeElement !== $('propH')) $('propH').value = round1(bb.h);
     if (document.activeElement !== $('propRot')) $('propRot').value = round1(layer.rotation || 0);
+
+    const btnGroup = $('btnGroup');
+    const btnUngroup = $('btnUngroup');
+    if (btnGroup) btnGroup.disabled = state.selectedIds.size <= 1;
+    if (btnUngroup) btnUngroup.disabled = !(layer && (layer.isGroup || (layer.subpaths && layer.subpaths.length > 1)));
   }
 
   function afterTransform(layer) {
@@ -786,6 +910,12 @@ if (typeof window !== 'undefined') {
       renderLayerList();
       updateStats();
     });
+
+    $('btnGroup')?.addEventListener('click', groupSelectedLayers);
+    $('btnUngroup')?.addEventListener('click', () => {
+      const l = selectedLayer();
+      if (l) ungroupLayer(l);
+    });
   }
   // ---------------------------------------------------------------- UI 绑定
   function wireUI() {
@@ -809,9 +939,18 @@ if (typeof window !== 'undefined') {
         document.querySelector('.mtab[data-panel=right]').click();
         $('connType').focus();
       } else {
+        const el = $('connDetails');
+        if (el) el.style.display = 'block';
         $('portSel').scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     });
+
+    const toggleConn = () => {
+      const el = $('connDetails');
+      if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    };
+    $('btnToggleConn')?.addEventListener('click', toggleConn);
+    $('connCard')?.addEventListener('click', toggleConn);
 
     // 导入
     $('btnImportFile').addEventListener('click', () => $('fileInput').click());
@@ -981,6 +1120,17 @@ if (typeof window !== 'undefined') {
     }
   }
 
+  function updateKnifeCoordsDisplay() {
+    if ($('knifePosVal')) {
+      $('knifePosVal').textContent = `X: ${state.knifePos.x.toFixed(1)}, Y: ${state.knifePos.y.toFixed(1)} mm`;
+    }
+    if ($('userOriginVal')) {
+      $('userOriginVal').textContent = `X: ${state.userOrigin.x.toFixed(1)}, Y: ${state.userOrigin.y.toFixed(1)} mm`;
+    }
+    renderer.knifePos = state.knifePos;
+    renderer.userOrigin = state.userOrigin;
+  }
+
   function wirePad() {
     const step = () => +$('stepMm').value || 5;
 
@@ -992,6 +1142,10 @@ if (typeof window !== 'undefined') {
       const moveOnce = (sign) => {
         const dx = +key.dataset.dx * step() * sign;
         const dy = +key.dataset.dy * step() * sign;
+        state.knifePos.x = round1(state.knifePos.x + dx);
+        state.knifePos.y = round1(state.knifePos.y + dy);
+        updateKnifeCoordsDisplay();
+        renderer.dirty = true;
         sendManual({ action: 'move', dx, dy, speed: 20 }, 'move');
       };
 
@@ -1029,11 +1183,39 @@ if (typeof window !== 'undefined') {
     document.querySelectorAll('[data-manual]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const action = btn.dataset.manual;
-        if (action === 'setorigin' && !confirm(t('confirm.setorigin'))) return;
+        if (action === 'setorigin') {
+          if (!confirm(t('confirm.setorigin'))) return;
+          state.userOrigin = { x: state.knifePos.x, y: state.knifePos.y };
+          updateKnifeCoordsDisplay();
+          renderer.dirty = true;
+          toast(t('toast.originSet', { x: state.userOrigin.x.toFixed(1), y: state.userOrigin.y.toFixed(1) }), 'ok');
+          sendManual({ action: 'setorigin', x: state.userOrigin.x, y: state.userOrigin.y }, action);
+          return;
+        }
+        if (action === 'home') {
+          state.knifePos = { x: state.userOrigin.x, y: state.userOrigin.y };
+          updateKnifeCoordsDisplay();
+          renderer.dirty = true;
+        }
         const cmd = { action };
-        if (btn.dataset.dist) cmd.distance = +btn.dataset.dist;
+        if (btn.dataset.dist) {
+          const d = +btn.dataset.dist;
+          cmd.distance = d;
+          if (action === 'feed') state.knifePos.y = round1(state.knifePos.y + d);
+          else if (action === 'eject') state.knifePos.y = round1(state.knifePos.y - d);
+          updateKnifeCoordsDisplay();
+          renderer.dirty = true;
+        }
         sendManual(cmd, action);
       });
+    });
+
+    // 重置原点
+    $('btnResetOrigin')?.addEventListener('click', () => {
+      state.userOrigin = { x: 0, y: 0 };
+      updateKnifeCoordsDisplay();
+      renderer.dirty = true;
+      toast(t('toast.originReset'), 'ok');
     });
 
     // 键盘方向键（桌面端调试很方便）
@@ -1044,7 +1226,12 @@ if (typeof window !== 'undefined') {
       e.preventDefault();
       const sign = e.shiftKey ? -1 : 1;
       const [dx, dy] = map[e.key];
-      sendManual({ action: 'move', dx: dx * step() * sign, dy: dy * step() * sign, speed: 20 }, 'move');
+      const stepVal = step() * sign;
+      state.knifePos.x = round1(state.knifePos.x + dx * stepVal);
+      state.knifePos.y = round1(state.knifePos.y + dy * stepVal);
+      updateKnifeCoordsDisplay();
+      renderer.dirty = true;
+      sendManual({ action: 'move', dx: dx * stepVal, dy: dy * stepVal, speed: 20 }, 'move');
     });
   }
 
@@ -1129,7 +1316,16 @@ if (typeof window !== 'undefined') {
         toast(t('toast.noPath'), 'err');
         return;
       }
-      addLayer(f.name, r.path);
+      const children = (r.elements && r.elements.length > 1) ? r.elements.map((elem) => ({
+        name: elem.name,
+        subpaths: structuredClone(elem.subpaths),
+      })) : null;
+      const isGroup = !!(children && children.length > 1);
+      const layer = addLayer(f.name, r.path, { isGroup, children });
+      state.selectedId = layer.id;
+      state.selectedIds = new Set([layer.id]);
+      renderer.selectedId = layer.id;
+      renderer.selectedIds = state.selectedIds;
       toast(t('toast.imported', { name: f.name }), 'ok');
       logLine(t('log.importOk', { n: r.path.subpaths.length, len: r.info.length.toFixed(0) }));
       for (const w of r.warnings || []) { logLine(t('log.notice', { msg: pickLang(w) || w })); }
@@ -1215,6 +1411,7 @@ if (typeof window !== 'undefined') {
           speed: +$('speedRange').value,
           force: +$('forceRange').value,
           direction: $('dirSel').value,
+          origin: state.userOrigin || { x: 0, y: 0 },
         },
       });
       state.gcode = r.gcode;

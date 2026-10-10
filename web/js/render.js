@@ -27,6 +27,9 @@ class Renderer {
       // 内容
       this.layers = [];
       this.selectedId = null;
+      this.selectedIds = new Set();
+      this.userOrigin = { x: 0, y: 0 };
+      this.knifePos = { x: 0, y: 0 };
 
       // 动画
       this.anim = null;        // { path, t, speed }
@@ -173,14 +176,60 @@ class Renderer {
       ctx.fill();
       ctx.stroke();
 
-      // 原点标记：机器的物理零点（左下角）
-      ctx.fillStyle = '#8b95a3';
+      // 机械物理原点（左下角）
+      ctx.fillStyle = '#94a3b8';
       ctx.font = '10px ui-monospace, monospace';
-      ctx.fillText(t('canvas.origin'), x + 3, y + h - 5);
+      ctx.fillText(t('canvas.mechOrigin'), x + 3, y + h - 5);
       ctx.beginPath();
-      ctx.arc(x, y + h, 3, 0, Math.PI * 2);
+      ctx.arc(x, y + h, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#94a3b8';
+      ctx.fill();
+
+      // 用户工作原点（若设置了原点，在材料区动态定位）
+      const uo = this.userOrigin || { x: 0, y: 0 };
+      const so = this.toScreen(uo.x, uo.y);
+
+      // 绘制原点标记（红点 + 坐标轴线）
+      ctx.beginPath();
+      ctx.arc(so.x, so.y, 4, 0, Math.PI * 2);
       ctx.fillStyle = '#e11d48';
       ctx.fill();
+
+      ctx.strokeStyle = '#e11d48';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(so.x, so.y); ctx.lineTo(so.x + 16, so.y);
+      ctx.moveTo(so.x, so.y); ctx.lineTo(so.x, so.y - 16);
+      ctx.stroke();
+
+      // 原点文字标签
+      ctx.fillStyle = '#e11d48';
+      ctx.font = 'bold 11px ui-monospace, monospace';
+      const label = `${t('canvas.origin')} (${uo.x.toFixed(1)}, ${uo.y.toFixed(1)})`;
+      ctx.fillText(label, so.x + 6, so.y - 6);
+
+      // 绘制刀头实时位置标记
+      if (this.knifePos) {
+        const kp = this.toScreen(this.knifePos.x, this.knifePos.y);
+        ctx.save();
+        ctx.strokeStyle = '#0284c7';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(kp.x, kp.y, 7, 0, Math.PI * 2);
+        ctx.moveTo(kp.x - 11, kp.y); ctx.lineTo(kp.x + 11, kp.y);
+        ctx.moveTo(kp.x, kp.y - 11); ctx.lineTo(kp.x, kp.y + 11);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(kp.x, kp.y, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#0284c7';
+        ctx.fill();
+
+        ctx.fillStyle = '#0284c7';
+        ctx.font = '10px ui-monospace, monospace';
+        ctx.fillText(`${t('canvas.knife')} (${this.knifePos.x.toFixed(1)}, ${this.knifePos.y.toFixed(1)})`, kp.x + 9, kp.y + 12);
+        ctx.restore();
+      }
     }
 
     _drawGrid() {
@@ -218,7 +267,7 @@ class Renderer {
       let skipped = 0;
       for (const layer of this.layers) {
         if (layer.hidden) continue;
-        const isSel = layer.id === this.selectedId;
+        const isSel = layer.id === this.selectedId || (this.selectedIds && this.selectedIds.has(layer.id));
         for (const sub of layer.subpaths) {
           const pts = G.flattenSubpathOpen(sub, 0.06);
           if (pts.length < 2) { skipped++; continue; }
