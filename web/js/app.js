@@ -402,6 +402,10 @@ if (typeof window !== 'undefined') {
 
     canvas.addEventListener('pointerdown', (e) => {
       canvas.setPointerCapture(e.pointerId);
+      if (document.activeElement && document.activeElement !== canvas && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+        document.activeElement.blur();
+      }
+      canvas.focus();
       const p = localPos(e);
       lastX = e.clientX; lastY = e.clientY; moved = 0;
 
@@ -751,6 +755,9 @@ if (typeof window !== 'undefined') {
         updateStats();
       });
       el.addEventListener('click', (e) => {
+        if (document.activeElement && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+          document.activeElement.blur();
+        }
         if (e.shiftKey || e.metaKey || e.ctrlKey) {
           if (state.selectedIds.has(layer.id)) {
             state.selectedIds.delete(layer.id);
@@ -802,7 +809,7 @@ if (typeof window !== 'undefined') {
     if (newLayers.length <= 1) return;
     pushHistory();
     renderer.layers.splice(idx, 1, ...newLayers);
-    state.selectedIds = new Set(newLayers.map((l) => l.id));
+    state.selectedIds = new Set([newLayers[0].id]);
     state.selectedId = newLayers[0].id;
     renderer.selectedId = state.selectedId;
     renderer.selectedIds = state.selectedIds;
@@ -993,7 +1000,7 @@ if (typeof window !== 'undefined') {
       }
     }
     if (allNew.length) {
-      state.selectedIds = new Set(allNew.map((x) => x.id));
+      state.selectedIds = new Set([allNew[0].id]);
       state.selectedId = allNew[0].id;
       renderer.selectedId = state.selectedId;
       renderer.selectedIds = state.selectedIds;
@@ -1537,7 +1544,25 @@ if (typeof window !== 'undefined') {
         return;
       }
 
-      if (e.key === 'Delete' || e.key === 'Backspace') {
+      // 全选快捷键 (Cmd+A / Ctrl+A)
+      if (isCmdOrCtrl && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        state.selectedIds = new Set(renderer.layers.filter((l) => !l.hidden).map((l) => l.id));
+        state.selectedId = [...state.selectedIds][0] || null;
+        renderer.selectedId = state.selectedId;
+        renderer.selectedIds = state.selectedIds;
+        renderer.dirty = true;
+        renderLayerList();
+        updateTransformPanel();
+        return;
+      }
+
+      // 删除快捷键：全方位支持 Mac (Backspace/Delete, Cmd+Backspace, Cmd+Delete) 与 Windows (Delete, Backspace)
+      // 包含中文输入法 (keyCode 229 / key Process 时靠 e.code 匹配)
+      const isDeleteKey = e.key === 'Delete' || e.key === 'Backspace' ||
+                          e.code === 'Delete' || e.code === 'Backspace' ||
+                          e.keyCode === 8 || e.keyCode === 46;
+      if (isDeleteKey) {
         if (state.selectedIds.size > 0 || state.selectedId) {
           e.preventDefault();
           deleteSelected();
