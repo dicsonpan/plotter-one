@@ -564,6 +564,17 @@ const routes = {
   'POST /api/job/estop': async (req, res) => { engine.emergencyStop(); sendJson(res, 200, { ok: true }); },
   'POST /api/job/clear': async (req, res) => { engine.clearFinished(); sendJson(res, 200, { ok: true }); },
 
+  'POST /api/preview': async (req, res) => {
+    const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+    const q = body.gcode;
+    if (!q) return sendJson(res, 400, err('缺少 gcode 参数', 'Missing gcode parameter'));
+    const preset = getPreset(config.machineId);
+    const r = parseHpgl(q, { stepsPerInch: preset.stepsPerInch });
+    const b = new HpglBuilder(preset, axisOptions());
+    mapPathPoints(r.path, (x, y) => b.toUser(x, y), b.isReflection);
+    sendJson(res, 200, { path: pathToClient(r.path), stats: r.stats, warnings: r.warnings });
+  },
+
   'GET /api/preview': async (req, res, url) => {
     // 回显自检：把自己生成的 HPGL 读回来，验证解析器与生成器一致
     const q = url.searchParams.get('gcode');

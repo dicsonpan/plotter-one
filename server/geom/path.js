@@ -294,8 +294,8 @@ export function matrixTranslateXY(m, x, y) {
 /** 判断矩阵是否为「相似变换」（等比缩放+旋转+平移），保弧的前提 */
 export function isSimilarity(m, tol = 1e-6) {
   const det = m.a * m.d - m.b * m.c;
-  if (Math.abs(det) < 1e-12) return false;
-  // 正交性检查：列向量长度相等且正交
+  if (det <= 1e-12) return false;
+  // 正交性检查：列向量长度相等且正交（必须正定，排除反射）
   const l1 = Math.hypot(m.a, m.b);
   const l2 = Math.hypot(m.c, m.d);
   if (Math.abs(l1 - l2) > tol * l1) return false;
@@ -412,11 +412,29 @@ export function cleanSubpath(sub) {
   return sub;
 }
 
-/** 移除整条零长度子路径 */
+/** 检查子路径所有坐标是否有效有限数（非 NaN，非 Infinity） */
+export function isSubpathFinite(sub) {
+  if (!sub || !sub.start || !Number.isFinite(sub.start.x) || !Number.isFinite(sub.start.y)) return false;
+  if (!Array.isArray(sub.elems)) return false;
+  for (const e of sub.elems) {
+    if (e.type === 'line') {
+      if (!Number.isFinite(e.x1) || !Number.isFinite(e.y1) || !Number.isFinite(e.x2) || !Number.isFinite(e.y2)) return false;
+    } else if (e.type === 'arc') {
+      if (!Number.isFinite(e.cx) || !Number.isFinite(e.cy) || !Number.isFinite(e.r) || !Number.isFinite(e.a0) || !Number.isFinite(e.a1)) return false;
+    } else if (e.type === 'ellipse') {
+      if (!Number.isFinite(e.cx) || !Number.isFinite(e.cy) || !Number.isFinite(e.rx) || !Number.isFinite(e.ry) || !Number.isFinite(e.a0) || !Number.isFinite(e.a1)) return false;
+    }
+  }
+  return true;
+}
+
+/** 移除整条零长度或含非法 NaN 坐标的子路径 */
 export function pruneDegenerate(path, minLen = 0.001) {
   path.subpaths = path.subpaths.filter((s) => {
+    if (!isSubpathFinite(s)) return false;
     cleanSubpath(s);
-    return subpathLength(s) >= minLen;
+    const len = subpathLength(s);
+    return Number.isFinite(len) && len >= minLen;
   });
   return path;
 }
@@ -563,13 +581,21 @@ function dist(a, b) {
  * 最近邻排序子路径，并按需反转以减少空行程。
  * @param {object} path
  * @param {{x:number,y:number}} from 起始刀位
- * @param {number} maxTravel 可选：超过此距离的空行程按包围盒矩形过滤顺序换向
  */
 export function optimizeOrder(path, from = { x: 0, y: 0 }) {
-  const subs = path.subpaths.slice();
-  const remaining = new Set(subs.map((_, i) => i));
+  const subs = path.subpaths.filter(isSubpathFinite);
+  if (!subs.length) { path.subpaths = []; return path; }
+
+  // 预先缓存起点与终点，避免在 O(N^2) 循环中频繁调用 currentPoint
+  const meta = subs.map((s) => {
+    const end = currentPoint(s);
+    const isClosed = !!s.closed || (Math.hypot(s.start.x - end.x, s.start.y - end.y) < 0.05);
+    return { s, start: s.start, end, isClosed };
+  });
+
+  const remaining = new Set(meta.map((_, i) => i));
   const ordered = [];
-  let cur = { x: from.x, y: from.y };
+  let cur = { x: from.x || 0, y: from.y || 0 };
   let prevCCW = true;
 
   while (remaining.size) {
@@ -577,19 +603,36 @@ export function optimizeOrder(path, from = { x: 0, y: 0 }) {
     let bestD = Infinity;
     let bestFlip = false;
     for (const i of remaining) {
-      const s = subs[i];
-      const dStart = dist(cur, s.start);
-      const end = currentPoint(s);
-      const dEnd = dist(cur, end);
-      if (dStart <= dEnd) {
-        if (dStart < bestD) { bestD = dStart; best = i; bestFlip = false; }
+      const m = meta[i];
+      const dStart = dist(cur, m.start);
+      if (!Number.isFinite(dStart)) continue;
+
+      if (m.isClosed) {
+        // 闭合路径首尾相连，反转没有收益且会破坏进给切削方向（正/逆铣），恒不反转
+        if (dStart < bestD) {
+          bestD = dStart;
+          best = i;
+          bestFlip = false;
+        }
       } else {
-        if (dEnd < bestD) { bestD = dEnd; best = i; bestFlip = true; }
+        const dEnd = dist(cur, m.end);
+        if (dStart <= dEnd) {
+          if (dStart < bestD) { bestD = dStart; best = i; bestFlip = false; }
+        } else if (Number.isFinite(dEnd)) {
+          if (dEnd < bestD) { bestD = dEnd; best = i; bestFlip = true; }
+        }
       }
     }
-    const s = subs[best];
-    // 交替方向（正铣/逆铣）能让刻刀受力一致，是刻字机的常用做法
-    if (bestFlip !== prevCCW) {
+
+    if (best === null) {
+      // 容错兜底：若均无法计算距离，安全取当前集合首个
+      best = remaining.values().next().value;
+      bestFlip = false;
+    }
+
+    const m = meta[best];
+    const s = m.s;
+    if (!m.isClosed && bestFlip !== prevCCW) {
       reverseSubpath(s);
       prevCCW = !prevCCW;
     } else {

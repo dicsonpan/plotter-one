@@ -28,7 +28,10 @@ function tokenizePath(d) {
 
 /** 端点参数化椭圆 → 圆弧图元（无 SVG A 命令则退化为折线） */
 function ellipticalArcTo(x0, y0, rx, ry, xRotDeg, largeArc, sweep, x1, y1, sub) {
-  if (rx === 0 || ry === 0) { addLine(sub, x1, y1); return; }
+  if (rx === 0 || ry === 0 || Math.hypot(x0 - x1, y0 - y1) < 1e-6) {
+    addLine(sub, x1, y1);
+    return;
+  }
   rx = Math.abs(rx); ry = Math.abs(ry);
   const phi = xRotDeg * DEG;
   const cosP = Math.cos(phi), sinP = Math.sin(phi);
@@ -56,8 +59,9 @@ function ellipticalArcTo(x0, y0, rx, ry, xRotDeg, largeArc, sweep, x1, y1, sub) 
   const cy = sinP * cxp + cosP * cyp + (y0 + y1) / 2;
 
   const ang = (ux, uy, vx, vy) => {
-    const dot = ux * vx + uy * vy;
     const len = Math.hypot(ux, uy) * Math.hypot(vx, vy);
+    if (len < 1e-12) return 0;
+    const dot = ux * vx + uy * vy;
     let a = Math.acos(Math.max(-1, Math.min(1, dot / len)));
     if (ux * vy - uy * vx < 0) a = -a;
     return a;
@@ -68,6 +72,11 @@ function ellipticalArcTo(x0, y0, rx, ry, xRotDeg, largeArc, sweep, x1, y1, sub) 
   let dTheta = ang(ux, uy, vx, vy);
   if (!sweep && dTheta > 0) dTheta -= TAU;
   if (sweep && dTheta < 0) dTheta += TAU;
+
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(theta1) || !Number.isFinite(dTheta)) {
+    addLine(sub, x1, y1);
+    return;
+  }
 
   if (Math.abs(rx - ry) < 1e-6 && Math.abs(phi % (Math.PI / 2)) < 1e-6) {
     sub.elems.push({ type: 'arc', cx, cy, r: rx, a0: theta1, a1: theta1 + dTheta });
@@ -266,10 +275,12 @@ function parsePoints(str) {
 
 /** 解析整个 SVG 文件，提取全部图元，支持 Group/Ungroup 元数据 */
 export function parseSvg(svgText, opts = {}) {
+  svgText = (svgText || '').replace(/<!--[\s\S]*?-->/g, '');
   const flipY = opts.flipY !== false;
   const path = makePath();
   const elements = [];
   const warnings = [];
+  const defElements = new Map();
 
   const viewBox = /viewBox\s*=\s*["']([\d.\-\s]+)["']/i.exec(svgText);
   const widthAttr = /<svg[^>]*\bwidth\s*=\s*["']([\d.]+)([a-z%]*)["']/i.exec(svgText);
@@ -444,6 +455,27 @@ export function parseSvg(svgText, opts = {}) {
         elemType = rawTag;
         elemDefaultName = rawTag === 'polygon' ? '多边形' : '折线';
       }
+    } else if (rawTag === 'use') {
+      const href = (attrs.href || attrs['xlink:href'] || '').replace(/^#/, '');
+      const ref = defElements.get(href);
+      if (ref) {
+        elemPath = { subpaths: structuredClone(ref.subpaths) };
+        const ux = parseFloat(attrs.x || 0);
+        const uy = parseFloat(attrs.y || 0);
+        if (ux || uy) {
+          applyMatrixToPath(elemPath, matrixTranslate(ux, flipY ? -uy : uy));
+        }
+        elemType = 'use';
+        elemDefaultName = ref.name || '组件';
+      }
+    }
+
+    if (attrs.id && elemPath && elemPath.subpaths && elemPath.subpaths.length) {
+      defElements.set(attrs.id, {
+        subpaths: structuredClone(elemPath.subpaths),
+        name: attrs.id,
+        type: elemType,
+      });
     }
 
     if (elemPath && elemPath.subpaths.length) {

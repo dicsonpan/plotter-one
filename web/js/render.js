@@ -308,9 +308,9 @@ class Renderer {
      * 屏幕像素恒定，不随图形缩放变小，否则放到很小时就没法操作了。
      */
     _drawSelection() {
-      const layer = this.layers.find((l) => l.id === this.selectedId);
-      if (!layer || layer.hidden) return;
-      const bb = this.selectionBox || this.computeBBox(layer);
+      const selected = this.layers.filter((l) => !l.hidden && (l.id === this.selectedId || (this.selectedIds && this.selectedIds.has(l.id))));
+      if (!selected.length) return;
+      const bb = this.selectionBox || this.computeSelectionBBox();
       if (!bb) return;
 
       const ctx = this.ctx;
@@ -364,10 +364,33 @@ class Renderer {
       ctx.restore();
     }
 
+    /** 计算当前选中图层集合的整体包围盒 */
+    computeSelectionBBox() {
+      const selected = this.layers.filter((l) => !l.hidden && (l.id === this.selectedId || (this.selectedIds && this.selectedIds.has(l.id))));
+      if (!selected.length) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const l of selected) {
+        const bb = this.computeBBox(l);
+        if (bb && (bb.w || bb.h)) {
+          if (bb.minX < minX) minX = bb.minX;
+          if (bb.minY < minY) minY = bb.minY;
+          if (bb.maxX > maxX) maxX = bb.maxX;
+          if (bb.maxY > maxY) maxY = bb.maxY;
+        }
+      }
+      if (!Number.isFinite(minX)) return null;
+      return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+    }
+
     /** 计算图层包围盒（屏幕无关，模型坐标） */
     computeBBox(layer) {
-      if (!layer.subpaths.length) return null;
-      const path = { subpaths: layer.subpaths };
+      if (!layer) return null;
+      let subs = layer.subpaths;
+      if ((!subs || !subs.length) && layer.children && layer.children.length) {
+        subs = layer.children.flatMap((c) => c.subpaths || []);
+      }
+      if (!subs || !subs.length) return null;
+      const path = { subpaths: subs };
       const bb = G.pathBBox(path);
       if (!isFinite(bb.minX)) return null;
       return bb;
