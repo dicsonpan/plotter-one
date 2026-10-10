@@ -61,13 +61,204 @@ npm start
 
 Open `http://localhost:8080`.
 
-For deployment to a board, see [docs/部署指南.md](docs/部署指南.md) — one command:
-
-```bash
-sudo ./deploy/install.sh
-```
+To run it on a board next to the engraver, see **[Deployment](#deployment)** below — it is one command (`sudo bash deploy/install.sh --port 8080`).
 
 For how to design artwork, see [docs/设计工作流.md](docs/设计工作流.md).
+
+---
+
+## Deployment
+
+Run this service on a small board (RK3399-class, ARM64) that sits next to the engraver.
+It asks for almost nothing: a Linux box with Node.js 18+, plus a USB-to-RS-232 cable.
+There is **no `npm install` and no build step** — deploying means copying files.
+
+### What you need
+
+- A board running Linux (Armbian / Debian / Ubuntu). ARM64 or x86 both work; an RK3399 is the sweet spot at 3-5W idle.
+- A **USB-to-RS-232** cable (±5V signal level).
+  ⚠️ It must be RS-232, **not** USB-TTL (3.3V). The wrong level can damage the engraver's control board.
+  Common chips: CH340, PL2303, FTDI, CP210x.
+- The engraver powered on and linked to the board with that cable.
+- Any phone / PC / tablet on the same LAN to open the web UI.
+
+### Step 1 — Get the board on the network
+
+Flash Armbian (or your distro) onto the board's eMMC/SD card, boot it, and connect it to your
+network over Ethernet or Wi-Fi. Find its IP address (check your router, or run `hostname -I`
+on the board). We'll call it `<board-ip>` below.
+
+### Step 2 — Install Node.js 18+
+
+Log into the board over SSH and check:
+
+```bash
+node -v     # must print v18.x or newer
+```
+
+If it prints nothing or an old version, install it:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt-get install -y nodejs
+node -v     # should now be v20.x
+```
+
+The installer in Step 4 also installs Node for you if it is missing, so this step is optional —
+but doing it explicitly means fewer surprises.
+
+### Step 3 — Copy the project onto the board
+
+On the board:
+
+```bash
+git clone https://github.com/dicsonpan/plotter-one.git
+cd plotter-one
+```
+
+(Or copy the folder over with `scp` from your computer — either works, because there is no build.)
+
+### Step 4 — Run the installer
+
+```bash
+sudo bash deploy/install.sh --port 8080
+```
+
+One command does everything:
+
+1. Installs Node.js 18+ if missing.
+2. Copies the project to `/opt/plotter-one`.
+3. Creates a dedicated `plotter` system user and adds it to the `dialout` group (serial-port access).
+4. Installs a systemd service that starts on boot and auto-restarts if it crashes.
+5. Installs udev rules so the serial port is readable/writable.
+6. Opens the firewall port.
+7. Sets up mDNS so you can reach it as `hostname.local` instead of memorising an IP.
+
+### Step 5 — Open the console in a browser
+
+On any device in the same LAN, open:
+
+```
+http://<board-ip>:8080
+```
+
+If mDNS works on your network, `http://armbian.local:8080` also works. You should see the console.
+
+### Step 6 — Connect the engraver
+
+1. Plug the USB-RS-232 cable into the board and the engraver.
+2. In the UI's **Device** section, pick the serial port — usually `/dev/ttyUSB0` or `/dev/ttyACM0`.
+3. The service auto-connects on boot and retries every 3 seconds, so you normally don't need to click anything.
+4. Verify it is live:
+
+   ```bash
+   curl -s http://localhost:8080/api/state | grep -o '"connected":[a-z]*'
+   # → "connected":true
+   ```
+
+#### How to find the serial port
+
+After plugging in the cable:
+
+```bash
+dmesg | tail -20              # did the kernel see it as ttyUSB0 / ttyACM0?
+ls -l /dev/ttyUSB* /dev/ttyACM*
+# check the chip vendor
+udevadm info -a -n /dev/ttyUSB0 | grep -E 'idVendor|idProduct'
+```
+
+Pick whatever appears in the dropdown in the UI.
+
+#### Serial parameters (Liyue machines)
+
+| Parameter | Value |
+|-----------|-------|
+| Baud rate | 9600 |
+| Data bits | 8 |
+| Stop bits | 1 |
+| Parity    | none |
+| Flow ctrl | none (try RTS/CTS if transfer is unstable) |
+
+These are the UI defaults.
+
+#### If the device won't connect
+
+```bash
+# 1. Permission problem (most common)
+ls -l /dev/ttyUSB0
+# should be crw-rw---- 1 root dialout ...
+sudo usermod -aG dialout plotter
+sudo systemctl restart plotter-one
+
+# 2. ModemManager is grabbing the port (common on Ubuntu/Debian)
+sudo systemctl stop ModemManager
+sudo systemctl disable ModemManager
+
+# 3. Another program is holding the port
+sudo fuser -v /dev/ttyUSB0
+
+# 4. Test the port by hand
+sudo apt install minicom
+sudo minicom -b 9600 -D /dev/ttyUSB0   # press Enter, see if it echoes
+```
+
+#### RS-232 cable notes
+
+- **Length**: beyond ~10-15 m data starts dropping. If the engraver is far, extend the USB side or use an RS-232 repeater.
+- **Crossover vs straight**: RS-232 is crossover (DTE-DCE). If unsure, try swapping TX/RX once.
+- **Ground**: must be common; a floating ground causes garbage or lost data.
+- **Shielding**: use a shielded cable to reduce motor interference.
+
+### Step 7 — Your first cut (do this safely)
+
+1. **Dry run first**: with no material on the bed, build a small 50mm square and send it; watch the tool-path direction.
+2. Axis direction and layout rotation are already confirmed on real hardware and locked into the machine presets — don't change them in daily use (wrong values mirror or topple the whole design).
+3. Only load material after the direction looks correct.
+
+### Making the LAN friendlier
+
+**Fixed IP** — edit `/etc/network/interfaces`:
+
+```
+auto eth0
+iface eth0 inet static
+    address 192.168.1.100
+    netmask 255.255.255.0
+    gateway 192.168.1.1
+```
+
+**mDNS (no IP to remember)** — the installer already sets up avahi, so `http://armbian.local:8080`
+works. On a phone, an mDNS browser (Bonjour on iOS, a similar tool on Android) resolves it.
+
+**Add to home screen** — open the console in the phone browser → Share → "Add to Home Screen".
+It then opens full-screen from the desktop icon, like a native app.
+
+### Daily operations
+
+```bash
+systemctl status plotter-one      # is it running?
+systemctl restart plotter-one     # restart after a config change
+journalctl -u plotter-one -f      # follow the logs
+```
+
+Config lives at `/opt/plotter-one/data/config.json`; restart the service after editing it.
+
+### Upgrade
+
+```bash
+cd plotter-one
+git pull
+sudo systemctl stop plotter-one
+sudo rsync -av --exclude node_modules --exclude data/ ./ /opt/plotter-one/
+sudo systemctl start plotter-one
+```
+
+### Uninstall
+
+```bash
+sudo bash deploy/uninstall.sh          # keep your config
+sudo bash deploy/uninstall.sh --purge   # remove everything
+```
 
 ---
 
@@ -385,8 +576,7 @@ plotter-one/
 ├── tools/i18n-check.js       i18n audit
 ├── deploy/                   install / uninstall / sync scripts
 └── docs/
-    ├── 设计工作流.md
-    └── 部署指南.md
+    └── 设计工作流.md
 ```
 
 `web/geom.js` is a copy of `server/geom/path.js`, kept in sync by `deploy/sync-geom.sh`.
@@ -412,152 +602,6 @@ npm start -- --port 9000
 
 Self-test coverage: geometry invariants, HPGL round-trip consistency, job engine state
 machine, mirrored-axis generation, machine bed sizes, serial write paths, bilingual messages.
-
----
-
-## Bugs that only real hardware reveals
-
-A few bugs here cannot be found by reading the code. Recorded so others do not repeat them.
-
-1. **Canvas X formula omitted the "viewport centre"** → the whole view was mirrored.
-   ("SPARKMINDS" rendered as "SPAPXIWS", while a symmetric box showed nothing wrong.)
-
-2. **`SerialTransport.write` written as `const { write } = await import('node:fs/promises')`**
-   → `node:fs/promises` has no `write` export (only `open`), so this destructured to
-   `undefined` and threw `write is not a function`. The connection had succeeded, so it
-   presented as "shows connected, fails on the first cut" — very much like a connection
-   problem. The self-test only covered the virtual plotter's `write`; the real serial path
-   was never exercised.
-
-3. **Axis direction must never be assumed** → crash-class bug. See the layout notes above.
-
-4. **Mirroring cannot be done with reverse `SC`** (hit on real hardware, 2026-10-04)
-   → presented as "press Home, Y spins wildly, X runs backwards", which looks like X/Y
-   transposed, but was actually `SC23622,0,...` giving the firmware a **negative scale
-   factor**. The HP-GL spec permits `Xmin > Xmax` for mirroring; the Liyue firmware does
-   not. Correct approach: `SC` always ascending, mirroring done host-side in `toMachine()`.
-   **Lesson**: when the machine goes wild, first suspect the parameters you sent, not
-   transposed axes.
-
-4b. **"Transposed" and "reversed" must be handled separately** (real hardware, 2026-10-04)
-   → this machine has physical X/Y transposed (the gantry is firmware Y, the feed is
-   firmware X), while "origin on the right-hand side" is a **direction** issue. The two are
-   orthogonal and must be set separately. The easiest mistake: **you cannot carry
-   `axisX/axisY` over unchanged after enabling the swap** — the same physical fact (gantry
-   homes to the right) lands on the other axis afterwards. I made exactly this error:
-   leaving `axisX=-1` in place when it should have been `axisY=-1`.
-   → Re-derive which axis owns which direction whenever you change `swapAxes`.
-
-4c. **The bed bound must be swapped too when axes are swapped**
-   → before the swap, machine X travels 600mm; after, it travels 710mm. Hard-coding
-   `preset.width` makes the machine scale coordinates against the wrong span — and because
-   nothing crashes, it is extremely hard to notice. Always go through
-   `machineSpanX` / `machineSpanY`.
-
-5. **Omitting `IN;` disables the entire machine** (real hardware, 2026-10-04 — my fault)
-   → while fixing axis direction I deleted `IN;` as "redundant state reset", and then no
-   button did anything. The Liyue firmware ignores all motion commands when uninitialised.
-   Serial writes succeed and the job shows "complete", but the machine does not move —
-   identical to a dead serial port. The safe combination is: keep `IN;`; the only dangerous
-   thing is reverse `SC`.
-   **Lesson**: **the assertions themselves can be wrong.** The "must not contain IN" check
-   was protecting this very bug, so deleting `IN;` still passed everything green.
-   **Assertions passing ≠ the machine moving.**
-
-6. **`PR;` + `PA dx,dy;` is an absolute move, not relative**
-   → in HP-GL, `PR;` only switches mode; the following `PA x,y` means "switch back to
-   absolute and move to (x,y)". The original manual jog was written as `PR;` + `PA197,0;`,
-   which on a mirrored machine became a dash toward the origin. Relative moves must be
-   written `PR dx,dy;`.
-
-7. **`PA0,0;` really does move to (0,0)** → to just "switch back to absolute mode", write
-   `PA;` (no coordinates). The original code sent `PU;PA0,0;` on every direction-key press,
-   so the head was yanked back to the origin every time. The same mistake in **e-stop** is
-   worse: it meant commanding the machine to move during an emergency stop. E-stop now
-   sends only `PU;`.
-
-8. **Pen-down test must not use `lineTo(2,0)`** → that is an **absolute** move to (2,0).
-   With the pen down it drives diagonally across the work and scores a line through the
-   finished piece. The test press must be a relative 2mm move.
-
-9. **Feed must travel along the feed axis**, which is not "X" by default → the original
-   `feed` was `moveTo(d, 0)` (an absolute move to (d,0)), so "feed 50mm" actually moved the
-   head sideways. Which axis feeds is hardware-determined; feeding goes through
-   `relative(0, d)` and lets `toMachineDelta` do the conversion — never hard-code
-   "feed = absolute coordinate on some axis" at the command level.
-
-10. **Reflection flips arc winding** → X mirror `x → w-x` and axis swap `x,y→y,x` are both
-    reflections (det = -1), turning a counter-clockwise arc in user coordinates into a
-    clockwise one — but HP-GL's `AA` only goes counter-clockwise. Conversion: a clockwise
-    `s` sweep ≡ a counter-clockwise `(360-s)` sweep. **The start angle must be mirrored
-    too** (X mirror: a0 → 180-a0), or the firmware draws a straight line from the current
-    position to the computed arc start, cutting a line that was never in the design. In the
-    implementation the start angle is back-solved from the current position and the mapped
-    centre rather than computed by hand. A full 360° must not be converted to 0 (that
-    degenerates to a zero-length arc). An even number of reflections (swap + single-axis
-    flip = 180° rotation) preserves winding — use the `isReflection` getter rather than
-    counting by hand at each site.
-
-11. **Diagnostics must use relative moves** → the original routine moved to the material
-    centre with `PA cx,cy` first; on a machine that was not homed, or with wrong coordinates,
-    that single command was a sprint across the entire workbench. Relative moves are
-    anchored to the current position regardless of homing state, so they are **safe to test
-    before homing**.
-
-12. **`/api/compile` once failed to pass the axis config through** → the on-screen axis
-    controls had no effect on the output at all, so changing them looked like a no-op and
-    invited misdiagnosis of the machine itself. Every generation entry point now goes
-    through a single config function.
-
-13. **Do not use `PA0,0` for homing** → once `SC` is in effect, `PA0,0` only returns to P1,
-    which sits at the right end when X is reversed. Liyue's mechanical home is `!PG;`.
-
-14. **`reverseSubpath` flattened arcs** → a single `AA` ballooned into hundreds of `PA`, and
-    the discretisation error shortened rounded rectangles by 8% (seen as "cut short").
-
-15. **Static asset caching** → changed code still ran the old logic in the browser, making
-    "I changed the code and nothing happened" very hard to debug. Now uses ETag +
-    `no-cache` conditional requests.
-
-16. **Module scripts run before DOMContentLoaded** → `getBoundingClientRect()` returns 0
-    and the canvas size cannot be computed.
-
-17. **Single-stroke font metrics** → glyphs actually occupy 4×6 font units, not 6×8.
-    Scaling by the wrong size made text 40% too short and a line 80mm wide.
-
-18. **A stale `config.json` silently overrides presets** → a preset default was changed, but
-    the board's `data/config.json` still held a value saved by an earlier calibration, which
-    takes priority. The new preset was silently ignored — "changed the code, no effect" —
-    and the first instinct is to suspect the machine or firmware. The UI no longer exposes
-    these settings, and `config` is no longer consulted for them.
-
-19. **Layout rotation, mirror, and axis direction are three different things** → this is the
-    one that cost the most time. Symptoms looked identical ("the output is wrong") but the
-    causes and fixes were unrelated, and tuning the wrong one made things worse. See the
-    table above.
-
-20. **Never infer state by comparing button text** → the pause handler read
-    `$('btnPause').textContent === '暂停'`. After internationalisation that test is always
-    false in the English UI and the pause button silently stops working. Button labels
-    change with the language; the predicate must read `state.jobState`.
-
-21. **A local variable can shadow the module-level `t`** → the translation lookup is `t`,
-    but `logLine` already had `const t = <timestamp>`. After shadowing, `logLine` can no
-    longer reach the lookup function — and it **throws no error**, it just fails to
-    translate that one string. The same happened with `const t = $('connType').value` in the
-    connection-type handler. This class of bug is *introduced by the change you are making*,
-    not pre-existing, which is exactly why it is easy to miss.
-
-22. **`duplicateLayer` in `transform.js` should not append its own "copy" suffix** → the
-    layer name is shown to the user, so it is a language concern. Hard-coding it leaks
-    Chinese into the English UI. It now only duplicates; the caller names the result in the
-    current language.
-
-23. **JS-generated `<option>` elements are invisible to `data-i18n`** → the "no serial port
-    found" placeholder is written by `scanPorts()` and carries no `data-i18n` attribute, so
-    switching language left it stranded in the previous language while the rest of the UI
-    translated. Fixed by tagging the placeholder with `data-i18n`. Real port names
-    (`/dev/ttyACM0`) have no prose and need no translation.
 
 ---
 
