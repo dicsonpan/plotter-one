@@ -13,6 +13,7 @@ import {
   circleToPath, ellipseToPath, polylineToPath,
   matrixTranslate, matrixScale, matrixRotate, matrixMultiply,
   matrixTranslateXY, applyMatrixToPath, IDENTITY, normAngle, pathBBox,
+  subpathBBox, subpathLength, simplifyPath, pruneDegenerate, filterSpeckles,
 } from '../geom/path.js';
 
 function tokenizePath(d) {
@@ -281,6 +282,7 @@ export function parseSvg(svgText, opts = {}) {
   const elements = [];
   const warnings = [];
   const defElements = new Map();
+  let totalFilteredSpeckles = 0;
 
   const viewBox = /viewBox\s*=\s*["']([\d.\-\s]+)["']/i.exec(svgText);
   const widthAttr = /<svg[^>]*\bwidth\s*=\s*["']([\d.]+)([a-z%]*)["']/i.exec(svgText);
@@ -490,6 +492,15 @@ export function parseSvg(svgText, opts = {}) {
       // 减去 viewBox 原点偏移
       applyOffset(elemPath);
 
+      // 导入层超保守几何预抽稀（0.005mm 容差）与退化清理：消除过度采样与共线碎段
+      simplifyPath(elemPath, 0.005);
+      pruneDegenerate(elemPath, 0.001);
+
+      // 导入层孤立微小杂点/碎屑滤除（阈值 1mm）：剔除位图描摹噪点小浮岛
+      const speckleRes = filterSpeckles(elemPath, 1.0);
+      totalFilteredSpeckles += speckleRes.removedCount;
+      if (!elemPath.subpaths.length) continue;
+
       // 去重检查：防止在同一位置重复添加几何完全一致的冗余图元（如 use 原位复用或双层重叠 path）
       const bbox = pathBBox(elemPath);
       const isDuplicate = elements.some((existing) => {
@@ -524,6 +535,13 @@ export function parseSvg(svgText, opts = {}) {
         }
       }
     }
+  }
+
+  if (totalFilteredSpeckles > 0) {
+    warnings.push({
+      zh: `已自动滤除 ${totalFilteredSpeckles} 个小于 1mm 的微小描摹杂点`,
+      en: `Automatically filtered ${totalFilteredSpeckles} tiny speckles (< 1mm)`,
+    });
   }
 
   if (!path.subpaths.length) {

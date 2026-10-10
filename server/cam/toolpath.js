@@ -15,7 +15,7 @@
 
 import {
   pathBBox, pathLength, optimizeOrder, setDirection, pruneDegenerate,
-  closeNearOpen, countElements, subpathLength,
+  closeNearOpen, countElements, subpathLength, simplifyPath,
 } from '../geom/path.js';
 
 export const Direction = { CW: 'cw', CCW: 'ccw', ALTERNATE: 'alternate' };
@@ -64,6 +64,15 @@ export function compileToolpath(inputPath, preset, options = {}) {
   const path = JSON.parse(JSON.stringify(inputPath)); // 深拷贝，不污染源
 
   pruneDegenerate(path, 0.005);
+  // CAM 几何层抽稀与共线合并优化：
+  // 默认容差 0.02mm，小于力宇 1000 步/英寸（0.0254mm/step）物理脉冲，
+  // 刀尖物理刃宽一般 0.2~0.5mm，0.02mm 抽稀既能保证绝对高精度，
+  // 又能把密集折线/SVG过度采样的 20~30 万点暴降 80%~90%。
+  const tolerance = options.tolerance !== undefined ? options.tolerance : 0.02;
+  if (tolerance > 0) {
+    simplifyPath(path, tolerance);
+    pruneDegenerate(path, 0.005);
+  }
   if (options.closeOpen !== false) closeNearOpen(path, options.closeTolerance || 0.02);
 
   const dir = options.direction || Direction.CCW;

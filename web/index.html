@@ -365,6 +365,14 @@
 
 <div class="toast-wrap" id="toastWrap"></div>
 
+<!-- 全局加载遮罩 -->
+<div id="loadingOverlay" class="loading-overlay" style="display: none;">
+  <div class="loading-card">
+    <div class="loading-spinner"></div>
+    <div class="loading-text" id="loadingText" data-i18n="loading.importing">正在解析与导入文件，请稍候...</div>
+  </div>
+</div>
+
 <!-- 全部用原生 ES module：浏览器直接支持，零构建，且前端与服务端
      共用同一份几何内核（web/geom.js 是 server/geom/path.js 的副本，
      由 deploy/sync-geom.sh 同步）。共用是必须的，否则会出现

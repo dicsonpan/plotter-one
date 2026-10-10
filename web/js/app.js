@@ -95,6 +95,19 @@ if (typeof window !== 'undefined') {
     updateStats();
   }
 
+  // ---------------------------------------------------------------- 全局遮罩
+  function showLoading(text) {
+    const overlay = $('loadingOverlay');
+    const label = $('loadingText');
+    if (label && text) label.textContent = text;
+    if (overlay) overlay.style.display = 'flex';
+  }
+
+  function hideLoading() {
+    const overlay = $('loadingOverlay');
+    if (overlay) overlay.style.display = 'none';
+  }
+
   // ---------------------------------------------------------------- 提示
   function toast(msg, kind = '') {
     const el = document.createElement('div');
@@ -1654,6 +1667,7 @@ if (typeof window !== 'undefined') {
   async function onFile(e) {
     const f = e.target.files[0];
     if (!f) return;
+    showLoading(t('loading.importing'));
     logLine(t('toast.parsing', { name: f.name }));
     try {
       const text = await f.text();
@@ -1710,6 +1724,7 @@ if (typeof window !== 'undefined') {
       toast(t('toast.parseFail', { msg: err.message }), 'err');
       logLine(t('log.parseFail', { msg: err.message }), 'err');
     } finally {
+      hideLoading();
       e.target.value = '';
     }
   }
@@ -1777,6 +1792,7 @@ if (typeof window !== 'undefined') {
   async function doCompile() {
     const items = buildItems();
     if (!items.length) { toast(t('toast.emptyLayout'), 'err'); return; }
+    showLoading(t('loading.compiling'));
     try {
       $('btnCompile').disabled = true;
       const r = await api('/api/compile', {
@@ -1811,6 +1827,7 @@ if (typeof window !== 'undefined') {
       toast(t('toast.compileFail', { msg: e.message }), 'err');
       logLine(t('toast.compileFail', { msg: e.message }), 'err');
     } finally {
+      hideLoading();
       $('btnCompile').disabled = false;
     }
   }
