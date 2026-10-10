@@ -173,7 +173,7 @@ Pick whatever appears in the dropdown in the UI.
 
 | Parameter | Value |
 |-----------|-------|
-| Baud rate | 9600 |
+| Baud rate | 115200 (default, supports 9600–230400) |
 | Data bits | 8 |
 | Stop bits | 1 |
 | Parity    | none |
@@ -315,7 +315,7 @@ The axis logic in this project was **iteratively debugged on a real SC631-AU**.
 |---|---|
 | Motor assignment | Standard: gantry rail = `X`, media roller = `Y` |
 | Step resolution | 1000 steps/inch (0.0254mm/step) |
-| Serial port | `/dev/ttyACM0`, 9600 8N1, no flow control |
+| Serial port | `/dev/ttyACM0`, 115200 8N1, no flow control |
 | Origin datum | Panel **Origin** button is $(0,0)$; no `!PG;` at job start |
 | **Layout orientation** | **The whole design comes out rotated 90° CCW** (directions correct, not mirrored — purely toppled) |
 

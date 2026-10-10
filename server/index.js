@@ -45,7 +45,7 @@ const CONFIG_PATH = resolve(DATA_ROOT, 'config.json');
 
 const DEFAULT_CONFIG = {
   machineId: 'liyue-sc630',
-  serial: { type: 'serial', path: '', baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
+  serial: { type: 'serial', path: '/dev/ttyACM0', baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
   lastMaterial: 'ivory-board',
   originMode: 'user',
   defaultSpeed: 30,
@@ -174,8 +174,13 @@ let reconnectTimer = null;
 let lastConnected = null;
 
 async function currentSerialCandidates() {
-  // 优先用配置里记的路径，其次扫一遍所有可用串口
+  // 优先用配置里记的路径，其次扫一遍所有可用串口（优先 ttyACM，再 ttyUSB）
   const list = await SerialTransport.list();
+  list.sort((a, b) => {
+    const aAcm = a.includes('ttyACM') ? 0 : 1;
+    const bAcm = b.includes('ttyACM') ? 0 : 1;
+    return aAcm - bAcm;
+  });
   const saved = config.serial?.path;
   const out = [];
   if (saved && list.includes(saved)) out.push(saved);
@@ -189,9 +194,10 @@ async function tryReconnect() {
   const candidates = await currentSerialCandidates();
   for (const path of candidates) {
     try {
+      const baud = +(config.serial?.baud || 115200);
       const t = new SerialTransport({
         path,
-        baud: +(config.serial?.baud || 9600),
+        baud,
         dataBits: +(config.serial?.dataBits || 8),
         stopBits: +(config.serial?.stopBits || 1),
         parity: config.serial?.parity || 'none',
@@ -202,11 +208,11 @@ async function tryReconnect() {
       connected = true;
       deviceInfo = await SerialTransport.describe(path);
       // 记住实际连上的路径：USB 重新插拔后节点可能变
-      if (config.serial?.path !== path) {
-        config.serial = { ...config.serial, path };
+      if (config.serial?.path !== path || config.serial?.baud !== baud) {
+        config.serial = { ...config.serial, path, baud };
         await saveConfig();
       }
-      console.log(`  ✓ 已自动连接串口 ${path} ${config.serial?.baud || 9600}`);
+      console.log(`  ✓ 已自动连接串口 ${path} ${baud}`);
       broadcast('device:connected', { connected: true, info: deviceInfo });
       return true;
     } catch {
@@ -487,9 +493,10 @@ const routes = {
         ...axisOptions(),
       });
 
+      const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
       const time = estimateTime(compiled.path, speed);
       const timeText = result.text;
-      const transferSec = (timeText.length / 100) / 0.88;
+      const transferSec = (timeText.length / (baud / 10)) / 0.88;
 
       sendJson(res, 200, {
         gcode: timeText,
@@ -537,10 +544,11 @@ const routes = {
     if (!built.text) return sendJson(res, 400, err('未生成任何指令', 'No commands generated'));
 
     // 每条手动指令都短小，直接插队但仍走引擎，保证限速与急停有效
+    const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
     const id = engine.enqueue({
       name: `手动·${MANUAL_LABELS[body.action] || body.action}`,
       text: built.text,
-      baud: preset.serialDefault.baud,
+      baud,
       priority: true,
       meta: { bytes: built.text.length, manual: true },
     });
@@ -553,10 +561,11 @@ const routes = {
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
     if (!body.gcode) return sendJson(res, 400, err('没有指令内容', 'No command content'));
     const preset = getPreset(config.machineId);
+    const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
     const id = engine.enqueue({
       name: body.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,
       text: body.gcode,
-      baud: preset.serialDefault.baud,
+      baud,
       meta: { bytes: body.gcode.length },
     });
     engine.run();

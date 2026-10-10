@@ -251,6 +251,10 @@ if (typeof window !== 'undefined') {
         $('dirSel').value = s.config.direction;
       }
 
+      if ($('baudSel') && document.activeElement !== $('baudSel') && s.config?.serial?.baud) {
+        $('baudSel').value = String(s.config.serial.baud);
+      }
+
       $('serverInfo').textContent = `${s.server.hostname} · :${s.server.port}`;
 
       // 连接状态
@@ -1319,6 +1323,7 @@ if (typeof window !== 'undefined') {
     $('connType').addEventListener('change', () => {
       const kind = $('connType').value;
       $('portWrap').style.display = kind === 'serial' ? '' : 'none';
+      if ($('baudWrap')) $('baudWrap').style.display = kind === 'serial' ? '' : 'none';
       $('tcpWrap').style.display = kind === 'tcp' ? '' : 'none';
     });
     $('btnScanPorts').addEventListener('click', scanPorts);
@@ -1631,6 +1636,11 @@ if (typeof window !== 'undefined') {
         sel.appendChild(o);
       }
       if (prev) sel.value = prev;
+      else if (state.config?.serial?.path) sel.value = state.config.serial.path;
+      else {
+        const acm = r.ports.find((p) => p.path.includes('ttyACM'));
+        if (acm) sel.value = acm.path;
+      }
       logLine(t('log.portFound', { n: r.ports.length }));
     } catch (e) { logLine(t('log.scanFail', { msg: e.message }), 'err'); }
   }
@@ -1641,7 +1651,8 @@ if (typeof window !== 'undefined') {
     if (type === 'serial') {
       const path = $('portSel').value;
       if (!path) { toast(t('toast.needPort'), 'err'); return; }
-      Object.assign(body, { path, baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false });
+      const baud = +($('baudSel')?.value || 115200);
+      Object.assign(body, { path, baud, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false });
     } else if (type === 'tcp') {
       Object.assign(body, { host: $('tcpHost').value, port: +$('tcpPort').value });
     }
