@@ -75,6 +75,29 @@ async function saveConfig() {
 
 await loadConfig();
 
+const HISTORY_PATH = resolve(DATA_ROOT, 'history.json');
+let historyList = [];
+
+async function loadHistory() {
+  try {
+    if (existsSync(HISTORY_PATH)) {
+      historyList = JSON.parse(await readFile(HISTORY_PATH, 'utf8'));
+      if (!Array.isArray(historyList)) historyList = [];
+    }
+  } catch (err) {
+    console.error('历史记录读取失败，重置为空：', err.message);
+    historyList = [];
+  }
+}
+
+async function saveHistory() {
+  await mkdir(DATA_ROOT, { recursive: true });
+  if (historyList.length > 100) historyList = historyList.slice(0, 100);
+  await writeFile(HISTORY_PATH, JSON.stringify(historyList, null, 2));
+}
+
+await loadHistory();
+
 let transport = new NullTransport();
 let connected = false;
 let deviceInfo = null;
@@ -384,6 +407,69 @@ const routes = {
     sendJson(res, 200, { ok: true, config });
   },
 
+  'GET /api/history': async (req, res, url) => {
+    const id = url.searchParams.get('id');
+    if (id) {
+      const item = historyList.find((h) => h.id === id);
+      if (!item) return sendJson(res, 404, err('历史任务不存在', 'Job not found in history'));
+      return sendJson(res, 200, item);
+    }
+    const summary = historyList.map((h) => ({
+      id: h.id,
+      name: h.name,
+      createdAt: h.createdAt,
+      machineId: h.machineId,
+      materialId: h.materialId,
+      speed: h.speed,
+      force: h.force,
+      direction: h.direction,
+      layerCount: h.layers?.length || 0,
+      stats: h.stats || {},
+      thumbnailSvg: h.thumbnailSvg || null,
+    }));
+    sendJson(res, 200, { history: summary });
+  },
+
+  'POST /api/history': async (req, res) => {
+    const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+    if (!body.layers || !Array.isArray(body.layers)) {
+      return sendJson(res, 400, err('缺少图层数据', 'Missing layers data'));
+    }
+    const entry = {
+      id: body.id || 'hist_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      name: body.name || '未命名任务',
+      createdAt: body.createdAt || Date.now(),
+      layers: body.layers,
+      userOrigin: body.userOrigin || { x: 0, y: 0 },
+      machineId: body.machineId || config.machineId,
+      materialId: body.materialId || config.lastMaterial,
+      speed: +(body.speed || config.defaultSpeed || 30),
+      force: +(body.force || config.defaultForce || 250),
+      direction: body.direction || config.direction || 'ccw',
+      optimize: body.optimize !== undefined ? !!body.optimize : !!config.optimize,
+      stats: body.stats || {},
+      thumbnailSvg: body.thumbnailSvg || null,
+    };
+    const idx = historyList.findIndex((h) => h.id === entry.id);
+    if (idx >= 0) historyList[idx] = entry;
+    else historyList.unshift(entry);
+    await saveHistory();
+    broadcast('history:updated', { count: historyList.length });
+    sendJson(res, 200, { ok: true, entry });
+  },
+
+  'DELETE /api/history': async (req, res, url) => {
+    const id = url.searchParams.get('id');
+    if (!id || id === 'all') {
+      historyList = [];
+    } else {
+      historyList = historyList.filter((h) => h.id !== id);
+    }
+    await saveHistory();
+    broadcast('history:updated', { count: historyList.length });
+    sendJson(res, 200, { ok: true });
+  },
+
   'POST /api/import': async (req, res) => {
     const raw = await readBody(req);
     let body;
@@ -571,6 +657,31 @@ const routes = {
       stepsPerInch: preset.stepsPerInch || 1000,
       meta: { bytes: body.gcode.length, estimate: body.estimate },
     });
+
+    // 自动归档至历史任务
+    if (body.archive && Array.isArray(body.archive.layers) && body.archive.layers.length > 0) {
+      const arch = body.archive;
+      const entry = {
+        id: 'hist_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        name: body.name || arch.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,
+        createdAt: Date.now(),
+        layers: arch.layers,
+        userOrigin: arch.userOrigin || { x: 0, y: 0 },
+        machineId: arch.machineId || config.machineId,
+        materialId: arch.materialId || config.lastMaterial,
+        speed: +(arch.speed || body.speed || config.defaultSpeed || 30),
+        force: +(arch.force || body.force || config.defaultForce || 250),
+        direction: arch.direction || config.direction || 'ccw',
+        optimize: arch.optimize !== undefined ? !!arch.optimize : !!config.optimize,
+        stats: arch.stats || {},
+        thumbnailSvg: arch.thumbnailSvg || null,
+      };
+      historyList.unshift(entry);
+      if (historyList.length > 100) historyList = historyList.slice(0, 100);
+      saveHistory().catch((e) => console.error('保存历史失败：', e));
+      broadcast('history:updated', { count: historyList.length });
+    }
+
     engine.run();
     sendJson(res, 200, { ok: true, jobId: id });
   },

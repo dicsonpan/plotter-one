@@ -6,9 +6,10 @@
 <meta name="theme-color" content="#2563eb">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<title data-i18n="app.title">刻字机控制台</title>
+<title data-i18n="app.title">创智刻字机 · SparkPlotter</title>
 <link rel="stylesheet" href="/css/app.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232563eb'/><path d='M28 66 L44 34 L56 58 L70 30' stroke='white' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="icon" type="image/png" href="/assets/logo-icon.png">
+<link rel="apple-touch-icon" href="/assets/logo-icon.png">
 </head>
 <body>
 <div class="app">
@@ -16,7 +17,8 @@
   <!-- 顶栏 -->
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark" data-i18n="app.brandMark">刻</div>
+      <img src="/assets/logo-horizontal.png" alt="SparkMinds 创智实验室" class="brand-logo" id="brandLogo">
+      <div class="brand-divider"></div>
       <div>
         <div class="brand-text" style="font-weight:600" data-i18n="app.title">刻字机控制台</div>
         <div class="brand-sub" id="serverInfo" data-i18n="srv.connecting">连接中…</div>
@@ -27,6 +29,9 @@
       <span class="conn-dot"></span>
       <span id="connText" data-i18n="btn.disconnected">未连接</span>
     </div>
+    <button class="btn btn-sm" id="btnHistory">
+      <span style="font-size:14px">🕒</span> <span data-i18n="btn.history">历史任务</span>
+    </button>
     <button class="btn btn-sm lang-btn" id="btnLang" data-i18n="lang.switch"
             data-i18n-attr="title:lang.switchTitle,aria-label:lang.switchTitle">EN</button>
     <button class="btn btn-sm" id="btnConnectTop" data-i18n="btn.connect">连接设备</button>
@@ -43,6 +48,11 @@
       <div class="btn-grid">
         <button class="btn" id="btnImportFile" data-i18n="btn.chooseFile">选择文件</button>
         <button class="btn" id="btnImportDemo" data-i18n="btn.loadDemo">载入示例</button>
+      </div>
+      <div class="btn-grid" style="margin-top:7px">
+        <button class="btn btn-sm" id="btnOpenHistory" style="grid-column: span 2">
+          <span style="font-size:13px">🕒</span> <span data-i18n="btn.historyOpen">从历史任务调出…</span>
+        </button>
       </div>
       <input type="file" id="fileInput" accept=".dxf,.svg,.plt,.hgl,.hpgl,.txt" style="display:none">
     </div>
@@ -385,6 +395,31 @@
   <div class="loading-card">
     <div class="loading-spinner"></div>
     <div class="loading-text" id="loadingText" data-i18n="loading.importing">正在解析与导入文件，请稍候...</div>
+  </div>
+</div>
+
+<!-- 历史任务模态弹窗 -->
+<div id="historyModal" class="modal-bg" style="display:none">
+  <div class="modal modal-wide">
+    <div class="modal-head">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:17px;">🕒</span>
+        <span data-i18n="history.title">历史任务与参数归档</span>
+        <span class="history-tag highlight" id="historyCount">0</span>
+      </div>
+      <button class="x-btn" id="btnCloseHistory" title="关闭">×</button>
+    </div>
+    <div class="history-toolbar">
+      <input type="text" id="historySearchInput" placeholder="搜索任务名称、材料或机型…" data-i18n-attr="placeholder:history.searchPlaceholder">
+      <button class="btn btn-sm" id="btnSaveCurrentTpl" data-i18n="history.saveCurrent">保存当前为模板</button>
+      <button class="btn btn-sm btn-danger" id="btnClearHistory" data-i18n="history.clearAll">清空全部</button>
+    </div>
+    <div class="history-list" id="historyListWrap">
+      <!-- 卡片动态渲染 -->
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-sm" id="btnCloseHistoryFoot" data-i18n="btn.close">关闭</button>
+    </div>
   </div>
 </div>
 

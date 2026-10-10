@@ -327,6 +327,10 @@ if (typeof window !== 'undefined') {
       if (type === 'device:closed') { toast(t('toast.deviceClosed'), 'err'); refreshState(); return; }
       if (type === 'device:error') { toast(t('toast.deviceError', { msg: payload.message }), 'err'); return; }
       if (type === 'config:updated') { state.config = payload; return; }
+      if (type === 'history:updated') {
+        if ($('historyModal')?.style.display !== 'none') refreshHistoryList();
+        return;
+      }
     };
 
     ws.onclose = () => {
@@ -1317,6 +1321,13 @@ if (typeof window !== 'undefined') {
     $('btnImportFile').addEventListener('click', () => $('fileInput').click());
     $('fileInput').addEventListener('change', onFile);
     $('btnImportDemo').addEventListener('click', loadDemo);
+    $('btnOpenHistory')?.addEventListener('click', openHistoryModal);
+    $('btnHistory')?.addEventListener('click', openHistoryModal);
+    $('btnCloseHistory')?.addEventListener('click', closeHistoryModal);
+    $('btnCloseHistoryFoot')?.addEventListener('click', closeHistoryModal);
+    $('btnClearHistory')?.addEventListener('click', clearAllHistory);
+    $('btnSaveCurrentTpl')?.addEventListener('click', saveCurrentAsTemplate);
+    $('historySearchInput')?.addEventListener('input', () => renderHistoryItems(cachedHistoryList));
 
     // 文字
     $('btnAddText').addEventListener('click', async () => {
@@ -1903,6 +1914,294 @@ if (typeof window !== 'undefined') {
     } catch (e) { toast(t('toast.previewFail', { msg: e.message }), 'err'); }
   }
 
+  // ---------------------------------------------------------------- 历史任务与模板归档
+  let cachedHistoryList = [];
+
+  function generateLayersThumbnailSvg(layers) {
+    if (!layers || !layers.length) {
+      return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 75" class="thumb-empty"><rect width="100" height="75" fill="#f1f5f9" rx="6"/><text x="50" y="42" text-anchor="middle" fill="#94a3b8" font-size="12">空</text></svg>';
+    }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const pathsD = [];
+    for (const layer of layers) {
+      if (layer.hidden) continue;
+      for (const sub of (layer.subpaths || [])) {
+        if (!sub.start) continue;
+        let d = `M ${sub.start.x.toFixed(1)} ${sub.start.y.toFixed(1)} `;
+        if (sub.start.x < minX) minX = sub.start.x;
+        if (sub.start.y < minY) minY = sub.start.y;
+        if (sub.start.x > maxX) maxX = sub.start.x;
+        if (sub.start.y > maxY) maxY = sub.start.y;
+
+        for (const el of (sub.elems || [])) {
+          if (el.type === 'line') {
+            d += `L ${el.x2.toFixed(1)} ${el.y2.toFixed(1)} `;
+            if (el.x2 < minX) minX = el.x2;
+            if (el.y2 < minY) minY = el.y2;
+            if (el.x2 > maxX) maxX = el.x2;
+            if (el.y2 > maxY) maxY = el.y2;
+          } else if (el.type === 'arc') {
+            const rad = (el.a1 * Math.PI) / 180;
+            const ex = el.cx + el.r * Math.cos(rad);
+            const ey = el.cy + el.r * Math.sin(rad);
+            const large = Math.abs(el.a1 - el.a0) > 180 ? 1 : 0;
+            const sweep = el.a1 > el.a0 ? 1 : 0;
+            d += `A ${el.r.toFixed(1)} ${el.r.toFixed(1)} 0 ${large} ${sweep} ${ex.toFixed(1)} ${ey.toFixed(1)} `;
+            if (ex < minX) minX = ex;
+            if (ey < minY) minY = ey;
+            if (ex > maxX) maxX = ex;
+            if (ey > maxY) maxY = ey;
+          }
+        }
+        if (sub.closed) d += 'Z ';
+        pathsD.push(d);
+      }
+    }
+
+    if (!isFinite(minX) || !pathsD.length) {
+      return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 75" class="thumb-empty"><rect width="100" height="75" fill="#f1f5f9" rx="6"/><text x="50" y="42" text-anchor="middle" fill="#94a3b8" font-size="12">空</text></svg>';
+    }
+
+    const pad = Math.max((maxX - minX), (maxY - minY)) * 0.08 || 2;
+    const vbX = minX - pad;
+    const vbY = minY - pad;
+    const vbW = Math.max(1, (maxX - minX) + pad * 2);
+    const vbH = Math.max(1, (maxY - minY) + pad * 2);
+
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}" class="history-svg" preserveAspectRatio="xMidYMid meet"><g transform="scale(1, -1) translate(0, ${-(vbY * 2 + vbH).toFixed(1)})" stroke="#2563eb" stroke-width="${(vbW * 0.015).toFixed(2)}" fill="none" stroke-linecap="round" stroke-linejoin="round">${pathsD.map((p) => `<path d="${p}"/>`).join('')}</g></svg>`;
+  }
+
+  async function openHistoryModal() {
+    const modal = $('historyModal');
+    if (!modal) return;
+    modal.style.display = 'grid';
+    await refreshHistoryList();
+  }
+
+  function closeHistoryModal() {
+    const modal = $('historyModal');
+    if (modal) modal.style.display = 'none';
+  }
+
+  async function refreshHistoryList() {
+    try {
+      const res = await api('/api/history');
+      cachedHistoryList = res.history || [];
+      const badge = $('historyCount');
+      if (badge) badge.textContent = cachedHistoryList.length;
+      renderHistoryItems(cachedHistoryList);
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  }
+
+  function renderHistoryItems(items) {
+    const wrap = $('historyListWrap');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+
+    const filter = ($('historySearchInput')?.value || '').trim().toLowerCase();
+    const filtered = filter
+      ? items.filter((h) => (h.name || '').toLowerCase().includes(filter) || (h.materialId || '').toLowerCase().includes(filter) || (h.machineId || '').toLowerCase().includes(filter))
+      : items;
+
+    if (!filtered.length) {
+      wrap.innerHTML = `<div class="history-empty">${t('history.empty')}</div>`;
+      return;
+    }
+
+    const en = lang() === 'en';
+    for (const item of filtered) {
+      const card = document.createElement('div');
+      card.className = 'history-card';
+      const timeStr = new Date(item.createdAt).toLocaleString(en ? 'en-GB' : 'zh-CN', {
+        month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+      });
+
+      const preset = state.presets[item.machineId];
+      const machName = preset ? (en ? (preset.nameEn || preset.name) : preset.name) : item.machineId;
+      const mat = state.materials.find((m) => m.id === item.materialId);
+      const matName = mat ? (en ? (mat.nameEn || mat.name) : mat.name) : (item.materialId || t('history.defaultMat'));
+
+      const cutLenMm = item.stats?.cutLengthMm || 0;
+      const cutStr = cutLenMm > 1000 ? (cutLenMm / 1000).toFixed(2) + 'm' : Math.round(cutLenMm) + 'mm';
+      const durSec = item.stats?.totalSeconds || 0;
+      const timeEstStr = fmtTime(durSec * 1000);
+
+      const thumbSvg = item.thumbnailSvg || `<svg viewBox="0 0 100 75"><rect width="100" height="75" fill="#f8fafc" rx="4"/><text x="50" y="42" text-anchor="middle" fill="#cbd5e1" font-size="11">预览</text></svg>`;
+
+      card.innerHTML = `
+        <div class="history-thumb">${thumbSvg}</div>
+        <div class="history-info">
+          <div class="history-title-row">
+            <span class="history-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
+            <span class="history-time">${timeStr}</span>
+          </div>
+          <div class="history-tags">
+            <span class="history-tag highlight">${escapeHtml(matName)}</span>
+            <span class="history-tag">${item.speed} mm/s</span>
+            <span class="history-tag">${item.force} g</span>
+            <span class="history-tag">${escapeHtml(machName)}</span>
+          </div>
+          <div class="history-meta">
+            ${t('history.meta', { layers: item.layerCount || 1, cut: cutStr, time: timeEstStr })}
+          </div>
+        </div>
+        <div class="history-actions">
+          <button class="btn btn-sm" data-act="load" data-id="${item.id}">${t('history.load')}</button>
+          <button class="btn btn-sm btn-ok" data-act="recut" data-id="${item.id}">${t('history.recut')}</button>
+          <button class="btn btn-sm btn-danger btn-icon" data-act="del" data-id="${item.id}" title="${t('history.del')}">×</button>
+        </div>
+      `;
+
+      card.querySelector('[data-act=load]').addEventListener('click', () => loadHistoryJob(item.id));
+      card.querySelector('[data-act=recut]').addEventListener('click', () => recutHistoryJob(item.id));
+      card.querySelector('[data-act=del]').addEventListener('click', () => deleteHistoryJob(item.id));
+
+      wrap.appendChild(card);
+    }
+  }
+
+  async function loadHistoryJob(id) {
+    try {
+      showLoading(t('loading.importing'));
+      const full = await api('/api/history?id=' + encodeURIComponent(id));
+      if (!full || !full.layers) throw new Error(t('history.incomplete'));
+
+      pushHistory();
+
+      renderer.layers = structuredClone(full.layers);
+      state.userOrigin = full.userOrigin ? { ...full.userOrigin } : { x: 0, y: 0 };
+
+      if (full.machineId && state.presets[full.machineId]) {
+        $('machineSel').value = full.machineId;
+        state.config.machineId = full.machineId;
+        renderer.setPreset(state.presets[full.machineId]);
+      }
+      if (full.materialId) {
+        $('matSel').value = full.materialId;
+        state.config.lastMaterial = full.materialId;
+      }
+      if (full.speed !== undefined) {
+        $('speedRange').value = full.speed;
+        $('speedVal').textContent = full.speed;
+        state.config.defaultSpeed = full.speed;
+      }
+      if (full.force !== undefined) {
+        $('forceRange').value = full.force;
+        $('forceVal').textContent = full.force;
+        state.config.defaultForce = full.force;
+      }
+      if (full.direction) {
+        $('dirSel').value = full.direction;
+        state.config.direction = full.direction;
+      }
+
+      state.selectedId = null;
+      state.selectedIds = new Set();
+      renderer.selectedId = null;
+      renderer.selectedIds = state.selectedIds;
+      renderer.dirty = true;
+
+      renderLayerList();
+      updateTransformPanel();
+      updateStats();
+      fitToContent();
+      closeHistoryModal();
+
+      toast(t('history.loaded'), 'ok');
+      logLine(`${t('history.loaded')}：${full.name}`);
+      return full;
+    } catch (e) {
+      toast(e.message, 'err');
+      return null;
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function recutHistoryJob(id) {
+    const full = await loadHistoryJob(id);
+    if (!full) return;
+
+    const en = lang() === 'en';
+    const mat = state.materials.find((m) => m.id === full.materialId);
+    const matName = mat ? (en ? (mat.nameEn || mat.name) : mat.name) : (full.materialId || '');
+
+    const ok = confirm(t('history.recutConfirm', {
+      name: full.name,
+      mat: matName,
+      speed: full.speed,
+      force: full.force,
+    }));
+    if (!ok) return;
+
+    await doCompile();
+    await doSend();
+  }
+
+  async function deleteHistoryJob(id) {
+    if (!confirm(t('history.delConfirm'))) return;
+    try {
+      await api('/api/history?id=' + encodeURIComponent(id), { method: 'DELETE' });
+      toast(t('history.deleted'), 'ok');
+      await refreshHistoryList();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  }
+
+  async function clearAllHistory() {
+    if (!confirm(t('history.clearConfirm'))) return;
+    try {
+      await api('/api/history?id=all', { method: 'DELETE' });
+      toast(t('history.cleared'), 'ok');
+      await refreshHistoryList();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  }
+
+  async function saveCurrentAsTemplate() {
+    if (!renderer.layers.length) {
+      toast(t('toast.emptyLayout'), 'err');
+      return;
+    }
+    const en = lang() === 'en';
+    const defaultName = `${t('history.defaultTpl')} ${new Date().toLocaleTimeString(en ? 'en-GB' : 'zh-CN', { hour12: false })}`;
+    const name = prompt(t('history.promptName'), defaultName);
+    if (!name) return;
+
+    try {
+      const thumb = generateLayersThumbnailSvg(renderer.layers);
+      const entry = {
+        name,
+        layers: structuredClone(renderer.layers),
+        userOrigin: { ...state.userOrigin },
+        machineId: state.config?.machineId,
+        materialId: $('matSel')?.value || state.config?.lastMaterial,
+        speed: +$('speedRange').value,
+        force: +$('forceRange').value,
+        direction: $('dirSel').value,
+        optimize: state.config?.optimize !== false,
+        stats: {
+          layerCount: renderer.layers.length,
+          subpathCount: renderer.layers.reduce((a, l) => a + (l.subpaths?.length || 0), 0),
+          cutLengthMm: totalLength(),
+          rapidLengthMm: 0,
+          totalSeconds: 0,
+          bytes: 0,
+        },
+        thumbnailSvg: thumb,
+      };
+      await api('/api/history', { method: 'POST', body: entry });
+      toast(t('history.saved'), 'ok');
+      await refreshHistoryList();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  }
+
   async function doSend() {
     if (!state.gcode) {
       toast(t('toast.compileFirst'), 'err');
@@ -1916,14 +2215,39 @@ if (typeof window !== 'undefined') {
     if (items.length > 1 && !confirm(t('confirm.multi', { n: items.length }))) return;
     if (!confirm(t('confirm.go'))) return;
 
+    const jobName = t('job.name', { n: items.length });
+    const thumbnailSvg = generateLayersThumbnailSvg(renderer.layers);
+
+    const archive = {
+      name: jobName,
+      layers: structuredClone(renderer.layers),
+      userOrigin: { ...state.userOrigin },
+      machineId: state.config?.machineId,
+      materialId: $('matSel')?.value || state.config?.lastMaterial,
+      speed: +$('speedRange').value,
+      force: +$('forceRange').value,
+      direction: $('dirSel').value,
+      optimize: state.config?.optimize !== false,
+      stats: {
+        layerCount: renderer.layers.length,
+        subpathCount: renderer.layers.reduce((a, l) => a + (l.subpaths?.length || 0), 0),
+        cutLengthMm: state.compiled?.estimate?.cutLengthMm || totalLength(),
+        rapidLengthMm: state.compiled?.estimate?.rapidLengthMm || 0,
+        totalSeconds: state.compiled?.estimate?.totalSeconds || 0,
+        bytes: state.gcode.length,
+      },
+      thumbnailSvg,
+    };
+
     try {
       await api('/api/send', {
         method: 'POST',
         body: {
           gcode: state.gcode,
-          name: t('job.name', { n: items.length }),
+          name: jobName,
           estimate: state.compiled?.estimate,
           speed: +$('speedRange').value,
+          archive,
         },
       });
       $('jobPanel').style.display = 'block';
