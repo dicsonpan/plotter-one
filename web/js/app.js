@@ -363,12 +363,47 @@ if (typeof window !== 'undefined') {
 
   function onProgress(p) {
     const fill = $('progFill');
-    fill.style.width = p.percent + '%';
-    $('progText').textContent = t('job.progress', {
-      pct: p.percent, sent: p.sent, total: p.total,
-    });
+    const pct = p.motionPercent !== undefined ? p.motionPercent : p.percent;
+    fill.style.width = pct + '%';
+
+    if (p.phase === 'caching') {
+      $('progText').textContent = t('job.caching', {
+        trans: p.transferPercent ?? p.percent,
+        pct: p.motionPercent ?? 0,
+      });
+    } else if (p.phase === 'cutting') {
+      $('progText').textContent = t('job.cutting', {
+        pct: p.motionPercent ?? p.percent,
+      });
+    } else if (p.phase === 'done' || pct >= 100) {
+      $('progText').textContent = t('job.done');
+    } else {
+      $('progText').textContent = t('job.progress', {
+        pct, sent: p.sent, total: p.total,
+      });
+    }
+
     const eta = p.etaMs || 0;
     $('progEta').textContent = eta > 0 ? t('job.eta', { time: fmtTime(eta) }) : '';
+
+    const transEl = $('progTransferText');
+    if (transEl) {
+      transEl.textContent = t('job.cacheInfo', {
+        trans: p.transferPercent ?? 100,
+        sent: p.sent,
+        total: p.total,
+      });
+    }
+
+    const lenEl = $('progMotionLen');
+    if (lenEl) {
+      if (p.cutLengthMm > 0) {
+        const lenStr = p.cutLengthMm > 1000 ? (p.cutLengthMm / 1000).toFixed(2) + ' m' : Math.round(p.cutLengthMm) + ' mm';
+        lenEl.textContent = t('job.motionLen', { len: lenStr });
+      } else {
+        lenEl.textContent = '';
+      }
+    }
   }
 
   function onJobState(s) {
@@ -1884,7 +1919,12 @@ if (typeof window !== 'undefined') {
     try {
       await api('/api/send', {
         method: 'POST',
-        body: { gcode: state.gcode, name: t('job.name', { n: items.length }) },
+        body: {
+          gcode: state.gcode,
+          name: t('job.name', { n: items.length }),
+          estimate: state.compiled?.estimate,
+          speed: +$('speedRange').value,
+        },
       });
       $('jobPanel').style.display = 'block';
       toast(t('toast.outputStarted'), 'ok');

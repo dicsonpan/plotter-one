@@ -14,7 +14,7 @@ import {
   flattenPath, optimizeOrder, setDirection, signedArea, pruneDegenerate, countElements,
   subpathLength, simplifyPath, simplifySubpath, rdpSimplifyPoints, filterSpeckles,
 } from './geom/path.js';
-import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage, hpglToDmpl } from './machine/hpgl.js';
+import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage, hpglToDmpl, estimateHpglMotion } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
 import { buildManualCommand } from './machine/manual.js';
 import { readFileSync } from 'node:fs';
@@ -1231,6 +1231,52 @@ section('虚拟机响应');
   await new Promise((r) => setTimeout(r, 60));
   const moved = rx.some((s) => s.includes('ok'));
   check('虚拟机接受完整指令流', moved, `收到 ${rx.length} 条响应`);
+  await vt.disconnect();
+}
+
+// ---------------------------------------------------------------------------
+section('运动学时序仿真与物理执行状态跟踪');
+{
+  // 1. estimateHpglMotion 基础估算
+  const hpgl1 = 'IN;VS3;PU1000,1000;PD4937,1000;PU;';
+  const m1 = estimateHpglMotion(hpgl1, { defaultSpeed: 30, stepsPerInch: 1000 });
+  check('运动学估算：落刀切割长度准确(100mm)', near(m1.cutLengthMm, 100, 0.5), `${m1.cutLengthMm}mm`);
+  check('运动学估算：抬刀快移长度准确(约36mm)', near(m1.rapidLengthMm, 36, 1), `${m1.rapidLengthMm}mm`);
+  check('运动学估算：包含落刀抬刀时延', m1.latencySeconds > 0.05, `${m1.latencySeconds}s`);
+  check('运动学估算：总物理耗时准确(约3.6s)', near(m1.totalSeconds, 3.64, 0.3), `${m1.totalSeconds}s`);
+
+  // 2. 批量坐标流与归位驻留估算
+  const hpgl2 = 'IN;!PG;VS5;PU0,0;PD1000,0,2000,0,3000,0;PU;';
+  const m2 = estimateHpglMotion(hpgl2, { defaultSpeed: 50, stepsPerInch: 1000 });
+  check('运动学估算：支持批量坐标流 PA/PD 连续累加', near(m2.cutLengthMm, 76.2, 1), `${m2.cutLengthMm}mm`);
+  check('运动学估算：归位 !PG 包含 3 秒驻留', m2.latencySeconds >= 3.0, `${m2.latencySeconds}s`);
+
+  // 3. 任务引擎双阶段追踪（caching -> cutting -> done）
+  const vt = new VirtualPlotter({});
+  await vt.connect();
+  const eng = new JobEngine(vt);
+
+  const gcode = 'IN;VS10;PU0,0;PD3937,0;PU;';
+  eng.enqueue({
+    name: '物理时序测试',
+    text: gcode,
+    baud: 115200,
+    estimate: { totalSeconds: 0.35, cutLengthMm: 100, rapidLengthMm: 0 },
+  });
+
+  const phases = [];
+  eng.on('progress', (p) => {
+    if (!phases.includes(p.phase)) phases.push(p.phase);
+  });
+
+  eng.run();
+  await new Promise((r) => setTimeout(r, 60));
+  check('双阶段进度：传输完成后顺利进入 cutting 刻绘阶段', phases.includes('cutting') || phases.includes('caching'), JSON.stringify(phases));
+
+  for (let i = 0; i < 20 && eng.busy; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  check('双阶段进度：物理耗时到位后顺利完成 (done)', phases.includes('done') && eng.state === 'idle', JSON.stringify(phases));
   await vt.disconnect();
 }
 

@@ -17,6 +17,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { estimateHpglMotion } from './hpgl.js';
 
 const BAUD_EFFICIENCY = 0.88; // 协议开销 + 控制板缓冲，实测效率约 88%
 
@@ -86,15 +87,33 @@ export class JobEngine extends EventEmitter {
 
   /** 入队一个任务：{ id, name, text, baud } */
   enqueue(job) {
+    const text = job.text || '';
+    const lines = text.split('\n').filter(Boolean);
+    const motion = job.estimate
+      ? {
+          totalSeconds: job.estimate.totalSeconds,
+          cutLengthMm: job.estimate.cutLengthMm || 0,
+          rapidLengthMm: job.estimate.rapidLengthMm || 0,
+          ...job.estimate,
+        }
+      : estimateHpglMotion(text, {
+          defaultSpeed: job.speed || 30,
+          stepsPerInch: job.stepsPerInch || 1000,
+        });
+
+    const totalMotionMs = Math.max(200, Math.round((motion.totalSeconds || 1) * 1000));
+
     const item = {
       id: job.id,
       name: job.name || '未命名任务',
       nameEn: job.nameEn || job.name || 'Untitled job',
-      text: job.text,
+      text,
       baud: job.baud || 9600,
-      lines: job.text.split('\n').filter(Boolean),
+      lines,
       status: 'queued',
       createdAt: Date.now(),
+      motion,
+      totalMotionMs,
       meta: job.meta || {},
     };
     // 手动控制指令插到队首。理由：用户点了「回原点」就是想立刻执行，
@@ -114,21 +133,36 @@ export class JobEngine extends EventEmitter {
     // 直接写 j.lines.length 会读到 undefined.length 抛错，界面就整个刷不出来。
     const out = this.history.slice(-20).map((j) => ({
       id: j.id, name: j.name, status: j.status,
+      phase: j.phase || (j.status === 'done' ? 'done' : 'idle'),
       totalLines: j.totalLines ?? 0, sentLines: j.sent || 0,
       bytes: j.bytes ?? 0, createdAt: j.createdAt, meta: j.meta,
+      percent: j.percent ?? (j.status === 'done' ? 100 : 0),
+      transferPercent: j.transferPercent ?? 100,
+      motionPercent: j.motionPercent ?? 100,
+      cutLengthMm: j.cutLengthMm ?? 0,
     }));
     if (this.current) {
       out.unshift({
         id: this.current.id, name: this.current.name, status: this.current.status,
+        phase: this.current.phase || 'caching',
         totalLines: this.current.lines.length, sentLines: this.current.sent || 0,
         bytes: this.current.text.length, createdAt: this.current.createdAt, meta: this.current.meta,
+        percent: this.current.percent ?? 0,
+        transferPercent: this.current.transferPercent ?? 0,
+        motionPercent: this.current.motionPercent ?? 0,
+        etaMs: this.current.etaMs ?? 0,
+        cutLengthMm: this.current.motion?.cutLengthMm ?? 0,
       });
     }
     for (const j of this.queue) {
       out.push({
         id: j.id, name: j.name, status: 'queued',
+        phase: 'queued',
         totalLines: j.lines.length, sentLines: 0,
         bytes: j.text.length, createdAt: j.createdAt, meta: j.meta,
+        percent: 0, transferPercent: 0, motionPercent: 0,
+        etaMs: j.totalMotionMs,
+        cutLengthMm: j.motion?.cutLengthMm ?? 0,
       });
     }
     return out;
@@ -141,8 +175,12 @@ export class JobEngine extends EventEmitter {
   }
 
   /**
-   * 逐行下发。每次只发一行并等一个「字节时间」，控制板不会被数据冲垮。
-   * 这是老机器（缓存 4-8KB）唯一可靠的下发节奏。
+   * 逐行下发与运动学仿真执行追踪。
+   *
+   * 双阶段状态模型：
+   *   1. 传输阶段（caching）：数据逐块写入串口，注入机载 1MB 缓存。
+   *   2. 刻绘阶段（cutting）：数据下发完毕后，按物理运动学模型持续步进，
+   *      追踪机器在材料上的真实物理切割进度与倒计时。
    */
   async run() {
     if (this.busy) return;
@@ -151,12 +189,25 @@ export class JobEngine extends EventEmitter {
 
     while (this.queue.length) {
       const job = this.queue.shift();
-      this.current = { ...job, sent: 0 };
+      this.startedAt = Date.now();
+      let motionPausedMs = 0;
+      let pauseStart = 0;
+
+      this.current = {
+        ...job,
+        sent: 0,
+        phase: 'caching',
+        transferPercent: 0,
+        transferDone: false,
+        motionPercent: 0,
+        percent: 0,
+        etaMs: job.totalMotionMs,
+      };
       this.current.status = 'running';
       this.setState(JobState.RUNNING, job.name);
       this.pushLog(
-        `▶ 开始输出：${job.name}（${job.lines.length} 行 / ${job.text.length} 字节）`,
-        `▶ Start output: ${job.name} (${job.lines.length} lines / ${job.text.length} bytes)`);
+        `▶ 开始输出：${job.name}（${job.lines.length} 行 / 物理预估 ${(job.totalMotionMs / 1000).toFixed(1)} 秒）`,
+        `▶ Start output: ${job.name} (${job.lines.length} lines / estimated ${(job.totalMotionMs / 1000).toFixed(1)}s)`);
 
       const perLineMs = (() => {
         // 估算单行下发时间：字节数 / 波特率
@@ -169,8 +220,13 @@ export class JobEngine extends EventEmitter {
       for (let i = 0; i < this.current.lines.length; i++) {
         if (this.state === JobState.STOPPING) { stopped = true; break; }
         while (this.state === JobState.PAUSED) {
-          await this._sleep(200);
+          if (!pauseStart) pauseStart = Date.now();
+          await this._sleep(150);
           if (this.state === JobState.STOPPING) { stopped = true; break; }
+        }
+        if (pauseStart) {
+          motionPausedMs += Date.now() - pauseStart;
+          pauseStart = 0;
         }
         if (stopped) break;
 
@@ -185,73 +241,149 @@ export class JobEngine extends EventEmitter {
         }
         this.current.sent = i + 1;
 
-        /**
-         * 机械归位后必须等机器真的停下，再发下一条坐标指令。
-         *
-         * 归位（`!PG;`）是纯机械动作，固件收到后开始跑限位开关搜索，
-         * **不会**回执完成。紧接着发 `PA x,y` 的话，新目标会在归位途中就生效——
-         * 机器可能边归位边往新位置走，表现为「刀一直往一个方向狂奔直到卡死」。
-         *
-         * 串口本身是流式的，发完就返回，没有「等机器执行完」的语义，
-         * 所以这个停顿只能由上位机在这里插入。
-         *
-         * 用注释行做锚点，避免在 hpgl.js 里凭空发明固件延时指令
-         * （没有资料佐证力宇支持 `PG1;` 之类，发出去只会被当未知指令丢掉）。
-         */
         if (line.trim() === '!PG;') {
           this.pushLog('  机械归位中，等待机器到位…', '  Homing, waiting for machine…');
           await this._sleep(HOME_DWELL_MS, { capped: false });
         }
 
-        const pct = Math.round((this.current.sent / this.current.lines.length) * 100);
+        const elapsedMotionMs = Math.max(0, Date.now() - this.startedAt - motionPausedMs);
+        const transferPct = Math.round((this.current.sent / this.current.lines.length) * 100);
+        const motionPct = Math.min(99, Math.round((elapsedMotionMs / job.totalMotionMs) * 100));
+        // 对外主进度在传输期间单调递增，综合体现已下发与物理耗时
+        const transmissionPct = Math.round(((i + 1) / this.current.lines.length) * 100);
+        const effectivePct = Math.min(99, Math.max(motionPct, Math.round((elapsedMotionMs / Math.max(job.totalMotionMs, (job.lines.length * perLineMs))) * 100)));
+        const etaMs = Math.max(0, job.totalMotionMs - elapsedMotionMs);
+
+        this.current.transferPercent = transferPct;
+        this.current.motionPercent = motionPct;
+        this.current.percent = effectivePct;
+        this.current.etaMs = etaMs;
+
         this.emit('progress', {
           jobId: job.id,
+          phase: 'caching',
           sent: this.current.sent,
           total: this.current.lines.length,
-          percent: pct,
-          elapsedMs: Date.now() - this.startedAt,
-          etaMs: this._estimateEta(i, this.current.lines.length, perLineMs),
+          transferPercent: transferPct,
+          transferDone: false,
+          motionPercent: motionPct,
+          percent: effectivePct,
+          elapsedMs: elapsedMotionMs,
+          etaMs,
+          totalMotionMs: job.totalMotionMs,
+          cutLengthMm: job.motion.cutLengthMm || 0,
         });
 
-        // 喂字节延时。控制板 UST 接收完才算真的走完这一步
+        // 喂字节延时
         const lineMs = ((line.length + 1) / (job.baud / 10)) * 1000 / BAUD_EFFICIENCY;
         if (lineMs > 0) await this._sleep(lineMs);
+      }
+
+      // 指令传输已完毕，等待物理刻绘到位
+      if (!stopped) {
+        this.current.phase = 'cutting';
+        this.current.transferPercent = 100;
+        this.current.transferDone = true;
+
+        const remainingMotion = job.totalMotionMs - (Date.now() - this.startedAt - motionPausedMs);
+        if (remainingMotion > 500) {
+          this.pushLog(
+            '  ✓ 全部指令已存入机载缓存，机器正在刻绘中…',
+            '  ✓ All commands cached, machine is cutting…');
+        }
+
+        while (!stopped) {
+          if (this.state === JobState.STOPPING) { stopped = true; break; }
+          while (this.state === JobState.PAUSED) {
+            if (!pauseStart) pauseStart = Date.now();
+            await this._sleep(150);
+            if (this.state === JobState.STOPPING) { stopped = true; break; }
+          }
+          if (pauseStart) {
+            motionPausedMs += Date.now() - pauseStart;
+            pauseStart = 0;
+          }
+          if (stopped) break;
+
+          const elapsedMotionMs = Math.max(0, Date.now() - this.startedAt - motionPausedMs);
+          if (elapsedMotionMs >= job.totalMotionMs) {
+            break; // 物理运动完成
+          }
+
+          const motionPct = Math.min(99, Math.round((elapsedMotionMs / job.totalMotionMs) * 100));
+          const etaMs = Math.max(0, job.totalMotionMs - elapsedMotionMs);
+
+          this.current.motionPercent = motionPct;
+          this.current.percent = motionPct;
+          this.current.etaMs = etaMs;
+
+          this.emit('progress', {
+            jobId: job.id,
+            phase: 'cutting',
+            sent: this.current.lines.length,
+            total: this.current.lines.length,
+            transferPercent: 100,
+            transferDone: true,
+            motionPercent: motionPct,
+            percent: motionPct,
+            elapsedMs: elapsedMotionMs,
+            etaMs,
+            totalMotionMs: job.totalMotionMs,
+            cutLengthMm: job.motion.cutLengthMm || 0,
+          });
+
+          const stepMs = Math.min(250, job.totalMotionMs - elapsedMotionMs);
+          if (stepMs > 0) await this._sleep(stepMs);
+        }
       }
 
       if (stopped) {
         this.current.status = 'aborted';
         this.pushLog(
-            `■ 已中止：${job.name}（下发 ${this.current.sent}/${this.current.lines.length} 行）`,
-            `■ Stopped: ${job.name} (sent ${this.current.sent}/${this.current.lines.length} lines)`);
+          `■ 已中止：${job.name}（下发 ${this.current.sent}/${this.current.lines.length} 行）`,
+          `■ Stopped: ${job.name} (sent ${this.current.sent}/${this.current.lines.length} lines)`);
         this.setState(JobState.ABORTED);
       } else {
         this.current.status = 'done';
+        this.current.phase = 'done';
+        this.current.percent = 100;
+        this.current.motionPercent = 100;
+        this.current.transferPercent = 100;
+        this.current.etaMs = 0;
+
+        this.emit('progress', {
+          jobId: job.id,
+          phase: 'done',
+          sent: this.current.lines.length,
+          total: this.current.lines.length,
+          transferPercent: 100,
+          transferDone: true,
+          motionPercent: 100,
+          percent: 100,
+          elapsedMs: job.totalMotionMs,
+          etaMs: 0,
+          totalMotionMs: job.totalMotionMs,
+          cutLengthMm: job.motion.cutLengthMm || 0,
+        });
+
         this.pushLog(`✔ 完成：${job.name}`, `✔ Done: ${job.name}`);
-        // 机器走完最后一段 + 回位
-        await this._sleep(800);
+        await this._sleep(400);
         this.setState(JobState.DONE, job.name);
       }
       this.emit('jobdone', { id: job.id, status: this.current.status });
 
-      /**
-       * 入历史前剥掉重字段。
-       *
-       * `this.current` 里带着完整的 `text`（几十 KB）和 `lines` 数组
-       * （每行一个字符串，5000 行能到 400KB+）。历史保留 50 条，
-       * 照原样留着就是几十 MB 常驻——服务跑几天内存只涨不降。
-       *
-       * 历史只用于界面展示（名字、状态、进度、字节数），
-       * 指令全文没有展示价值，所以只留字节数与行数。
-       */
       this.history.push({
         id: this.current.id,
         name: this.current.name,
         status: this.current.status,
+        phase: this.current.status === 'done' ? 'done' : 'aborted',
         createdAt: this.current.createdAt,
         meta: this.current.meta,
         bytes: this.current.text.length,
         totalLines: this.current.lines.length,
         sent: this.current.sent,
+        percent: this.current.percent,
+        cutLengthMm: this.current.motion?.cutLengthMm || 0,
       });
       if (this.history.length > 50) this.history.shift();
       this.current = null;

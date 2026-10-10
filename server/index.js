@@ -566,7 +566,10 @@ const routes = {
       name: body.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,
       text: body.gcode,
       baud,
-      meta: { bytes: body.gcode.length },
+      estimate: body.estimate,
+      speed: +(body.speed || config.defaultSpeed || 30),
+      stepsPerInch: preset.stepsPerInch || 1000,
+      meta: { bytes: body.gcode.length, estimate: body.estimate },
     });
     engine.run();
     sendJson(res, 200, { ok: true, jobId: id });
