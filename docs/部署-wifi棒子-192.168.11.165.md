@@ -9,7 +9,8 @@
 |---|---|
 | 硬件 | 高通骁龙 410（msm8916），wifi 棒子形态 |
 | 架构 | aarch64 |
-| 内存 | 379 MiB（无 swap 余量，紧） |
+| 内存 | 379 MiB |
+| 交换 | 1G 磁盘 swapfile `/swapfile`（btrfs 上必须 `chattr +C` 关 COW，否则 swapon 失败；原为 190M zram，已 `disable`） |
 | 磁盘 | 3.3 GB eMMC（/dev/mmcblk0p14） |
 | 系统 | Debian 11 bullseye（Mobian 定制镜像） |
 | 内核 | `5.18.0-msm8916mainline+`（主线定制，非 Debian 官方） |

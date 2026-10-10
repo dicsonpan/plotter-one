@@ -12,7 +12,7 @@ import {
   makePath, makeSubpath, addLine, addArc, circleToPath, ellipseToPath, polylineToPath,
   applyMatrixToPath, matrixScale, matrixTranslate, pathLength, pathBBox,
   flattenPath, optimizeOrder, setDirection, signedArea, pruneDegenerate, countElements,
-  subpathLength,
+  subpathLength, simplifyPath, simplifySubpath, rdpSimplifyPoints, filterSpeckles,
 } from './geom/path.js';
 import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
@@ -20,7 +20,7 @@ import { buildManualCommand } from './machine/manual.js';
 import { readFileSync } from 'node:fs';
 import { parseHpgl } from './import/hpglReader.js';
 import { parseDxf } from './import/dxf.js';
-import { parseSvgPath } from './import/svg.js';
+import { parseSvgPath, parseSvg } from './import/svg.js';
 import { compileToolpath, analyze, estimateTime, Direction } from './cam/toolpath.js';
 import { textToPath } from './cam/textToPath.js';
 import { VirtualPlotter, NullTransport, SerialTransport } from './machine/transport.js';
@@ -322,6 +322,33 @@ EOF`;
 
   const cubic = parseSvgPath('M0 0 C 10 0, 10 10, 0 10');
   check('SVG 三次贝塞尔可解析', pathLength(cubic) > 15, `长度 ${pathLength(cubic).toFixed(2)}`);
+
+  // SVG 导入过滤微小噪点杂质（阈值 1mm）
+  const svgWithSpeckle = `
+    <svg width="200" height="200" viewBox="0 0 200 200">
+      <!-- 正常大矩形 (50x50mm) -->
+      <rect id="main_box" x="10" y="10" width="50" height="50" />
+      <!-- 微小描摹噪点 (0.6x0.6mm，类似附件二多余蓝色部分) -->
+      <path id="speckle_noise" d="M 70 70 L 70.6 70 L 70.6 70.6 L 70 70.6 Z" />
+    </svg>
+  `;
+  const parsedSvg = parseSvg(svgWithSpeckle);
+  check('SVG 导入自动滤除 <1mm 独立噪点图元', parsedSvg.elements.length === 1 && parsedSvg.elements[0].id === 'main_box');
+  check('SVG 导入生成滤除提示警告且中英双语',
+    parsedSvg.warnings.some((w) => w.zh.includes('小于 1mm') && w.en.includes('< 1mm')));
+
+  // filterSpeckles 直接测试：0.8mm 小闭合环被剔除，10mm 细长线条放行
+  const testPath = makePath();
+  const tinySub = makeSubpath(0, 0);
+  addLine(tinySub, 0.8, 0); addLine(tinySub, 0.8, 0.8); addLine(tinySub, 0, 0.8); addLine(tinySub, 0, 0);
+  tinySub.closed = true;
+  testPath.subpaths.push(tinySub);
+  const longSub = makeSubpath(10, 10);
+  addLine(longSub, 20, 10); // 10mm 细长线
+  testPath.subpaths.push(longSub);
+
+  const filterRes = filterSpeckles(testPath, 1.0);
+  check('filterSpeckles 精准剔除 0.8mm 杂点且保留 10mm 细长线', filterRes.removedCount === 1 && testPath.subpaths.length === 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +377,76 @@ section('CAM 与输出');
 
   const est = estimateTime(c.path, 30);
   check('时间估算为正', est.totalSeconds > 0, `${est.totalSeconds.toFixed(1)}s`);
+}
+
+// ---------------------------------------------------------------------------
+section('CAM 几何层抽稀优化（RDP 与共线合并）');
+{
+  // 1. 共线直线抽稀：100 个连续点落在直线上，必须合并为 2 个点（起点与终点）
+  const colPts = [];
+  for (let i = 0; i <= 100; i++) {
+    colPts.push({ x: i * 1.5, y: i * 2.0 });
+  }
+  const colSub = makeSubpath(colPts[0].x, colPts[0].y);
+  for (let i = 1; i < colPts.length; i++) addLine(colSub, colPts[i].x, colPts[i].y);
+  const colPath = makePath();
+  colPath.subpaths.push(colSub);
+
+  simplifyPath(colPath, 0.02);
+  check('共线密集折线压缩为 2 点（1 条线段）', colSub.elems.length === 1, `实际图元数 ${colSub.elems.length}`);
+  check('共线折线终点坐标守恒', near(colSub.elems[0].x2, 150, 1e-3) && near(colSub.elems[0].y2, 200, 1e-3));
+
+  // 2. 密集高频曲线抽稀：1000 个密集正弦点，容差 0.02mm
+  const sinePts = [];
+  for (let i = 0; i <= 1000; i++) {
+    const x = i * 0.1;
+    const y = 5 * Math.sin(x);
+    sinePts.push({ x, y });
+  }
+  const sineSimplified = rdpSimplifyPoints(sinePts, 0.02);
+  check('密集高频曲线压缩率超过 60%', sineSimplified.length < 400, `原始 1001 点，抽稀后 ${sineSimplified.length} 点`);
+  check('曲线抽稀起点终点守恒', near(sineSimplified[0].x, 0, 1e-3) && near(sineSimplified[sineSimplified.length - 1].x, 100, 1e-3));
+
+  // 3. 闭合多边形抽稀保持闭环
+  const circlePts = [];
+  const R = 30;
+  for (let i = 0; i <= 360; i++) {
+    const rad = (i * Math.PI) / 180;
+    circlePts.push({ x: 50 + R * Math.cos(rad), y: 50 + R * Math.sin(rad) });
+  }
+  const polyCircle = makeSubpath(circlePts[0].x, circlePts[0].y);
+  for (let i = 1; i < circlePts.length; i++) addLine(polyCircle, circlePts[i].x, circlePts[i].y);
+  polyCircle.closed = true;
+  const polyPath = makePath();
+  polyPath.subpaths.push(polyCircle);
+
+  simplifyPath(polyPath, 0.02);
+  check('闭合离散圆点数大幅压缩(>60%)', polyCircle.elems.length < 150, `实际线段数 ${polyCircle.elems.length}`);
+  const first = polyCircle.elems[0];
+  const last = polyCircle.elems[polyCircle.elems.length - 1];
+  check('闭合离散圆抽稀后首尾闭合', near(first.x1, last.x2, 1e-3) && near(first.y1, last.y2, 1e-3));
+
+  // 4. 混合图元（直线 + 原生圆弧）：圆弧不受影响
+  const mixedSub = makeSubpath(0, 0);
+  for (let i = 1; i <= 20; i++) addLine(mixedSub, i, 0); // 20段共线直线
+  addArc(mixedSub, 20, 10, 10, -Math.PI / 2, Math.PI / 2); // 1段圆弧
+  for (let i = 1; i <= 20; i++) addLine(mixedSub, 20 - i, 20); // 20段共线直线
+  const mixedPath = makePath();
+  mixedPath.subpaths.push(mixedSub);
+
+  simplifyPath(mixedPath, 0.02);
+  const arcElems = mixedSub.elems.filter((e) => e.type === 'arc');
+  check('混合图元中原生圆弧保留且数量不变', arcElems.length === 1);
+  check('混合图元中两段共线直线各自压缩为单条线段', mixedSub.elems.length === 3, `实际总图元数 ${mixedSub.elems.length}`);
+
+  // 5. compileToolpath 自动触发几何层抽稀
+  const densePath = makePath();
+  const denseSub = makeSubpath(0, 0);
+  for (let i = 1; i <= 200; i++) addLine(denseSub, i * 0.5, (i % 2 === 0 ? 0.005 : 0)); // 200段微米级抖动线
+  densePath.subpaths.push(denseSub);
+  const compiled = compileToolpath(densePath, MACHINE_PRESETS['liyue-sc631-au'], { tolerance: 0.02 });
+  check('compileToolpath 输出刀路自动应用几何抽稀', compiled.path.subpaths[0].elems.length < 5,
+    `实际图元数 ${compiled.path.subpaths[0].elems.length}`);
 }
 
 // ---------------------------------------------------------------------------

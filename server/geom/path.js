@@ -439,6 +439,211 @@ export function pruneDegenerate(path, minLen = 0.001) {
   return path;
 }
 
+/**
+ * 点到线段 AB 所在直线的垂直距离。
+ * 若 AB 长度过短（退化为点），退化为到点 A 的欧氏距离。
+ */
+export function pointLineDistance(p, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1e-12) return Math.hypot(p.x - a.x, p.y - a.y);
+  return Math.abs(dx * (a.y - p.y) - dy * (a.x - p.x)) / Math.sqrt(lenSq);
+}
+
+/**
+ * RDP (Ramer-Douglas-Peucker) 核心递归算法。
+ * 对开折线进行抽稀，保证所有被舍弃点到基准弦的距离 <= tol。
+ */
+export function rdp(points, tol) {
+  if (!points || points.length <= 2) return points ? [...points] : [];
+  let maxD = 0;
+  let idx = 0;
+  const a = points[0];
+  const b = points[points.length - 1];
+  for (let i = 1; i < points.length - 1; i++) {
+    const d = pointLineDistance(points[i], a, b);
+    if (d > maxD) {
+      maxD = d;
+      idx = i;
+    }
+  }
+  if (maxD > tol) {
+    const left = rdp(points.slice(0, idx + 1), tol);
+    const right = rdp(points.slice(idx), tol);
+    return left.slice(0, -1).concat(right);
+  }
+  return [a, b];
+}
+
+/**
+ * 对折线点集进行 RDP 抽稀与共线冗余消除。
+ * 支持开折线与闭合折线（首尾闭合时自动选最远特征点作为分界拆为两段再抽稀）。
+ */
+export function rdpSimplifyPoints(pts, tol = 0.02) {
+  if (!pts || pts.length <= 2) return pts || [];
+  // 1. 初步消除连续微小抖动/重复点（两点欧氏距离 < 1e-6）
+  const dedup = [pts[0]];
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i];
+    const prev = dedup[dedup.length - 1];
+    if (Math.hypot(p.x - prev.x, p.y - prev.y) > 1e-6) {
+      dedup.push(p);
+    }
+  }
+  if (dedup.length <= 2) return dedup;
+
+  const first = dedup[0];
+  const last = dedup[dedup.length - 1];
+  const isClosed = Math.hypot(first.x - last.x, first.y - last.y) < 1e-6;
+
+  let simplified;
+  if (isClosed && dedup.length >= 4) {
+    // 闭合环：首尾重合导致基准弦长为0。找离起点最远的点作为对角特征点拆分
+    let maxDistSq = 0;
+    let farIdx = 1;
+    for (let i = 1; i < dedup.length - 1; i++) {
+      const dsq = (dedup[i].x - first.x) ** 2 + (dedup[i].y - first.y) ** 2;
+      if (dsq > maxDistSq) {
+        maxDistSq = dsq;
+        farIdx = i;
+      }
+    }
+    const part1 = rdp(dedup.slice(0, farIdx + 1), tol);
+    const part2 = rdp(dedup.slice(farIdx), tol);
+    simplified = part1.slice(0, -1).concat(part2);
+  } else {
+    simplified = rdp(dedup, tol);
+  }
+
+  // 2. 共线冗余点消除（若中间点到两端点垂距 < 1e-5，且在两端点之间，直接删掉中间点）
+  if (simplified.length > 2) {
+    const colclean = [simplified[0]];
+    for (let i = 1; i < simplified.length - 1; i++) {
+      const prev = colclean[colclean.length - 1];
+      const cur = simplified[i];
+      const next = simplified[i + 1];
+      const d = pointLineDistance(cur, prev, next);
+      const dot = (cur.x - prev.x) * (next.x - cur.x) + (cur.y - prev.y) * (next.y - cur.y);
+      if (d < 1e-5 && dot > 0) {
+        // 共线且同向前进，跳过冗余中间点
+        continue;
+      }
+      colclean.push(cur);
+    }
+    colclean.push(simplified[simplified.length - 1]);
+    simplified = colclean;
+  }
+
+  return simplified;
+}
+
+/**
+ * 简化单个子路径中的连续折线段。
+ * 原生圆弧（arc）与椭圆（ellipse）保持不变，连续的 line 折线段通过 RDP 算法抽稀。
+ */
+export function simplifySubpath(sub, tol = 0.02) {
+  if (!sub || !sub.elems || !sub.elems.length) return sub;
+  const newElems = [];
+  let i = 0;
+
+  while (i < sub.elems.length) {
+    const e = sub.elems[i];
+    if (e.type !== 'line') {
+      newElems.push(e);
+      i++;
+      continue;
+    }
+
+    // 收集连续的 line 段
+    const startPoint = { x: e.x1, y: e.y1 };
+    const linePts = [startPoint];
+    let j = i;
+    while (j < sub.elems.length && sub.elems[j].type === 'line') {
+      linePts.push({ x: sub.elems[j].x2, y: sub.elems[j].y2 });
+      j++;
+    }
+
+    // 对连续折线点序列进行抽稀
+    const simplified = rdpSimplifyPoints(linePts, tol);
+    for (let k = 0; k < simplified.length - 1; k++) {
+      const p1 = simplified[k];
+      const p2 = simplified[k + 1];
+      if (Math.hypot(p2.x - p1.x, p2.y - p1.y) > 1e-7) {
+        newElems.push({ type: 'line', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y });
+      }
+    }
+    i = j;
+  }
+
+  sub.elems = newElems;
+  if (sub.elems.length > 0) {
+    const first = sub.elems[0];
+    sub.start = first.type === 'line' ? { x: first.x1, y: first.y1 }
+      : (first.type === 'arc' ? arcStart(first) : { x: sub.start.x, y: sub.start.y });
+  }
+  return sub;
+}
+
+/**
+ * 对整条路径进行折线抽稀与共线合并。
+ */
+export function simplifyPath(path, tol = 0.02) {
+  if (!path || !path.subpaths) return path;
+  for (const s of path.subpaths) {
+    simplifySubpath(s, tol);
+  }
+  return path;
+}
+
+/**
+ * 滤除微小孤立杂点/描摹碎屑（De-speckle）。
+ * 规则：
+ * 1. 外接包围盒最大尺寸小于 thresholdMm（默认 1.0mm）且周长较短的微小封闭环或开折线；
+ * 2. 或宽和高均微小且周长极短的长条形微碎片；
+ * 3. 或零长度/不可达退化段。
+ *
+ * @param {Object} path 路径对象
+ * @param {number} [thresholdMm=1.0] 尺寸阈值（毫米）
+ * @returns {{ path: Object, removedCount: number }}
+ */
+export function filterSpeckles(path, thresholdMm = 1.0) {
+  if (!path || !Array.isArray(path.subpaths)) return { path, removedCount: 0 };
+  let removedCount = 0;
+  path.subpaths = path.subpaths.filter((s) => {
+    if (!isSubpathFinite(s)) {
+      removedCount++;
+      return false;
+    }
+    const len = subpathLength(s);
+    if (!Number.isFinite(len) || len < 0.01) {
+      removedCount++;
+      return false;
+    }
+    const bb = subpathBBox(s);
+    const w = (bb.w !== undefined ? bb.w : bb.maxX - bb.minX) || 0;
+    const h = (bb.h !== undefined ? bb.h : bb.maxY - bb.minY) || 0;
+    const maxDim = Math.max(w, h);
+    const minDim = Math.min(w, h);
+
+    // a. 最大尺寸小于阈值（默认1mm）且周长短于 4 * thresholdMm
+    if (maxDim < thresholdMm && len < thresholdMm * 4) {
+      removedCount++;
+      return false;
+    }
+    // b. 闭合或近似闭合的微碎片（如 1.2mm x 0.4mm 细屑），短边与长边均极微
+    const endP = currentPoint(s);
+    const isClosed = s.closed || Math.hypot(s.start.x - endP.x, s.start.y - endP.y) < 0.05;
+    if (isClosed && minDim < thresholdMm * 0.6 && maxDim < thresholdMm * 1.5 && len < thresholdMm * 4.5) {
+      removedCount++;
+      return false;
+    }
+
+    return true;
+  });
+  return { path, removedCount };
+}
+
 /** 单条子路径的有符号面积（正为逆时针） */
 export function subpathSignedArea(sub, maxSagitta = 0.01) {
   const pts = flattenSubpath(sub, maxSagitta);
@@ -565,7 +770,8 @@ export function subpathBBox(sub) {
     if (p.x > maxX) maxX = p.x;
     if (p.y > maxY) maxY = p.y;
   }
-  return { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+  if (!isFinite(minX)) return { minX: 0, minY: 0, maxX: 0, maxY: 0, cx: 0, cy: 0, w: 0, h: 0 };
+  return { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, w: maxX - minX, h: maxY - minY };
 }
 
 /** 端点（用于最近邻排序的接续点判断） */

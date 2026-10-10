@@ -49,7 +49,7 @@ a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 imple
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# self-test (217 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
+# self-test (229 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
 npm run selftest
 
 # i18n audit (verify every string has both zh and en)
@@ -410,6 +410,12 @@ its own.
   - **Relative Origin CAM Compilation**: CAM toolpath generation automatically offsets coordinates relative to the active work origin, guaranteeing absolute cutting alignment with canvas layouts.
 - **Precise numeric control**: X / Y / width / height / angle, with aspect lock, six-way alignment, flip, duplicate
 - **Quick text**: a built-in single-stroke font (Stroker) designed for engraving — ordinary fonts turned into outlines blob together on 3mm acrylic, single-stroke letters stay legible
+- **Two-tier Geometry Optimization & De-speckle**:
+  - **CAM Process Simplification (RDP & Collinear Reduction)**: Adaptive Douglas-Peucker simplification with 0.02mm physical tolerance (smaller than the machine's 0.0254mm step pulse and blade kerf). Compresses over-sampled polylines and vector tracing paths by 70%–95% (e.g. from 295k commands down to 94k), drastically slashing 9600-baud serial bottleneck.
+  - **Import-level De-speckle (1.0mm threshold)**: Automatically filters isolated tiny stray artifacts/floating islands from bitmap tracing ($Max(W, H) < 1.0\text{mm}$, perimeter $< 4.0\text{mm}$), preventing the blade from cutting messy speckles and ruining adhesive vinyl.
+  - **Ultra-conservative 0.005mm Pre-simplification**: Merges exact collinear segments and sub-micron jitter at import time, keeping canvas zoom/pan and layer ungrouping completely lag-free.
+- **Mac Keyboard Polish & Focus Management**: Full support for Mac `Delete`, `Backspace`, `Cmd+Backspace` deletion and `Cmd+A` select-all; autofocus management transfers keyboard focus seamlessly from input fields back to the stage canvas, working reliably even under IME composition.
+- **Full-screen Loading Mask**: Modal semi-opaque spinner during vector import and CAM compilation with user interaction lock to prevent duplicate actions.
 - 6 material presets (ivory board / PVC foam / acrylic / vinyl / KT board + foil / thin paper), each with its own speed and force
 
 ### Device Connection and Manual Control
@@ -558,7 +564,7 @@ manual-control note carries both languages.
 plotter-one/
 ├── server/
 │   ├── index.js              HTTP routes + WebSocket
-│   ├── selftest.js           217 self-checks
+│   ├── selftest.js           229 self-checks
 │   ├── geom/path.js          geometry kernel (paths / matrices / transforms)
 │   ├── cam/
 │   │   ├── toolpath.js       toolpath generation (arcs preserved, not flattened)
@@ -591,7 +597,7 @@ over there".
 ## Development
 
 ```bash
-npm run selftest         # 217 self-checks, no machine required
+npm run selftest         # 229 self-checks, no machine required
 node tools/i18n-check.js # i18n audit
 npm start                # default port 8080
 npm start -- --port 9000
