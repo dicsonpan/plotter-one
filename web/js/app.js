@@ -33,6 +33,68 @@ if (typeof window !== 'undefined') {
     userOrigin: { x: 0, y: 0 },
   };
 
+  // ---------------------------------------------------------------- 撤销/重做
+  const history = {
+    undoStack: [],
+    redoStack: [],
+    maxSize: 50,
+  };
+
+  function pushHistory() {
+    const snap = {
+      layers: structuredClone(renderer.layers),
+      selectedId: state.selectedId,
+      selectedIds: Array.from(state.selectedIds),
+    };
+    history.undoStack.push(snap);
+    if (history.undoStack.length > history.maxSize) history.undoStack.shift();
+    history.redoStack = [];
+  }
+
+  function undo() {
+    if (!history.undoStack.length) {
+      toast(t('toast.noUndo'), 'warn');
+      return;
+    }
+    const current = {
+      layers: structuredClone(renderer.layers),
+      selectedId: state.selectedId,
+      selectedIds: Array.from(state.selectedIds),
+    };
+    history.redoStack.push(current);
+    const prev = history.undoStack.pop();
+    restoreSnapshot(prev);
+    toast(t('toast.undone'), 'ok');
+  }
+
+  function redo() {
+    if (!history.redoStack.length) {
+      toast(t('toast.noRedo'), 'warn');
+      return;
+    }
+    const current = {
+      layers: structuredClone(renderer.layers),
+      selectedId: state.selectedId,
+      selectedIds: Array.from(state.selectedIds),
+    };
+    history.undoStack.push(current);
+    const next = history.redoStack.pop();
+    restoreSnapshot(next);
+    toast(t('toast.redone'), 'ok');
+  }
+
+  function restoreSnapshot(snap) {
+    renderer.layers = structuredClone(snap.layers);
+    state.selectedId = snap.selectedId;
+    state.selectedIds = new Set(snap.selectedIds || []);
+    renderer.selectedId = state.selectedId;
+    renderer.selectedIds = state.selectedIds;
+    renderer.dirty = true;
+    renderLayerList();
+    updateTransformPanel();
+    updateStats();
+  }
+
   // ---------------------------------------------------------------- 提示
   function toast(msg, kind = '') {
     const el = document.createElement('div');
@@ -410,6 +472,8 @@ if (typeof window !== 'undefined') {
       updateTransformPanel();
     });
 
+    let dragStartRecorded = false;
+
     canvas.addEventListener('pointermove', (e) => {
       const p = localPos(e);
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
@@ -433,12 +497,25 @@ if (typeof window !== 'undefined') {
       if (mode === 'pan') {
         renderer.panBy(dx, dy);
       } else if (mode === 'move' && dragLayer && past) {
-        // 关键：把位移写进几何，不是显示偏移。
-        // 否则屏幕上动了、刻出来还在原地。
-        T.translateLayer(dragLayer, dx / renderer.scale, -dy / renderer.scale);
+        if (!dragStartRecorded) {
+          pushHistory();
+          dragStartRecorded = true;
+        }
+        const dxM = dx / renderer.scale;
+        const dyM = -dy / renderer.scale;
+        const targets = state.selectedIds.has(dragLayer.id)
+          ? renderer.layers.filter((l) => state.selectedIds.has(l.id))
+          : [dragLayer];
+        for (const l of targets) {
+          T.translateLayer(l, dxM, dyM);
+        }
         renderer.dirty = true;
         updateTransformPanel();
       } else if (mode === 'scale' && dragLayer && past) {
+        if (!dragStartRecorded) {
+          pushHistory();
+          dragStartRecorded = true;
+        }
         const bb = scaleStart.bb;
         const w0 = Math.max(bb.w, 1e-6), h0 = Math.max(bb.h, 1e-6);
         const c = scaleStart.corner;
@@ -461,6 +538,10 @@ if (typeof window !== 'undefined') {
         renderer.dirty = true;
         updateTransformPanel();
       } else if (mode === 'rotate' && dragLayer && past) {
+        if (!dragStartRecorded) {
+          pushHistory();
+          dragStartRecorded = true;
+        }
         const cur = Math.atan2(p.y - rotateStart.sy, p.x - rotateStart.sx);
         let deg = (cur - rotateStart.angle) * 180 / Math.PI;
         if (e.shiftKey) deg = Math.round(deg / 15) * 15;   // Shift 吸 15°
@@ -477,13 +558,19 @@ if (typeof window !== 'undefined') {
       if (mode === 'move' && dragLayer) {
         // 拖完把图形收回材料框内，避免移到外面刻不到
         const bed = state.preset || { width: 600, height: 710 };
-        T.clampLayerIntoBed(dragLayer, bed.width, bed.height, 2);
+        const targets = state.selectedIds.has(dragLayer.id)
+          ? renderer.layers.filter((l) => state.selectedIds.has(l.id))
+          : [dragLayer];
+        for (const l of targets) {
+          T.clampLayerIntoBed(l, bed.width, bed.height, 2);
+        }
         renderer.dirty = true;
         updateTransformPanel();
         updateStats();
       }
       mode = null; dragLayer = null;
       scaleStart = null; rotateStart = null;
+      dragStartRecorded = false;
       canvas.style.cursor = renderer.tool === 'pan' ? 'grab' : 'crosshair';
     };
     canvas.addEventListener('pointerup', endDrag);
@@ -699,6 +786,8 @@ if (typeof window !== 'undefined') {
         name: child.name || `${layer.name} #${i + 1}`,
         subpaths: structuredClone(child.subpaths),
         hidden: false,
+        isGroup: !!child.isGroup,
+        children: child.children ? structuredClone(child.children) : null,
       }));
     } else if (layer.subpaths.length > 1) {
       newLayers = layer.subpaths.map((sub, i) => ({
@@ -706,9 +795,12 @@ if (typeof window !== 'undefined') {
         name: `${layer.name} #${i + 1}`,
         subpaths: [structuredClone(sub)],
         hidden: false,
+        isGroup: false,
+        children: null,
       }));
     }
     if (newLayers.length <= 1) return;
+    pushHistory();
     renderer.layers.splice(idx, 1, ...newLayers);
     state.selectedIds = new Set(newLayers.map((l) => l.id));
     state.selectedId = newLayers[0].id;
@@ -724,6 +816,7 @@ if (typeof window !== 'undefined') {
   function groupSelectedLayers() {
     const toGroup = renderer.layers.filter((l) => state.selectedIds.has(l.id));
     if (toGroup.length <= 1) return;
+    pushHistory();
     const firstIdx = renderer.layers.indexOf(toGroup[0]);
     renderer.layers = renderer.layers.filter((l) => !state.selectedIds.has(l.id));
     const newGroup = {
@@ -732,7 +825,12 @@ if (typeof window !== 'undefined') {
       isGroup: true,
       hidden: false,
       subpaths: toGroup.flatMap((l) => structuredClone(l.subpaths)),
-      children: toGroup.map((l) => ({ name: l.name, subpaths: structuredClone(l.subpaths) })),
+      children: toGroup.map((l) => ({
+        name: l.name,
+        subpaths: structuredClone(l.subpaths),
+        isGroup: !!l.isGroup,
+        children: l.children ? structuredClone(l.children) : null,
+      })),
     };
     renderer.layers.splice(firstIdx, 0, newGroup);
     state.selectedId = newGroup.id;
@@ -781,25 +879,174 @@ if (typeof window !== 'undefined') {
   const selectedLayer = () => renderer.layers.find((l) => l.id === state.selectedId) || null;
   const round1 = (v) => Math.round(v * 10) / 10;
 
+  function deleteSelected() {
+    const toDelete = new Set(state.selectedIds);
+    if (state.selectedId) toDelete.add(state.selectedId);
+    if (!toDelete.size) return;
+    pushHistory();
+    const count = toDelete.size;
+    renderer.layers = renderer.layers.filter((l) => !toDelete.has(l.id));
+    state.selectedId = null;
+    state.selectedIds = new Set();
+    renderer.selectedId = null;
+    renderer.selectedIds = state.selectedIds;
+    renderer.dirty = true;
+    renderLayerList();
+    updateTransformPanel();
+    updateStats();
+    toast(t('toast.deleted', { n: count }), 'ok');
+  }
+
+  function duplicateSelected() {
+    const toDup = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+    if (!toDup.length) return;
+    pushHistory();
+    const copies = toDup.map((l) => {
+      const copy = T.duplicateLayer(l);
+      copy.name = t('prop.copySuffix', { name: l.name });
+      T.translateLayer(copy, 10, -10);
+      return copy;
+    });
+    renderer.layers.push(...copies);
+    state.selectedIds = new Set(copies.map((c) => c.id));
+    state.selectedId = copies[0].id;
+    renderer.selectedId = state.selectedId;
+    renderer.selectedIds = state.selectedIds;
+    renderer.dirty = true;
+    renderLayerList();
+    updateTransformPanel();
+    updateStats();
+  }
+
+  function flipSelected(horizontal = true) {
+    const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+    if (!selected.length) {
+      const visible = renderer.layers.filter((l) => !l.hidden);
+      if (!visible.length) return;
+      pushHistory();
+      const bed = state.preset || { width: 600, height: 710 };
+      const cx = bed.width / 2, cy = bed.height / 2;
+      for (const l of visible) {
+        T.flipLayer(l, horizontal, !horizontal, cx, cy);
+      }
+      renderer.dirty = true;
+      updateTransformPanel();
+      updateStats();
+      renderLayerList();
+      toast(horizontal ? t('toast.flippedH') : t('toast.flippedV'), 'ok');
+      return;
+    }
+    pushHistory();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const l of selected) {
+      const bb = T.layerBBox(l);
+      if (bb.w || bb.h) {
+        if (bb.minX < minX) minX = bb.minX;
+        if (bb.minY < minY) minY = bb.minY;
+        if (bb.maxX > maxX) maxX = bb.maxX;
+        if (bb.maxY > maxY) maxY = bb.maxY;
+      }
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    for (const l of selected) {
+      T.flipLayer(l, horizontal, !horizontal, cx, cy);
+    }
+    renderer.dirty = true;
+    updateTransformPanel();
+    updateStats();
+    renderLayerList();
+    toast(horizontal ? t('toast.flippedH') : t('toast.flippedV'), 'ok');
+  }
+
+  function ungroupSelectedLayers() {
+    const toUngroup = renderer.layers.filter((l) => (state.selectedIds.has(l.id) || l.id === state.selectedId) && (l.isGroup || (l.children && l.children.length > 0) || (l.subpaths && l.subpaths.length > 1)));
+    if (!toUngroup.length) return;
+    pushHistory();
+    let allNew = [];
+    for (const l of toUngroup) {
+      const idx = renderer.layers.indexOf(l);
+      if (idx === -1) continue;
+      let newLayers = [];
+      if (l.children && l.children.length > 0) {
+        newLayers = l.children.map((child, i) => ({
+          id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6) + '_' + i,
+          name: child.name || `${l.name} #${i + 1}`,
+          subpaths: structuredClone(child.subpaths),
+          hidden: false,
+          isGroup: !!child.isGroup,
+          children: child.children ? structuredClone(child.children) : null,
+        }));
+      } else if (l.subpaths.length > 1) {
+        newLayers = l.subpaths.map((sub, i) => ({
+          id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6) + '_' + i,
+          name: `${l.name} #${i + 1}`,
+          subpaths: [structuredClone(sub)],
+          hidden: false,
+          isGroup: false,
+          children: null,
+        }));
+      }
+      if (newLayers.length > 0) {
+        renderer.layers.splice(idx, 1, ...newLayers);
+        allNew.push(...newLayers);
+      }
+    }
+    if (allNew.length) {
+      state.selectedIds = new Set(allNew.map((x) => x.id));
+      state.selectedId = allNew[0].id;
+      renderer.selectedId = state.selectedId;
+      renderer.selectedIds = state.selectedIds;
+      renderer.dirty = true;
+      renderLayerList();
+      updateTransformPanel();
+      updateStats();
+      toast(t('toast.ungrouped', { n: allNew.length }), 'ok');
+    }
+  }
+
   function updateTransformPanel() {
     const sec = $('transformSect');
-    const layer = selectedLayer();
-    if (!layer) { sec.style.display = 'none'; return; }
+    const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+    if (!selected.length) { sec.style.display = 'none'; return; }
     sec.style.display = '';
-    $('selName').textContent = layer.name;
 
-    const bb = T.layerBBox(layer);
+    if (state.selectedIds.size > 1) {
+      $('selName').textContent = t('prop.selectedCount', { n: state.selectedIds.size });
+    } else {
+      $('selName').textContent = selected[0].name;
+    }
+
+    let bb;
+    if (state.selectedIds.size > 1) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const l of selected) {
+        const b = T.layerBBox(l);
+        if (b.w || b.h) {
+          if (b.minX < minX) minX = b.minX;
+          if (b.minY < minY) minY = b.minY;
+          if (b.maxX > maxX) maxX = b.maxX;
+          if (b.maxY > maxY) maxY = b.maxY;
+        }
+      }
+      bb = { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
+    } else {
+      bb = T.layerBBox(selected[0]);
+    }
+
     // 用户正在输入时不要回写，否则打字打到一半被冲掉
     if (document.activeElement !== $('propX')) $('propX').value = round1(bb.minX);
     if (document.activeElement !== $('propY')) $('propY').value = round1(bb.minY);
     if (document.activeElement !== $('propW')) $('propW').value = round1(bb.w);
     if (document.activeElement !== $('propH')) $('propH').value = round1(bb.h);
-    if (document.activeElement !== $('propRot')) $('propRot').value = round1(layer.rotation || 0);
+    if (document.activeElement !== $('propRot')) $('propRot').value = round1(selected[0].rotation || 0);
 
     const btnGroup = $('btnGroup');
     const btnUngroup = $('btnUngroup');
     if (btnGroup) btnGroup.disabled = state.selectedIds.size <= 1;
-    if (btnUngroup) btnUngroup.disabled = !(layer && (layer.isGroup || (layer.subpaths && layer.subpaths.length > 1)));
+    if (btnUngroup) {
+      btnUngroup.disabled = !selected.some((l) => l.isGroup || (l.children && l.children.length > 0) || (l.subpaths && l.subpaths.length > 1));
+    }
   }
 
   function afterTransform(layer) {
@@ -812,19 +1059,62 @@ if (typeof window !== 'undefined') {
   function wireTransformPanel() {
     // 坐标：把包围盒左上角挪到指定位置
     const applyXY = () => {
-      const l = selectedLayer(); if (!l) return;
-      T.setLayerPosition(l, +$('propX').value || 0, +$('propY').value || 0);
-      afterTransform(l);
+      const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+      if (!selected.length) return;
+      pushHistory();
+      let bb;
+      if (selected.length > 1) {
+        let minX = Infinity, minY = Infinity;
+        for (const l of selected) {
+          const b = T.layerBBox(l);
+          if (b.minX < minX) minX = b.minX;
+          if (b.minY < minY) minY = b.minY;
+        }
+        bb = { minX, minY };
+      } else {
+        bb = T.layerBBox(selected[0]);
+      }
+      const targetX = +$('propX').value || 0;
+      const targetY = +$('propY').value || 0;
+      const dx = targetX - bb.minX;
+      const dy = targetY - bb.minY;
+      for (const l of selected) {
+        T.translateLayer(l, dx, dy);
+      }
+      afterTransform(selected[0]);
     };
     $('propX').addEventListener('change', applyXY);
     $('propY').addEventListener('change', applyXY);
 
     // 尺寸：缩放到目标宽高（可锁比例）
     const applyWH = () => {
-      const l = selectedLayer(); if (!l) return;
+      const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+      if (!selected.length) return;
+      pushHistory();
       const keep = $('btnLockRatio').classList.contains('on');
-      T.setLayerSize(l, +$('propW').value || 1, +$('propH').value || 1, keep);
-      afterTransform(l);
+      const targetW = +$('propW').value || 1;
+      const targetH = +$('propH').value || 1;
+
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const l of selected) {
+        const b = T.layerBBox(l);
+        if (b.minX < minX) minX = b.minX;
+        if (b.minY < minY) minY = b.minY;
+        if (b.maxX > maxX) maxX = b.maxX;
+        if (b.maxY > maxY) maxY = b.maxY;
+      }
+      const w = maxX - minX, h = maxY - minY;
+      if (w <= 0 || h <= 0) return;
+
+      let sx = targetW / w;
+      let sy = targetH / h;
+      if (keep) { const s = Math.min(sx, sy); sx = s; sy = s; }
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+
+      for (const l of selected) {
+        T.scaleLayer(l, sx, sy, cx, cy);
+      }
+      afterTransform(selected[0]);
     };
     $('propW').addEventListener('change', applyWH);
     $('propH').addEventListener('change', applyWH);
@@ -833,18 +1123,49 @@ if (typeof window !== 'undefined') {
       $('btnLockRatio').classList.toggle('on');
     });
 
-    // 角度：累加存到 layer，正向值好显示
+    // 角度
     $('propRot').addEventListener('change', () => {
-      const l = selectedLayer(); if (!l) return;
+      const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+      if (!selected.length) return;
+      pushHistory();
       const target = +$('propRot').value || 0;
-      const delta = target - (l.rotation || 0);
-      if (delta) { l.rotation = target; T.rotateLayer(l, delta); afterTransform(l); }
+      const delta = target - (selected[0].rotation || 0);
+      if (delta) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const l of selected) {
+          const b = T.layerBBox(l);
+          if (b.minX < minX) minX = b.minX;
+          if (b.minY < minY) minY = b.minY;
+          if (b.maxX > maxX) maxX = b.maxX;
+          if (b.maxY > maxY) maxY = b.maxY;
+        }
+        const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+        for (const l of selected) {
+          l.rotation = target;
+          T.rotateLayer(l, delta, cx, cy);
+        }
+        afterTransform(selected[0]);
+      }
     });
+
     const spin = (deg) => {
-      const l = selectedLayer(); if (!l) return;
-      l.rotation = (l.rotation || 0) + deg;
-      T.rotateLayer(l, deg);
-      afterTransform(l);
+      const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+      if (!selected.length) return;
+      pushHistory();
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const l of selected) {
+        const b = T.layerBBox(l);
+        if (b.minX < minX) minX = b.minX;
+        if (b.minY < minY) minY = b.minY;
+        if (b.maxX > maxX) maxX = b.maxX;
+        if (b.maxY > maxY) maxY = b.maxY;
+      }
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      for (const l of selected) {
+        l.rotation = (l.rotation || 0) + deg;
+        T.rotateLayer(l, deg, cx, cy);
+      }
+      afterTransform(selected[0]);
     };
     $('btnRotateL').addEventListener('click', () => spin(-90));
     $('btnRotateR').addEventListener('click', () => spin(90));
@@ -852,70 +1173,51 @@ if (typeof window !== 'undefined') {
     // 对齐：相对材料框
     document.querySelectorAll('[data-align]').forEach((b) => {
       b.addEventListener('click', () => {
-        const l = selectedLayer(); if (!l) return;
+        const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+        if (!selected.length) return;
+        pushHistory();
         const bed = state.preset || { width: 600, height: 710 };
-        const bb = T.layerBBox(l);
         const a = b.dataset.align;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const l of selected) {
+          const bb = T.layerBBox(l);
+          if (bb.minX < minX) minX = bb.minX;
+          if (bb.minY < minY) minY = bb.minY;
+          if (bb.maxX > maxX) maxX = bb.maxX;
+          if (bb.maxY > maxY) maxY = bb.maxY;
+        }
+        const allBb = { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
         let dx = 0, dy = 0;
-        if (a === 'left') dx = 2 - bb.minX;
-        else if (a === 'right') dx = (bed.width - 2) - bb.maxX;
-        else if (a === 'hcenter') dx = bed.width / 2 - bb.cx;
-        else if (a === 'bottom') dy = 2 - bb.minY;
-        else if (a === 'top') dy = (bed.height - 2) - bb.maxY;
-        else if (a === 'vcenter') dy = bed.height / 2 - bb.cy;
-        T.translateLayer(l, round1(dx), round1(dy));
-        afterTransform(l);
+        if (a === 'left') dx = 2 - allBb.minX;
+        else if (a === 'right') dx = (bed.width - 2) - allBb.maxX;
+        else if (a === 'hcenter') dx = bed.width / 2 - allBb.cx;
+        else if (a === 'bottom') dy = 2 - allBb.minY;
+        else if (a === 'top') dy = (bed.height - 2) - allBb.maxY;
+        else if (a === 'vcenter') dy = bed.height / 2 - allBb.cy;
+        for (const l of selected) {
+          T.translateLayer(l, round1(dx), round1(dy));
+        }
+        afterTransform(selected[0]);
       });
     });
 
-    // 翻转：以自身包围盒中心为轴
-    $('btnFlipX').addEventListener('click', () => {
-      const l = selectedLayer(); if (!l) return;
-      const bb = T.layerBBox(l);
-      T.scaleLayer(l, -1, 1, bb.cx, bb.cy);
-      afterTransform(l);
-    });
-    $('btnFlipY').addEventListener('click', () => {
-      const l = selectedLayer(); if (!l) return;
-      const bb = T.layerBBox(l);
-      T.scaleLayer(l, 1, -1, bb.cx, bb.cy);
-      afterTransform(l);
-    });
+    // 翻转（镜像）：水平镜像与垂直镜像
+    $('btnFlipX').addEventListener('click', () => flipSelected(true));
+    $('btnFlipY').addEventListener('click', () => flipSelected(false));
 
-    $('btnDupLayer').addEventListener('click', () => {
-      const l = selectedLayer(); if (!l) return;
-      const copy = T.duplicateLayer(l);
-      // 副本名带语言后缀，所以每次都重算——切语言后再次复制应该显示新语言
-      copy.name = t('prop.copySuffix', { name: l.name });
-      T.translateLayer(copy, 10, -10);
-      renderer.layers.push(copy);
-      state.selectedId = copy.id;
-      renderer.selectedId = copy.id;
-      afterTransform(copy);
-    });
-
+    $('btnDupLayer').addEventListener('click', duplicateSelected);
     $('btnFrontLayer').addEventListener('click', () => {
-      const l = selectedLayer(); if (!l) return;
-      renderer.layers = renderer.layers.filter((x) => x !== l).concat([l]);
-      afterTransform(l);
+      const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+      if (!selected.length) return;
+      pushHistory();
+      renderer.layers = renderer.layers.filter((x) => !selected.includes(x)).concat(selected);
+      afterTransform(selected[0]);
     });
 
-    $('btnDelLayer').addEventListener('click', () => {
-      const l = selectedLayer(); if (!l) return;
-      renderer.layers = renderer.layers.filter((x) => x !== l);
-      state.selectedId = null;
-      renderer.selectedId = null;
-      renderer.dirty = true;
-      updateTransformPanel();
-      renderLayerList();
-      updateStats();
-    });
+    $('btnDelLayer').addEventListener('click', deleteSelected);
 
     $('btnGroup')?.addEventListener('click', groupSelectedLayers);
-    $('btnUngroup')?.addEventListener('click', () => {
-      const l = selectedLayer();
-      if (l) ungroupLayer(l);
-    });
+    $('btnUngroup')?.addEventListener('click', ungroupSelectedLayers);
   }
   // ---------------------------------------------------------------- UI 绑定
   function wireUI() {
@@ -1218,9 +1520,31 @@ if (typeof window !== 'undefined') {
       toast(t('toast.originReset'), 'ok');
     });
 
-    // 键盘方向键（桌面端调试很方便）
+    // 键盘快捷键监听
     document.addEventListener('keydown', (e) => {
       if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+
+      const isCmdOrCtrl = e.ctrlKey || e.metaKey;
+      if (isCmdOrCtrl && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (isCmdOrCtrl && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (state.selectedIds.size > 0 || state.selectedId) {
+          e.preventDefault();
+          deleteSelected();
+          return;
+        }
+      }
+
       const map = { ArrowUp: [0, 1], ArrowDown: [0, -1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
       if (!map[e.key]) return;
       e.preventDefault();
@@ -1316,12 +1640,38 @@ if (typeof window !== 'undefined') {
         toast(t('toast.noPath'), 'err');
         return;
       }
-      const children = (r.elements && r.elements.length > 1) ? r.elements.map((elem) => ({
-        name: elem.name,
-        subpaths: structuredClone(elem.subpaths),
-      })) : null;
+      pushHistory();
+      let children = null;
+      if (r.elements && r.elements.length > 1) {
+        children = r.elements.map((elem) => ({
+          name: elem.name,
+          subpaths: structuredClone(elem.subpaths),
+        }));
+      } else if (r.path.subpaths.length > 1) {
+        children = r.path.subpaths.map((sub, i) => ({
+          name: `${f.name} #${i + 1}`,
+          subpaths: [structuredClone(sub)],
+        }));
+      }
       const isGroup = !!(children && children.length > 1);
       const layer = addLayer(f.name, r.path, { isGroup, children });
+
+      // 自动校准到工作区：纠正负坐标并将大尺寸图形等比缩放到材料幅面内
+      const bed = state.preset || { width: 600, height: 710 };
+      const bb = T.layerBBox(layer);
+      let dx = 0, dy = 0;
+      if (bb.minX < 10) dx = 10 - bb.minX;
+      if (bb.minY < 10) dy = 10 - bb.minY;
+      if (dx !== 0 || dy !== 0) T.translateLayer(layer, dx, dy);
+
+      const curBb = T.layerBBox(layer);
+      const maxW = bed.width - 20;
+      const maxH = bed.height - 20;
+      if (curBb.w > maxW || curBb.h > maxH) {
+        const sf = Math.min(maxW / Math.max(curBb.w, 1), maxH / Math.max(curBb.h, 1));
+        T.scaleLayer(layer, sf, sf, curBb.minX, curBb.minY);
+      }
+
       state.selectedId = layer.id;
       state.selectedIds = new Set([layer.id]);
       renderer.selectedId = layer.id;
@@ -1453,8 +1803,11 @@ if (typeof window !== 'undefined') {
           direction: $('dirSel').value,
         },
       });
-      // 用回显解析把生成结果还原成路径，验证「所见即所刻」
-      const back = await api('/api/preview?gcode=' + encodeURIComponent(r.gcode));
+      // 用 POST 路由回显解析，避免大 G-code 导致 URL 超过 8KB 返回 HTTP 431
+      const back = await api('/api/preview', {
+        method: 'POST',
+        body: { gcode: r.gcode },
+      });
       const merged = { subpaths: back.path.subpaths };
       renderer.startAnim(merged, +$('speedRange').value);
       renderer.onAnimEnd = () => { logLine(t('log.previewDone')); };
