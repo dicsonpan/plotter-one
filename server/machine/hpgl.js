@@ -297,6 +297,12 @@ export class HpglBuilder {
     this.pos = { x: 0, y: 0 };
     this.penDown = false;
     this.bytes = 0;
+    this._coordBatch = [];
+    this._flushing = false;
+    // 连续坐标流合并：每条 PA 指令最多合并 30 对坐标（约 300~360 字节），
+    // 既能消除数以万计重复的 PA 助记符与分号/换行符传输开销（提速 20%~30%），
+    // 又完全适配 9600 串口小缓冲与固件接收能力。
+    this.maxBatchPairs = options.maxBatchPairs !== undefined ? options.maxBatchPairs : 30;
   }
 
   // -------------------------------------------------------------------------
@@ -420,8 +426,33 @@ export class HpglBuilder {
   }
 
   emit(str) {
+    if (this._flushing) {
+      this.cmds.push(str);
+      this.bytes += str.length;
+      return this;
+    }
+    this._flushCoords();
     this.cmds.push(str);
     this.bytes += str.length;
+    return this;
+  }
+
+  /**
+   * 将缓存中的连续坐标合并为单条 PA 指令下发。
+   *
+   * 提速核心：在 9600 串口物理带宽下，每对坐标原先独立占一行（`PA x,y;\n`），
+   * 重复的 `PA` 与分号换行带来约 30% 的协议字符冗余。
+   * 合并为 `PA x1,y1,x2,y2...;` 后，体积下降 20%~30%，行数减少 90%+，
+   * 既大幅降低串口传输耗时，又让下位机固件在单条 PA 内部平滑运动规划。
+   */
+  _flushCoords() {
+    if (this._coordBatch && this._coordBatch.length > 0) {
+      const coords = this._coordBatch.join(',');
+      this._coordBatch = [];
+      this._flushing = true;
+      this.emit(`PA${coords};`);
+      this._flushing = false;
+    }
     return this;
   }
 
@@ -495,6 +526,7 @@ export class HpglBuilder {
 
   /** 抬刀。已在抬刀状态时不重复发指令——9600 波特下每个字节都要花时间 */
   penUp() {
+    this._flushCoords();
     if (this.penDown) { this.emit('PU;'); this.penDown = false; }
     return this;
   }
@@ -513,6 +545,7 @@ export class HpglBuilder {
    * 抬刀是安全操作，多发一个字节的成本可以忽略；不发指令的风险不行。
    */
   forcePenUp() {
+    this._flushCoords();
     this.emit('PU;');
     this.penDown = false;
     return this;
@@ -525,6 +558,7 @@ export class HpglBuilder {
   }
 
   moveTo(x, y) {
+    this._flushCoords();
     const p = this.toMachine(x, y);
     const px = toPlotterUnits(p.x, this.spi);
     const py = toPlotterUnits(p.y, this.spi);
@@ -537,9 +571,16 @@ export class HpglBuilder {
     const p = this.toMachine(x, y);
     const px = toPlotterUnits(p.x, this.spi);
     const py = toPlotterUnits(p.y, this.spi);
-    if (!this.penDown) { this.emit('PD;'); this.penDown = true; }
-    this.emit(`PA${px},${py};`);
+    if (!this.penDown) {
+      this.emit('PD;');
+      this.penDown = true;
+    }
+    // 连续落刀切割坐标流合并：将连续的点缓存在当前批次中
+    this._coordBatch.push(px, py);
     this.pos = { x: px, y: py };
+    if (this.maxBatchPairs > 0 && this._coordBatch.length >= this.maxBatchPairs * 2) {
+      this._flushCoords();
+    }
     return this;
   }
 
@@ -564,6 +605,7 @@ export class HpglBuilder {
    * 这样起点角与实际位置永远自洽，不依赖任何角度变换公式。
    */
   arcTo(cx, cy, r, a0, a1) {
+    this._flushCoords();
     const c = this.toMachine(cx, cy);
     const cxq = toPlotterUnits(c.x, this.spi);
     const cyq = toPlotterUnits(c.y, this.spi);
@@ -732,6 +774,7 @@ export class HpglBuilder {
       this.emit('PA0,0;');
     }
     this.end();
+    this._flushCoords();
 
     const text = this.cmds.join('\n') + '\n';
     return {
@@ -763,7 +806,7 @@ export function hpglToDmpl(hpglText) {
     if (!line) continue;
     if (map[line]) { out.push(map[line]); continue; }
     let m;
-    if ((m = line.match(/^PA(-?\d+),(-?\d+);$/))) { out.push(`A${m[1]},${m[2]};`); continue; }
+    if ((m = line.match(/^PA((?:-?\d+,-?\d+,?)+);$/))) { out.push(`A${m[1].replace(/,$/, '')};`); continue; }
     if ((m = line.match(/^PD;$/))) { out.push('D;'); continue; }
     if ((m = line.match(/^PU;$/))) { out.push('U;'); continue; }
     if ((m = line.match(/^VS(\d+);$/))) { out.push(`V${m[1]};`); continue; }
