@@ -14,7 +14,7 @@ import {
   flattenPath, optimizeOrder, setDirection, signedArea, pruneDegenerate, countElements,
   subpathLength, simplifyPath, simplifySubpath, rdpSimplifyPoints, filterSpeckles,
 } from './geom/path.js';
-import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage } from './machine/hpgl.js';
+import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage, hpglToDmpl } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
 import { buildManualCommand } from './machine/manual.js';
 import { readFileSync } from 'node:fs';
@@ -447,6 +447,68 @@ section('CAM 几何层抽稀优化（RDP 与共线合并）');
   const compiled = compileToolpath(densePath, MACHINE_PRESETS['liyue-sc631-au'], { tolerance: 0.02 });
   check('compileToolpath 输出刀路自动应用几何抽稀', compiled.path.subpaths[0].elems.length < 5,
     `实际图元数 ${compiled.path.subpaths[0].elems.length}`);
+}
+
+// ---------------------------------------------------------------------------
+section('指令层连续坐标流合并（HP-GL 批量坐标提速 20%~30%）');
+{
+  const preset = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
+  // 构造 60 个非共线连接点（折线）
+  const poly = makePath();
+  const ps = makeSubpath(0, 0);
+  for (let i = 1; i <= 60; i++) {
+    addLine(ps, i * 2, (i % 2 === 0 ? 10 : 0));
+  }
+  poly.subpaths.push(ps);
+
+  // 1. 未合并模式（每对坐标独立占一行，maxBatchPairs: 1）
+  const unmerged = compileToPlotterLanguage(poly, preset, { maxBatchPairs: 1, speedMmPerSec: 30 });
+  // 2. 连续流合并模式（默认 30 对/行）
+  const merged = compileToPlotterLanguage(poly, preset, { maxBatchPairs: 30, speedMmPerSec: 30 });
+
+  check('合并模式生成有效指令', merged.text.length > 0);
+  const mergedPaLines = merged.text.split('\n').filter((l) => /^PA-?\d+,-?\d+,/.test(l));
+  check('落刀连续切割坐标合并为批量 PA 指令', mergedPaLines.length > 0);
+
+  // 验证压缩率：字符数减少 20%~30%
+  const byteReduction = (unmerged.bytes - merged.bytes) / unmerged.bytes;
+  check('指令层体积压缩率达 20%~30%（实测提速基准）', byteReduction >= 0.20 && byteReduction <= 0.35,
+    `未合并 ${unmerged.bytes}B vs 合并后 ${merged.bytes}B，压缩 ${(byteReduction * 100).toFixed(1)}%`);
+
+  // 验证行数压缩：60 个点在合并后大幅缩减
+  const unmergedLines = unmerged.text.split('\n').filter((l) => /^PA/.test(l)).length;
+  const mergedLines = merged.text.split('\n').filter((l) => /^PA/.test(l)).length;
+  check('PA 指令行数压缩率超过 80%', (unmergedLines - mergedLines) / unmergedLines >= 0.80,
+    `PA 行数 ${unmergedLines} → ${mergedLines}`);
+
+  // 验证往返几何精度：回读路径长度与原路径在量化容差内一致
+  const back = parseHpgl(merged.text, { stepsPerInch: preset.stepsPerInch });
+  const origLen = pathLength(poly);
+  const backLen = pathLength(back.path);
+  const lenErr = Math.abs(origLen - backLen) / origLen;
+  check('连续坐标流合并后往返长度守恒(<0.5%)', lenErr < 0.005,
+    `原始 ${origLen.toFixed(2)} vs 回读 ${backLen.toFixed(2)}，误差 ${(lenErr * 100).toFixed(3)}%`);
+
+  const obb = pathBBox(poly), bbb = pathBBox(back.path);
+  check('连续坐标流合并后包围盒守恒', Math.abs(obb.w - bbb.w) < 0.5 && Math.abs(obb.h - bbb.h) < 0.5,
+    `原始 ${obb.w.toFixed(1)}×${obb.h.toFixed(1)} vs 回读 ${bbb.w.toFixed(1)}×${bbb.h.toFixed(1)}`);
+
+  // 混合图元（直线流 + 圆弧 + 直线流）：验证在遇圆弧前自动 flush，圆弧后继续批量合并
+  const mixed = makePath();
+  const ms = makeSubpath(0, 0);
+  for (let i = 1; i <= 20; i++) addLine(ms, i, 0);
+  addArc(ms, 20, 10, 10, -Math.PI / 2, Math.PI / 2);
+  for (let i = 1; i <= 20; i++) addLine(ms, 20 - i, 20);
+  mixed.subpaths.push(ms);
+  const mixedBuilt = compileToPlotterLanguage(mixed, preset, { speedMmPerSec: 30 });
+  const mixedBack = parseHpgl(mixedBuilt.text, { stepsPerInch: preset.stepsPerInch });
+  check('混合图元往返圆弧数量守恒且长度一致',
+    mixedBack.path.subpaths[0].elems.filter((e) => e.type === 'arc').length === 1
+    && Math.abs(pathLength(mixed) - pathLength(mixedBack.path)) / pathLength(mixed) < 0.001);
+
+  // DMPL 转换验证：PA 多坐标流正确翻译为 A 多坐标流
+  const dmplText = hpglToDmpl(merged.text);
+  check('DMPL 正确映射批量坐标为 A 指令', /^A-?\d+,-?\d+,/m.test(dmplText));
 }
 
 // ---------------------------------------------------------------------------

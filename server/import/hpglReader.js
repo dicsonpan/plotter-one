@@ -74,8 +74,13 @@ export function parseHpgl(text, opts = {}) {
       if (!pts.length) continue;
       if (!penDown) {
         // 抬刀状态下的 PA 只是移动：更新位置，不产生路径
-        cx = pts[0]; cy = pts[1] || 0;
+        cx = pts[pts.length - 2] ?? pts[0];
+        cy = pts[pts.length - 1] ?? pts[1] ?? 0;
         continue;
+      }
+      if (!sub) {
+        sub = makeSubpath(toMm(cx), toMm(cy));
+        path.subpaths.push(sub);
       }
       // 落刀状态下的 PA 是切割路径
       for (let k = 0; k + 1 < pts.length; k += 2) {
