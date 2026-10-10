@@ -1,575 +1,563 @@
-# 刻字机 Web 控制服务
+# Engraving Machine Web Console
 
-**[English](README.en.md)** | 简体中文
-
-把 Windows 独占的刻字机输出软件（Ucancam / UcanSign、文泰刻绘）搬到浏览器。
-一台板子插在刻字机旁边，局域网内任何设备用浏览器打开就能用——Windows、Mac、iPad、安卓手机，
-甚至没装任何东西的瘦客户端。
+Move Windows-only engraving output software (Ucancam / UcanSign, 文泰刻绘) into a browser.
+One board plugged in next to the machine; any device on the LAN opens it in a browser —
+Windows, Mac, iPad, Android phone, even a bare thin client with nothing installed.
 
 ```
-                 同一局域网
+                 same LAN
    ┌────────┐  ┌────────┐  ┌────────┐
-   │  电脑  │  │  手机  │  │  平板  │     浏览器，不用装软件
+   │  PC    │  │ phone  │  │ tablet │     browser, no software to install
    └────┬───┘  └───┬────┘  └───┬────┘
         └──────────┴───────────┘
                    │ HTTP + WebSocket
                    ▼
         ┌──────────────────────┐
-        │  RK3399 / 任意 ARM64 │   常驻 3-5W
-        │  Node.js 零依赖      │
+        │  RK3399 / any ARM64  │   3-5W idle
+        │  Node.js, zero deps  │
         └──────────┬───────────┘
                    │ RS-232 9600 8N1
                    ▼
-              力宇刻字机
+            engraving machine
 ```
 
+**[中文](README.zh.md)**
+
 ---
 
-## 特点
+## Why
 
-| | Ucancam / UcanSign / 文泰 | 这个 |
+| | Ucancam / UcanSign / 文泰 | This |
 |---|---|---|
-| 平台 | 仅 Windows | 任意设备，手机也能用 |
-| 安装 | 每台机器装一次 | 浏览器打开就用 |
-| 串口驱动 | 需装驱动 | 直接 `/dev/ttyACM0`，无驱动 |
-| 离线输出 | 依赖 U 盘 | 直接下发 |
-| 依赖 | 商业软件 | **零运行时依赖**（只用 Node 标准库） |
+| Platform | Windows only | Any device, including phones |
+| Install | Once per machine | Just open a browser |
+| Serial driver | Must install drivers | Direct `/dev/ttyACM0`, no driver |
+| Offline output | Needs a USB stick | Sent directly |
+| Dependencies | Commercial software | **Zero runtime deps** (Node standard library only) |
 
-零依赖是刻意的：串口用 `stty` + 文件描述符而不是 `serialport`（后者带 C++ 扩展，
-在 ARM64 上要么没预编译、要么要交叉编译）。HTTP 用 `node:http`，
-WebSocket 实现了 RFC6455 最小版。**在板子上不需要 `npm install`，部署就是拷贝文件。**
+Zero dependencies is deliberate: the serial port uses `stty` + file descriptors rather
+than `serialport` (which ships C++ extensions that either lack ARM64 prebuilds or require
+a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 implementation.
+**No `npm install` is needed on the board — deploying means copying files.**
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bash
-# 克隆
+# clone
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# 自检（217 项，验证几何/协议/状态机/坐标轴/版面旋转/双语，不需要接机器）
+# self-test (217 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
 npm run selftest
 
-# i18n 体检（确认每条文案都有中英两份）
+# i18n audit (verify every string has both zh and en)
 node tools/i18n-check.js
 
-# 启动
+# start
 npm start
 ```
 
-打开 `http://localhost:8080`。
+Open `http://localhost:8080`.
 
-部署到板子见 [docs/部署指南.md](docs/部署指南.md)，一条命令：
+For deployment to a board, see [docs/部署指南.md](docs/部署指南.md) — one command:
 
 ```bash
 sudo ./deploy/install.sh
 ```
 
-图形怎么画、用什么软件画，见 [docs/设计工作流.md](docs/设计工作流.md)。
+For how to design artwork, see [docs/设计工作流.md](docs/设计工作流.md).
 
 ---
 
-## 支持的机器
+## Supported machines
 
-力宇 SC 系列（SC631-AU / SC631E / SC801 / SC1261）及其他兼容 HP-GL 的刻字机。
+Liyue SC series (SC631-AU / SC631E / SC801 / SC1261) and other HP-GL compatible engravers.
 
-| 机型 | 预设幅面 | 说明 |
+| Model | Preset bed | Notes |
 |---|---|---|
-| **力宇 SC631-AU** | 600 × 710 mm | 保守设定，见下方「⚠️ 幅面」 |
-| 力宇 SC631E | 630 × 710 mm | 仅在铭牌确认为 630mm 时使用 |
-| 力宇 SC801 / SC801E | 800 × 880 mm | |
-| 力宇 SC1261 / SC1261E | 1260 × 1340 mm | |
-| 通用 HPGL | 630 × 710 mm | 1016 单位/英寸 |
-| 力宇四轴 / 伺服（3D） | 800 × 880 mm | |
+| **Liyue SC631-AU** | 600 × 710 mm | Conservative default, see "⚠️ Bed width" below |
+| Liyue SC631E | 630 × 710 mm | Use only after confirming a 630mm nameplate |
+| Liyue SC801 / SC801E | 800 × 880 mm | |
+| Liyue SC1261 / SC1261E | 1260 × 1340 mm | |
+| Generic HPGL | 630 × 710 mm | 1016 units/inch |
+| Liyue 4-axis / servo (3D) | 800 × 880 mm | |
 
-**分辨率**：力宇标注 0.0254mm/step 即 1000 步/英寸。
-本服务在上位机通过 `toPlotterUnits()` 精确换算为机器脉冲整数步进，直发原生 HP-GL 坐标。
-**注意：卷筒刻字机绝不能下发 `SC`（缩放）指令**——卷筒纸 Y 轴为连续进给（无物理上限 $P2_y = 0$），发 `SC` 会导致固件将 Y 轴缩放比例归零，使走纸完全失去响应，且造成 X 轴异常。
+**Resolution**: Liyue specs 0.0254mm/step, i.e. 1000 steps/inch. This service converts
+precisely to integer machine pulses via `toPlotterUnits()` and emits native HP-GL coordinates.
 
-### ⚠️ 幅面宽度为什么取 600 而不是 630
+> ⚠️ **Never send `SC` (scale) to a roll-feed engraver.** The roll has no fixed physical
+> Y limit ($P2_y = 0$); sending `SC` makes the firmware compute a Y scale factor of zero,
+> which kills the feed axis entirely and corrupts X motion as well.
 
-SC631-AU 的「最大刻绘宽度」在不同厂商资料里有 600 / 615 / 630 三种说法。
-本项目**默认取最小值 600mm**：幅面设小只是排版受限，设大了是**刀走出材料、撞机甚至断刀**。
+### ⚠️ Why the bed width is 600 and not 630
 
-若机身铭牌确认为 630mm，在界面「机器型号」里改选 SC631E 预设即可。
+Vendors list the SC631-AU "max plot width" as 600, 615, or 630 mm depending on the source.
+This project **defaults to the smallest value, 600mm**: a too-small bed only constrains
+layout, a too-large one sends the tool off the material into the machine — or breaks the blade.
 
-### ⚠️ 坐标轴方向与对刀原点
+If your nameplate confirms 630mm, just switch to the SC631E preset in the UI.
 
-**刻字机以操作者在材料上设定的对刀原点为基准：**
-1. 操作者在机身面板用方向键将刀尖移动到材料角落。
-2. 按机身面板的 **【原点】(Origin)** 键，此时该物理位置被固件设为局部 $(0, 0)$。
-3. 刻绘任务从 $(0, 0)$ 开始正向刻入材料，任务开头**绝不下发 `!PG;` 机械归位**（避免冲毁对刀原点并撞导轨限位）。
+### ⚠️ Axis directions and the origin datum
 
-标准轴向约定：
-- **X 轴（第一参数）**：刀头（龙门左右导轨，幅面宽 600mm）
-- **Y 轴（第二参数）**：走纸滚筒（材料进退，710mm 进纸方向）
+**The engraver is based on the origin the operator sets on the material:**
+1. The operator nudges the tip to a material corner with the panel's direction keys.
+2. They press the panel's **Origin** button; that physical position becomes local $(0, 0)$.
+3. Jobs start from $(0, 0)$ and cut forward. A job **never sends `!PG;` mechanical homing
+   at the start** — that would destroy the operator's datum and slam into the rail limit.
 
-> **这些都不在界面上调。** 它们是机器硬件属性，已在 SC631-AU 实机确认，
-> 固化在 `machine/hpgl.js` 的机型预设里。界面暴露它们只会招来误改——
-> 历史上正是反复调错这几项，才把「版面朝向」和「轴方向」搞混。
-> 换机器或换控制板时才需要改预设，改法见下方「真机验证记录」。
+Standard axis assignment:
+- **X (first HP-GL parameter)**: gantry (left-right across the 600mm bed)
+- **Y (second parameter)**: media roller (material feed, 710mm of travel)
+
+These are **not adjustable from the UI**. They are machine hardware properties confirmed on
+a real SC631-AU and pinned in `machine/hpgl.js`. See "Verified hardware facts" below.
 
 ---
 
-## 真机验证记录
+## Verified hardware facts
 
-本项目的坐标轴逻辑是**在 SC631-AU 实机上反复调试验证的**。
+The axis logic in this project was **iteratively debugged on a real SC631-AU**.
 
-### 已确认的机器事实
-
-| 项 | 实测结果 |
+| Item | Measured |
 |---|---|
-| 物理电机分配 | 标准分配：刀头导轨为 `X` 轴，走纸滚筒为 `Y` 轴 |
-| 步进分辨率 | 1000 步/英寸（0.0254mm/step） |
-| 串口 | `/dev/ttyACM0`，9600 8N1，无流控 |
-| 初始坐标基准 | 以面板【原点】为 $(0,0)$，开头不发 `!PG;` |
-| **版面朝向** | **刻字时整版逆时针歪 90°**（方向正确、不镜像，纯躺倒） |
+| Motor assignment | Standard: gantry rail = `X`, media roller = `Y` |
+| Step resolution | 1000 steps/inch (0.0254mm/step) |
+| Serial port | `/dev/ttyACM0`, 9600 8N1, no flow control |
+| Origin datum | Panel **Origin** button is $(0,0)$; no `!PG;` at job start |
+| **Layout orientation** | **The whole design comes out rotated 90° CCW** (directions correct, not mirrored — purely toppled) |
 
-对应到标准配置：
+The corresponding configuration:
 
 ```
-swapAxes    = false    ← 不交换轴
-axisX       =  1       ← 刀头正向
-axisY       =  1       ← 走纸正向
-layoutRotate = 90      ← 补偿版面朝向（顺时针 90°）
+swapAxes     = false    ← do not swap axes
+axisX        =  1       ← gantry positive
+axisY        =  1       ← media roller positive
+layoutRotate = 90       ← compensates layout orientation (90° clockwise)
 ```
 
-#### `layoutRotate` 是什么，为什么单独一个参数
+#### What `layoutRotate` is, and why it is a separate parameter
 
-**2026-10-05 实机结论**：把「SparkMinds」横排在画布上，刻出来整版
-**逆时针歪了 90°**——方向本身是对的（没有镜像），只是整块版面转倒了。
-所以补偿值是**顺时针 90°**。
+**Real-machine finding, 2026-10-05**: with "SparkMinds" laid out horizontally on the canvas,
+the engraved output came out **rotated 90° counter-clockwise** — the directions were correct
+(no mirroring), the whole layout was simply lying on its side. The compensation is therefore
+**90° clockwise**.
 
-物理原因：机器的走纸轴（710mm）与刀头轴（600mm）在固件里是反的，
-而使用者是站在机器正前方按「左右 / 里外」描述版面的——
-两个参考系差一次 90° 旋转，净效果就是整版转倒。
+Physical cause: the machine's feed axis (710mm) and gantry axis (600mm) are transposed in
+the firmware, while the operator describes the layout standing in front of the machine in
+terms of "left/right" and "in/out". The two reference frames differ by one 90° rotation, and
+the net effect is that the whole layout lies down.
 
-> 🔴 **它和 `swapAxes` 是两件完全不同的事，别再混着调**
+> 🔴 **It is a completely different thing from `swapAxes` — do not tune one for the other**
 >
-> | 参数 | 管什么 | 填错的表现 |
+> | Parameter | Controls | Symptom when wrong |
 > |---|---|---|
-> | `swapAxes` | 图形是否**镜像** | 左右颠倒（一眼看出） |
-> | `axisX/axisY` | 每根轴**往哪边是正** | 单轴镜像 |
-> | `layoutRotate` | 整块版面**转多少度** | 整体躺倒 90°/180° |
+> | `swapAxes` | Whether the graphic is **mirrored** | Left-right flipped (obvious at a glance) |
+> | `axisX/axisY` | Which way is **positive** on each axis | Single-axis mirror |
+> | `layoutRotate` | How far the **whole layout is rotated** | Layout toppled 90°/180° |
 >
-> 历史上把前两者当成「版面朝向」来调，是本项目反复踩坑的根源。
-> 三个维度正交，可以任意组合；旋转只接受 90° 的整数倍
-> （入口会归一化，传 37° 会被收敛成 0°）。
+> Historically, treating the first two as "layout orientation" was the root cause of
+> repeated misdiagnosis in this project. The three dimensions are orthogonal and combine
+> freely; rotation only accepts multiples of 90° (normalised at the entry point, so 37°
+> collapses to 0°).
 
-> ⚠️ **改预设默认值时，必须同时检查板子上 `data/config.json` 里的历史值。**
-> `config` 优先级高于预设，旧值会**静默覆盖**新预设——
-> 表现是「改了代码没效果」，很容易误判成机器有问题。踩过一次。
+### Confirmed firmware behaviours
 
-### 实机确认的固件行为
+These were all learned the hard way; recorded here so nobody repeats the experiments.
 
-这几条都是踩过才知道的，写在这里省得重复试：
-
-| 行为 | 说明 |
+| Behaviour | Explanation |
 |---|---|
-| **必须先发 `IN;`** | 冷启动后固件处于未初始化状态，没有 `IN;` 会**静默忽略所有运动指令**。串口写入成功、任务显示「完成」，但机器纹丝不动——表现和「串口坏了」完全一样 |
-| **不支持反向 SC** | `SC23622,0,...`（Xmin>Xmax）会让固件算出负缩放系数，整机失控（Y 轴飞转、X 轴狂奔）。SC 必须恒正序 |
-| **`!PG;` 不回执完成** | 机械归位没有完成信号，串口又是流式的。上位机必须自己等（约 3 秒），否则新坐标会在归位途中生效 |
-| **手动操作必须无条件抬刀** | 软件对刀状态的认知可能与机器真实状态不符（任务中断/串口重连后）。安全操作要无条件发 `PU;`，不能省 |
+| **`IN;` must be sent first** | After cold start the firmware is uninitialised and **silently ignores all motion commands** without `IN;`. Serial writes succeed and the job shows "complete", but the machine does not move — indistinguishable from a dead serial port |
+| **Reverse `SC` is not supported** | `SC23622,0,...` (Xmin > Xmax) makes the firmware compute a **negative scale factor**, sending the whole machine into a runaway (Y spinning, X fleeing). `SC` must always be in ascending order |
+| **`!PG;` gives no completion signal** | Mechanical homing has no done signal and the serial stream does not wait. The host must wait itself (~3s), or the new coordinates take effect mid-homing |
+| **Manual operations must lift the pen unconditionally** | The software's notion of pen state can diverge from the machine's (after an aborted job or a reconnect). Safety operations must send `PU;` regardless |
 
-### 安全设计
+### Safety design
 
-几条「宁可多等、不可撞机」的处理：
+Deliberately biased towards "wait longer rather than crash":
 
-- **任务开头先归位**：第一条 `PA` 是绝对定位，而机器开刀前停在哪是不确定的。
-  从未知位置跳到图形起点会一路撞限位，所以强制先 `!PG;` 再定位（`homeFirst:false` 可关）
-- **进给限速 + 急停**：所有手动动作都走任务队列，不绕过限速；急停只发 `PU;`，**不发任何移动指令**
-- **SC 恒正序**：方向设错最坏是图形镜像，不会让固件进入负缩放
-- **单次位移上限 200mm**，防止手滑
-- **诊断用相对移动**：5mm、抬刀、来回一次，未归位也能安全测试
-- **退出前抬刀**：服务重启/崩溃时不把压刀状态留给控制板
+- **No homing at job start**: the first `PA` is absolute positioning, and where the head sits
+  before cutting is unknown. Jumping from an unknown position to the start of the artwork
+  drives straight into the limit switch.
+- **Rate limiting + e-stop**: all manual actions go through the job queue and never bypass
+  rate limiting; e-stop sends only `PU;` and **no motion command at all**
+- **`SC` always ascending**: a wrong direction setting can at worst mirror the graphic, it
+  can never drive the firmware into a negative scale
+- **200mm cap per manual move**, so a slip of the hand cannot run away
+- **Relative moves for diagnostics**: 5mm, pen up, out and back — safe even when not homed
+- **Pen lifted on exit**: a service restart or crash does not leave the head pressing on
+  the control board
 
-### 串口自动重连
+### Serial auto-reconnect
 
-服务启动时会**自动接回串口**，并每 3 秒重试一次。USB 重新插拔导致设备节点变化
-（`ttyACM0` → `ttyACM1`）也能恢复。
+The service **reconnects the serial port automatically** on startup and retries every 3
+seconds, so a USB re-plug that changes the device node (`ttyACM0` → `ttyACM1`) recovers on
+its own.
 
-> 之前没有这层逻辑时，每次服务重启机器都会「失联」，
-> 界面上的手动按钮全部置灰，看起来像机器坏了——这是最容易误判的地方。
+> Without this layer, every service restart left the machine "disconnected" and greyed out
+> every manual button — which reads as a broken machine. That is the single most
+> misdiagnosed failure mode in this project.
 
 ---
 
-## 功能
+## Features
 
-### 导入与编辑
+### Import and edit
 
-- **导入 DXF / SVG / HP-GL**，也能直接粘贴 HP-GL 指令
-- **画布上直接编辑**：选中图形后拖动移动、拖四角缩放、拖顶部圆点旋转
-  （Shift 锁比例 / 吸 15°）
-- **数值精确调整**：X / Y / 宽 / 高 / 角度，支持宽高比锁定、六向对齐、翻转、复制
-- **快速文字**：内置单线字体（Stroker），专为刻字设计——普通字体转轮廓后在
-  3mm 亚克力上会糊成一团，单线字才能刻清楚
-- 6 种材料预设（象牙卡纸 / PVC 发泡板 / 亚克力 / 不干胶 / KT 板烫金 / 薄纸），
-  各自带速度和刀压
+- **Import DXF / SVG / HP-GL**, or paste HP-GL commands directly
+- **Direct canvas editing**: drag to move, drag a corner to scale, drag the top handle to
+  rotate (Shift locks ratio / snaps to 15°)
+- **Precise numeric control**: X / Y / width / height / angle, with aspect lock,
+  six-way alignment, flip, duplicate
+- **Quick text**: a built-in single-stroke font (Stroker) designed for engraving — ordinary
+  fonts turned into outlines blob together on 3mm acrylic, single-stroke letters stay legible
+- 6 material presets (ivory board / PVC foam / acrylic / vinyl / KT board + foil / thin paper),
+  each with its own speed and force
 
-### 手动控制
+### Manual control
 
-面板式控制，对应 Ucancam / 文泰的基本操作：
+A pad mirroring the basic operations of Ucancam / 文泰:
 
-- **方向键十字**（▲◀●▶▼），步长 0.1 / 1 / 5 / 10 / 25 / 50 mm
-  - 按住连续移动，Shift 反向，桌面端也支持键盘方向键
-- **抬刀 / 落刀 / 回原点 / 设原点 / 进纸 / 出纸 / 抬刀回位**
-- 单次位移上限 200mm，防止手滑
-- **串口自动重连**：服务重启后自动接回，USB 重新插拔也能恢复，
-  不需要用户手动点「连接设备」
+- **Direction pad** (▲◀●▶▼), step 0.1 / 1 / 5 / 10 / 25 / 50 mm
+  - press-and-hold to move continuously, Shift to reverse; arrow keys work on desktop
+- **Pen up / pen down / home / set origin / feed / eject / pen-up-and-home**
+- 200mm cap per move, so a slip of the hand cannot run away
+- **Serial auto-reconnect**: reconnecting after a service restart, and recovering from a
+  USB re-plug, with no need to press "Connect" by hand
 
-所有手动动作都走任务队列，**不绕过限速与急停**。
-手动方向按**画布视角**发送（按「右」= 刀头往右），与机器内部的轴编号解耦——
-所以即使这台机器的物理 X/Y 是接反的，操作直觉依然正确。
+All manual actions go through the job queue and **never bypass rate limiting or e-stop**.
+Manual directions are sent in **canvas orientation** (pressing "right" moves the head
+right), decoupled from the machine's internal axis numbering — so the operating intuition
+stays correct even when the physical X/Y are transposed.
 
-### 输出控制
+### Output control
 
-- 任务队列 + 实时进度（按行）
-- 暂停 / 继续 / 停止 / 急停
-- 输出中可实时看到刀路预览
+- Job queue with live per-line progress
+- Pause / resume / stop / e-stop
+- Live toolpath preview during output
 
 ---
 
-## 资源占用
+## Resource usage
 
-以下是在 **RK3399 / Armbian（4GB + 15GB eMMC）** 上实测的数字，不是估算。
+Measured on an **RK3399 / Armbian (4GB RAM + 15GB eMMC)** — real numbers, not estimates.
 
-### 磁盘
+### Disk
 
-| 项 | 实测 |
+| Item | Measured |
 |---|---|
-| 部署目录总计 | **400 KB** |
+| Total deployment | **400 KB** |
 | ├ `server/` | 232 KB |
 | ├ `web/` | 152 KB |
-| ├ `data/`（配置） | 8 KB |
+| ├ `data/` (config) | 8 KB |
 | └ `package.json` | 4 KB |
-| 依赖 | **0**（零 npm 依赖，不需要 `npm install`） |
+| Dependencies | **0** (no npm deps, no `npm install`) |
 
-400KB 是本项目「拷贝即用」设计的直接结果：不用 `serialport`（带 C++ 扩展），
-串口走 `stty` + 文件描述符，HTTP 走 `node:http`，WebSocket 自行实现最小版。
+400KB is a direct consequence of the "copy and run" design: no `serialport` (C++ extensions),
+serial via `stty` + file descriptors, HTTP via `node:http`, hand-rolled minimal WebSocket.
 
-`data/config.json` 会随保存配置缓慢增长，但只有配置项，量级在 KB。
+`data/config.json` grows slowly as settings are saved, but it only holds config — order of
+magnitude, kilobytes.
 
-### 内存
+### Memory
 
-| 状态 | 实测 RSS |
+| State | Measured RSS |
 |---|---|
-| 空闲常驻 | **约 43 MB** |
-| 单任务峰值 | 随图形复杂度上升，见下 |
+| Idle resident | **~43 MB** |
+| Single job peak | Scales with artwork complexity, see below |
 
-43MB 主要是 Node 运行时本身（V8 堆 + 内部），**不是本项目的数据**。
+43MB is mostly the Node runtime itself (V8 heap + internals), **not this project's data**.
 
-任务期的增量取决于图形复杂度，实测（5000 段线，76KB 指令）：
+Per-job overhead depends on complexity. Measured (5000 segments, 76KB of commands):
 
 ```
-指令全文 text      75 KB
-lines 数组开销     约 450 KB   ← 每行一个字符串，JS 字符串对象有额外开销
+command text          75 KB
+lines array overhead  ~450 KB   ← one string per line; JS string objects carry overhead
 ```
 
-**已经在做的一处优化**：任务历史保留 50 条，早期实现把每条的 `text` + `lines`
-整份留着，几十 MB 常驻、跑几天只涨不降。现在入历史时剥掉重字段，
-只留名字/状态/进度/字节数，界面照常显示。
+**Optimisation already in place**: job history keeps 50 entries. The early implementation
+retained the full `text` + `lines` for each, which meant tens of MB resident, growing
+monotonically over days. History entries now drop the heavy fields and keep only
+name/status/progress/byte count; the UI is unaffected.
 
 ### CPU
 
-| 状态 | 实测 |
+| State | Measured |
 |---|---|
-| 空闲 | **< 1%**（load average 约 0.05） |
-| 输出中 | 约 1-3% |
+| Idle | **< 1%** (load average ~0.05) |
+| Outputting | ~1-3% |
 
-**CPU 占用极低是串口波特率决定的**：9600 波特 = 960 字节/秒上限。
-一份 76KB 的指令光传输就要 91 秒，机器走得比数据慢得多。
-所以 CPU 瓶颈从来不在这里，而在机器的机械速度。
+**The tiny CPU footprint is dictated by the serial baud rate**: 9600 baud = 960 bytes/second
+ceiling. Shipping 76KB of commands takes 91 seconds of transfer alone; the machine moves far
+slower than the data. The CPU was never the bottleneck — the mechanics are.
 
-> 这也解释了为什么 `jobEngine` 要按字节数算延时、逐行喂：
-> 不是为了省 CPU，是为了**别把控制板的数据缓冲冲垮**。
+> This is also why `jobEngine` throttles by byte count and feeds line by line:
+> not to save CPU, but to avoid **overrunning the controller's data buffer**.
 
-### 温度与稳定性
+### Temperature and stability
 
-实测 CPU 温度 **45°C**（空闲），RK3399 是被动散热，这个温度很安全。
-服务 `Restart=always`，崩溃会自动拉起；实测 `NRestarts=0`（稳定运行无重启）。
+Measured CPU temperature **45°C** idle. The RK3399 is passively cooled, so this is very safe.
+The service runs with `Restart=always`; measured `NRestarts=0` over extended operation.
 
-### 一句话总结
+### In one sentence
 
-一台 RK3399 用 400KB 硬盘、43MB 内存、<1% CPU 就够了。
-**瓶颈 100% 在刻字机机械本身**，不在这个服务。
+An RK3399 needs 400KB of disk, 43MB of RAM and <1% CPU to run this.
+**The bottleneck is 100% the engraving mechanics**, not this service.
 
 ---
 
-## 精度
+## Accuracy
 
-自检里有一项是「HPGL 编译后再解析回几何」的往返一致性验证：
+The self-test includes an HPGL compile-then-reparse round-trip consistency check:
 
-| 指标 | 实测 | 说明 |
+| Metric | Measured | Meaning |
 |---|---|---|
-| 长度误差 | 0.0115% | 800mm 幅面上约 0.08mm |
-| 包围盒误差 | 0.0003% | |
+| Length error | 0.0115% | ≈ 0.08mm across an 800mm bed |
+| Bounding box error | 0.0003% | |
 
-对比力宇标称重复精度 0.127mm，**指令生成的误差比机器本身的精度低一个数量级**——
-说明瓶颈在机械，不在软件。
+Against Liyue's quoted 0.127mm repeatability, **the command generation error is an order of
+magnitude below the machine's own precision** — the mechanics are the limit, not the software.
 
 ---
 
-## 国际化
+## Internationalisation
 
-界面支持中英双语，点头栏的 `中 / EN` 按钮切换；首次访问按浏览器语言自动选择，
-选择结果记在 `localStorage`。
+The UI ships in Chinese and English. Switch with the `中 / EN` button in the top bar, or let
+it follow the browser language on first visit. The choice is remembered in `localStorage`.
 
-三类文案分别处理：
+How it is put together:
 
-| 来源 | 机制 |
+| Source | Mechanism |
 |---|---|
-| 静态 HTML | `data-i18n="key"`，属性用 `data-i18n-attr="placeholder:key,title:key"` |
-| 动态 JS | `t('key', { vars })` |
-| 服务端消息 | 两种语言一起下发，客户端挑（警告 `{zh, en}`、元信息 `{note, noteEn}`） |
+| Static HTML | `data-i18n="key"`, plus `data-i18n-attr="placeholder:key,title:key"` for attributes |
+| Dynamic JS | `t('key', { vars })` |
+| Server messages | Both languages are sent; the client picks (`{zh, en}` for warnings, `{note, noteEn}` for metadata) |
 
-三个刻意的设计取舍：
+Three deliberate design decisions:
 
-1. **不引第三方 i18n 库。** 前端是原生 ES module、零构建，
-   需要 `npm install` 的库会破坏「拷贝文件即部署」这个前提。
-2. **key 找不到时显示 key 本身**，而不是空白。
-   空白看起来像「界面坏了」，而 `some.missing.key` 一眼看得见——静默失败才最危险。
-3. **既有 API 字段保持中文语义。** `error` 仍是中文，英文挂在 `errorEn`；
-   `pushLog(line, en)` 的 `line` 仍是中文。
-   改动既有字段的含义，会让浏览器缓存里的旧前端显示空白。
+1. **No i18n library.** The front end is native ES modules with zero build. A library that
+   needs `npm install` would break the "copy files to deploy" property.
+2. **A missing key renders as the key itself**, not as blank. A blank looks like a broken UI;
+   `some.missing.key` is visible at a glance. Silently failing is the dangerous mode.
+3. **Existing API fields keep their Chinese meaning.** `error` still holds Chinese and `en`
+   is added alongside as `errorEn`; `pushLog(line, en)` still records Chinese in `line`.
+   Changing the meaning of an established field would blank out any older cached client.
 
 ```bash
 node tools/i18n-check.js
 ```
 
-体检内容：每条文案中英是否都有、两侧占位符是否一致、HTML 与 JS 引用的 key 是否都存在、
-用户可见代码里是否残留未翻译的中文。它防的是最阴险的那类问题——
-**key 根本没翻译**：界面悄悄夹着中文，而语法、启动、点按钮所有检查都是绿的。
+This audits that every key exists in both languages, that placeholders match on both sides,
+that HTML and JS reference only real keys, and that no untranslated Chinese string remains
+in user-facing code. The risky failure mode it guards against is a key that was never
+translated: the UI quietly keeps Chinese while every other check stays green.
 
-自检里也断言了每条机型预设、材料预设、CAM 警告、手动控制 note 都带双语。
+The self-test also asserts that every machine preset, material preset, CAM warning and
+manual-control note carries both languages.
 
 ---
 
-## 项目结构
+## Project structure
 
 ```
 plotter-one/
 ├── server/
-│   ├── index.js              HTTP 路由 + WebSocket
-│   ├── selftest.js           217 项自检
-│   ├── geom/path.js          几何内核（路径/矩阵/变换）
+│   ├── index.js              HTTP routes + WebSocket
+│   ├── selftest.js           217 self-checks
+│   ├── geom/path.js          geometry kernel (paths / matrices / transforms)
 │   ├── cam/
-│   │   ├── toolpath.js       刀路计算（保弧离散）
-│   │   └── textToPath.js     单线字体转路径
+│   │   ├── toolpath.js       toolpath generation (arcs preserved, not flattened)
+│   │   └── textToPath.js     single-stroke font → paths
 │   ├── machine/
-│   │   ├── hpgl.js           HP-GL 生成 + 机型预设
-│   │   ├── transport.js      串口 / TCP / 虚拟机
-│   │   ├── jobEngine.js      任务队列与限速
-│   │   ├── manual.js         手动控制指令
-│   │   ├── calibrate.js      安全微动（诊断用）
-│   ├── import/               DXF / SVG / HPGL 解析
-│   └── api/httpKit.js        HTTP 工具 + WebSocket 实现
-├── web/                      前端（原生 ES module，无构建）
-│   ├── js/i18n.js            中英双语词典 + 切换
-│   ├── js/transform.js       图形变换
-│   ├── js/render.js          Canvas 渲染
-│   └── geom.js               几何内核副本（与 server 同步）
-├── tools/i18n-check.js       i18n 体检脚本
-├── deploy/                   安装 / 卸载 / 同步脚本
+│   │   ├── hpgl.js           HP-GL generation + machine presets
+│   │   ├── transport.js      serial / TCP / virtual plotter
+│   │   ├── jobEngine.js      job queue + rate limiting
+│   │   ├── manual.js         manual control commands
+│   │   └── calibrate.js      safe micro-move helper (diagnostics)
+│   ├── import/               DXF / SVG / HPGL parsers
+│   └── api/httpKit.js        HTTP helpers + WebSocket implementation
+├── web/                      front end (native ES modules, no build)
+│   ├── js/i18n.js            bilingual dictionary + switcher
+│   ├── js/transform.js       geometry transforms
+│   ├── js/render.js          canvas rendering
+│   └── geom.js               geometry kernel copy (synced from server)
+├── tools/i18n-check.js       i18n audit
+├── deploy/                   install / uninstall / sync scripts
 └── docs/
     ├── 设计工作流.md
     └── 部署指南.md
 ```
 
-`web/geom.js` 是 `server/geom/path.js` 的副本，由 `deploy/sync-geom.sh` 同步。
-**必须共用同一份几何**，否则会出现「屏上在这里、刻出来在那里」。
+`web/geom.js` is a copy of `server/geom/path.js`, kept in sync by `deploy/sync-geom.sh`.
+**Sharing one geometry kernel is mandatory** — otherwise you get "on screen here, engraved
+over there".
 
 ---
 
-## 开发
+## Development
 
 ```bash
-npm run selftest     # 217 项自检，不需要接机器
-node tools/i18n-check.js   # i18n 体检
-npm start            # 默认 8080 端口
+npm run selftest         # 217 self-checks, no machine required
+node tools/i18n-check.js # i18n audit
+npm start                # default port 8080
 npm start -- --port 9000
 ```
 
-**改动 `server/geom/path.js` 后要同步到 web**：
+**After editing `server/geom/path.js`, sync it to the web side**:
 
 ```bash
 ./deploy/sync-geom.sh
 ```
 
-自检覆盖：几何不变量、HPGL 往返一致性、任务引擎状态机、
-坐标轴镜像生成、版面旋转、机型幅面、串口写入路径、服务端双语完整性。
+Self-test coverage: geometry invariants, HPGL round-trip consistency, job engine state
+machine, mirrored-axis generation, machine bed sizes, serial write paths, bilingual messages.
 
 ---
 
-## 踩过的坑
+## Bugs that only real hardware reveals
 
-这个项目里有几个 bug 靠读代码发现不了，只有真跑起来才会暴露。记在这里省得别人重踩。
+A few bugs here cannot be found by reading the code. Recorded so others do not repeat them.
 
-1. **画布 X 坐标公式漏了「视口中心」** → 整个画面左右镜像
-   （"SPARKMINDS" 显示成 "SPAPXIWS"，而对称的方框完全看不出异常）
+1. **Canvas X formula omitted the "viewport centre"** → the whole view was mirrored.
+   ("SPARKMINDS" rendered as "SPAPXIWS", while a symmetric box showed nothing wrong.)
 
-2. **`SerialTransport.write` 写成 `const { write } = await import('node:fs/promises')`**
-   → `node:fs/promises` 没有 `write` 导出（只有 `open`），解构出 `undefined`，
-   调用即报 `write is not a function`。连接是成功的，所以表现成
-   「显示已连接、一开始刻就失败」，很像连接问题。
-   自检当时只测了虚拟机的 `write`，真实串口路径一次都没覆盖过。
+2. **`SerialTransport.write` written as `const { write } = await import('node:fs/promises')`**
+   → `node:fs/promises` has no `write` export (only `open`), so this destructured to
+   `undefined` and threw `write is not a function`. The connection had succeeded, so it
+   presented as "shows connected, fails on the first cut" — very much like a connection
+   problem. The self-test only covered the virtual plotter's `write`; the real serial path
+   was never exercised.
 
-3. **坐标轴方向不能假定** → 见上文「坐标轴方向必须先校准」。
-   这是撞机级的问题。
+3. **Axis direction must never be assumed** → crash-class bug. See the layout notes above.
 
-4. **镜像不能靠反向 SC**（2026-10-04 实机踩到，症状极具误导性）
-   → 表现为「点回原点，Y 轴疯狂转动，X 轴往反方向走」，
-   看起来像 X/Y 装反了，实际是发了 `SC23622,0,...` 让固件算出**负缩放系数**。
-   HP-GL 规范允许 `Xmin > Xmax` 表达镜像，但力宇固件不支持。
-   正确做法：SC 恒正序，镜像在上位机 `toMachine()` 里做。
-   **教训**：机器出现「疯转」时，先怀疑自己下发的参数是否合法，
-   而不是先怀疑轴接反了。
+4. **Mirroring cannot be done with reverse `SC`** (hit on real hardware, 2026-10-04)
+   → presented as "press Home, Y spins wildly, X runs backwards", which looks like X/Y
+   transposed, but was actually `SC23622,0,...` giving the firmware a **negative scale
+   factor**. The HP-GL spec permits `Xmin > Xmax` for mirroring; the Liyue firmware does
+   not. Correct approach: `SC` always ascending, mirroring done host-side in `toMachine()`.
+   **Lesson**: when the machine goes wild, first suspect the parameters you sent, not
+   transposed axes.
 
-4b. **「接反」和「方向相反」必须分开处理**（2026-10-04 实机踩到）
-   → 这台机器物理 X/Y 接反（刀头是固件 Y、走纸是固件 X），
-   而「原点在右手边」是**方向**问题。两者正交，要分别设。
-   最容易错的是：**交换之后不能沿用交换前的 axisX/axisY**——
-   同一个物理事实（刀头归位在右）在交换后要落在另一根轴上。
-   我就犯了这个错：把 `axisX=-1` 留着不动，实际该是 `axisY=-1`。
-   → 改 swapAxes 时必须重新推导两个方向的归属。
+4b. **"Transposed" and "reversed" must be handled separately** (real hardware, 2026-10-04)
+   → this machine has physical X/Y transposed (the gantry is firmware Y, the feed is
+   firmware X), while "origin on the right-hand side" is a **direction** issue. The two are
+   orthogonal and must be set separately. The easiest mistake: **you cannot carry
+   `axisX/axisY` over unchanged after enabling the swap** — the same physical fact (gantry
+   homes to the right) lands on the other axis afterwards. I made exactly this error:
+   leaving `axisX=-1` in place when it should have been `axisY=-1`.
+   → Re-derive which axis owns which direction whenever you change `swapAxes`.
 
-4c. **交换轴后 SC 幅面上界必须跟着换**
-   → 交换前机器 X 走 600mm，交换后走 710mm。写死 `preset.width`
-   会让机器按错误跨度换算坐标，整体缩放，且因为不崩不卡，表现极难察觉。
-   统一走 `machineSpanX` / `machineSpanY`。
+4c. **The bed bound must be swapped too when axes are swapped**
+   → before the swap, machine X travels 600mm; after, it travels 710mm. Hard-coding
+   `preset.width` makes the machine scale coordinates against the wrong span — and because
+   nothing crashes, it is extremely hard to notice. Always go through
+   `machineSpanX` / `machineSpanY`.
 
-4d. **校准向导在交换模式下要写回正确的轴**
-   → 界面问的是「刀头往右走了吗」（用户视角的 X），
-   但交换后驱动刀头的是机器 Y。答「不是」时若按 dir 猜轴，会翻错那根轴。
-   映射必须跟着 swap 状态走。
+5. **Omitting `IN;` disables the entire machine** (real hardware, 2026-10-04 — my fault)
+   → while fixing axis direction I deleted `IN;` as "redundant state reset", and then no
+   button did anything. The Liyue firmware ignores all motion commands when uninitialised.
+   Serial writes succeed and the job shows "complete", but the machine does not move —
+   identical to a dead serial port. The safe combination is: keep `IN;`; the only dangerous
+   thing is reverse `SC`.
+   **Lesson**: **the assertions themselves can be wrong.** The "must not contain IN" check
+   was protecting this very bug, so deleting `IN;` still passed everything green.
+   **Assertions passing ≠ the machine moving.**
 
-5. **漏发 `IN;` 会让整台机器失灵**（2026-10-04 实机，我造成的）
-   → 修坐标轴时把 `IN;` 当成「多余的状态重置」删掉，结果点任何按钮都没反应。
-   力宇固件冷启动后处于未初始化状态，**没有 `IN;` 就静默忽略所有运动指令**。
-   串口写入成功、任务显示「完成」，但机器不动——表现和「串口坏了」一模一样。
-   安全的做法是：`IN;` 保留，危险的只有反向 SC。
-   **教训**：自检断言本身也可能是错的。那条「不含 IN」的断言把这个 bug
-   当成正确行为保护着，所以删掉还能全绿。**断言通过 ≠ 机器能动。**
+6. **`PR;` + `PA dx,dy;` is an absolute move, not relative**
+   → in HP-GL, `PR;` only switches mode; the following `PA x,y` means "switch back to
+   absolute and move to (x,y)". The original manual jog was written as `PR;` + `PA197,0;`,
+   which on a mirrored machine became a dash toward the origin. Relative moves must be
+   written `PR dx,dy;`.
 
-6. **`PR;` + `PA dx,dy;` 是绝对移动，不是相对移动**
-   → HP-GL 里 `PR;` 只切模式不带坐标，随后的 `PA x,y` 是「切回绝对并移到 (x,y)」。
-   原代码手动 jog 写成 `PR;` + `PA197,0;`，在镜像机器上表现为一记朝原点的冲刺。
-   相对移动必须写 `PR dx,dy;`。
+7. **`PA0,0;` really does move to (0,0)** → to just "switch back to absolute mode", write
+   `PA;` (no coordinates). The original code sent `PU;PA0,0;` on every direction-key press,
+   so the head was yanked back to the origin every time. The same mistake in **e-stop** is
+   worse: it meant commanding the machine to move during an emergency stop. E-stop now
+   sends only `PU;`.
 
-7. **`PA0,0;` 会真的移动到 (0,0)** → 收尾想「切回绝对模式」应该写 `PA;`（不带坐标）。
-   原代码每点一次方向键都发 `PU;PA0,0;`，于是刀头每次都被拽回原点。
-   同样的错在**急停**里更危险：急停发了 `PU;PA0,0;`，等于急停时还命令机器动一下。
-   现在急停只发 `PU;`。
+8. **Pen-down test must not use `lineTo(2,0)`** → that is an **absolute** move to (2,0).
+   With the pen down it drives diagonally across the work and scores a line through the
+   finished piece. The test press must be a relative 2mm move.
 
-7. **落刀试压不能用 `lineTo(2,0)`** → 那是**绝对**移动到 (2,0)。
-   落刀状态下从当前位置直插材料左下角，等于在成品上划一道对角线。
-   试压必须是相对移动 2mm。
+9. **Feed must travel along the feed axis**, which is not "X" by default → the original
+   `feed` was `moveTo(d, 0)` (an absolute move to (d,0)), so "feed 50mm" actually moved the
+   head sideways. Which axis feeds is hardware-determined; feeding goes through
+   `relative(0, d)` and lets `toMachineDelta` do the conversion — never hard-code
+   "feed = absolute coordinate on some axis" at the command level.
 
-8. **进纸要沿走纸轴，不是想当然的 X** → 原 `feed` 写的是 `moveTo(d, 0)`（绝对移动到 (d,0)），
-   名为「进纸 50mm」实际是把刀头横移到画面某处。
-   走纸轴是哪根由硬件决定：交换前是机器 Y，**这台机器交换后是机器 X**。
-   所以进纸统一走 `relative(0, d)`，让 `toMachineDelta` 去换算——
-   在指令层不要写死「进纸 = 某个轴的绝对坐标」。
+10. **Reflection flips arc winding** → X mirror `x → w-x` and axis swap `x,y→y,x` are both
+    reflections (det = -1), turning a counter-clockwise arc in user coordinates into a
+    clockwise one — but HP-GL's `AA` only goes counter-clockwise. Conversion: a clockwise
+    `s` sweep ≡ a counter-clockwise `(360-s)` sweep. **The start angle must be mirrored
+    too** (X mirror: a0 → 180-a0), or the firmware draws a straight line from the current
+    position to the computed arc start, cutting a line that was never in the design. In the
+    implementation the start angle is back-solved from the current position and the mapped
+    centre rather than computed by hand. A full 360° must not be converted to 0 (that
+    degenerates to a zero-length arc). An even number of reflections (swap + single-axis
+    flip = 180° rotation) preserves winding — use the `isReflection` getter rather than
+    counting by hand at each site.
 
-9. **回原点不带 SC，但要带 `IN;`** → `!PG` 是机械归位，不经过坐标换算，
-   对轴向设置免疫，所以**不该发 SC**（别把人为坐标系掺进物理归位）。
-   但 `IN;` 必须有——见上面第 5 条，两者不是一回事。
+11. **Diagnostics must use relative moves** → the original routine moved to the material
+    centre with `PA cx,cy` first; on a machine that was not homed, or with wrong coordinates,
+    that single command was a sprint across the entire workbench. Relative moves are
+    anchored to the current position regardless of homing state, so they are **safe to test
+    before homing**.
 
-9b. **严禁发 `SC` 缩放指令，且刻绘开头绝不能发 `!PG;`（2026-10-05 彻底修复）**
-   → 症状：点「开始刻绘」后，刀头（X轴）朝远离原点方向狂奔，走纸（Y轴）没有任何反应。
-   两层根因共同造成：
-   1. **`SC` 缩放指令杀死了 Y 轴**：HP-GL 的 `SC` 计算缩放系数为 $(P2_y - P1_y) / (Y_{max} - Y_{min})$。卷筒刻字机 Y 轴为连续滚筒，硬件根本没有固定 $P2_y$（固件内为 0）。下发 `SC` 会直接将 Y 轴缩放比例算为 0，导致固件忽略所有 Y 轴步进，走纸完全不动；
-   2. **开头下发 `!PG;` 毁坏了对刀原点**：`!PG;` 是机械限位搜索（只有导轨 X 轴有物理限位开关，走纸滚筒无开关）。刻字机以操作者在材料上手动定位按【原点】为局部 $(0,0)$。开头下发 `!PG;` 会命令刀头横跨整机一路向右狂奔去撞机械限位，抛弃对刀原点，而走纸 Y 轴不动。
-   3. **彻底修复**：
-      - 彻底移除 `SC` 指令，上位机直出高精度脉冲整数步进；
-      - 任务开头默认不发 `!PG;`，从对刀原点安全切入；
-      - 任务结尾抬刀返回 `PA0,0;`；
-      - 恢复标准轴向配置 `swapAxes = false, axisX = 1, axisY = 1`。
+12. **`/api/compile` once failed to pass the axis config through** → the on-screen axis
+    controls had no effect on the output at all, so changing them looked like a no-op and
+    invited misdiagnosis of the machine itself. Every generation entry point now goes
+    through a single config function.
 
-9c. **归位后必须等机器到位，不能凭空发明固件延时指令**
-   → `!PG;` 触发限位开关搜索，固件**不回执完成**；串口是流式的，发完就返回。
-   紧接着发 `PA` 会让新目标在归位途中生效，机器边归位边往新位置走，
-   表现同样是「刀头狂奔卡死」。
-   等待必须由上位机在指令之间插入（`jobEngine` 的 HOME_DWELL_MS = 3s）。
-   **不要发 `PG1;` 之类猜测的固件指令**——没有任何资料佐证力宇支持，
-   发出去只会被当未知指令丢掉，甚至更糟。
+13. **Do not use `PA0,0` for homing** → once `SC` is in effect, `PA0,0` only returns to P1,
+    which sits at the right end when X is reversed. Liyue's mechanical home is `!PG;`.
 
-9d. **`_sleep` 的两种语义不能共用一个上限**
-   → 轮询等待（暂停/停止检查）要短，200ms 上限是为响应性设的；
-   机器驻留（归位等待）要真的等够。
-   以前共用 `Math.min(ms, 200)`，传 3000 也只睡 200ms，归位等待形同虚设，
-   而且**不报错**，只是「偶尔撞机」，极难察觉。
+14. **`reverseSubpath` flattened arcs** → a single `AA` ballooned into hundreds of `PA`, and
+    the discretisation error shortened rounded rectangles by 8% (seen as "cut short").
 
-9e. **前端预览崩溃：变量越界 + 空子路径**
-   → `render.js` 的 `startAnim` 里有一行 `if (i < pts.length) {}`，
-   而 `i` 是内层 `for (let i = ...)` 的循环变量，在外层引用 → `i is not defined`。
-   那行本就是无意义的死代码，删掉即可。
-   同时补空子路径守卫：`pts.length < 2` 时 `pts[pts.length-1]` 是 `undefined`，
-   后面算距离得到 NaN，会污染动画总长与进度。
-   **教训**：前端 JS 不在自检覆盖范围内，`node --check` 只查语法不查作用域，
-   这类错误只能靠实机点按钮发现。
+15. **Static asset caching** → changed code still ran the old logic in the browser, making
+    "I changed the code and nothing happened" very hard to debug. Now uses ETag +
+    `no-cache` conditional requests.
 
-9f. **任务历史不要留全量指令**
-   → 历史保留 50 条，若每条都带 `text` + `lines`，
-   几百行的任务累积就是几十 MB 常驻，服务跑几天内存只涨不降。
-   入历史时剥掉重字段，只留界面要用的名字/状态/进度/字节数。
-   注意 `list()` 曾读 `j.lines.length` / `j.text.length`，
-   剥字段后必须同步改并给 undefined 兜底，否则界面整个刷不出来。
+16. **Module scripts run before DOMContentLoaded** → `getBoundingClientRect()` returns 0
+    and the canvas size cannot be computed.
 
-10. **反射会翻转圆弧绕向** → X 镜像 `x → w-x` 与轴交换 `x,y→y,x` 都是反射（det = -1），
-    会把用户坐标里逆时针的弧变成机器坐标里顺时针的弧，而 HP-GL 的 `AA` 只能逆时针。
-    换算：顺时针 s 段 ≡ 逆时针 (360-s) 段。**且起点角也要镜像**
-    （X 镜像 a0 → 180-a0），否则固件会从当前位置直线拉到算出来的圆弧起点，
-    凭空多刻一条线。实现上起点角直接由当前点与映射后圆心反解，不手算。
-    整圆的 360° 不能被换算成 0（会退化成零长度弧）。
-    反射次数为偶数（如换轴 + 单轴反向 = 旋转 180°）时绕向不变——
-    用 `isReflection` 统一判定，别在各处手数。
+17. **Single-stroke font metrics** → glyphs actually occupy 4×6 font units, not 6×8.
+    Scaling by the wrong size made text 40% too short and a line 80mm wide.
 
-11. **校准指令必须用相对移动** → 原校准先 `PA cx,cy` 走到材料中心，
-    在未归位或坐标系不对的机器上，这一发就是横跨整个工作台的冲刺。
-    相对移动以当前位置为基准，与归位状态无关，**未归位也能安全测试**。
+18. **A stale `config.json` silently overrides presets** → a preset default was changed, but
+    the board's `data/config.json` still held a value saved by an earlier calibration, which
+    takes priority. The new preset was silently ignored — "changed the code, no effect" —
+    and the first instinct is to suspect the machine or firmware. The UI no longer exposes
+    these settings, and `config` is no longer consulted for them.
 
-12. **`/api/compile` 曾漏传轴向配置** → 界面上的「坐标轴方向」下拉框对实际输出毫无作用，
-    改完看着没变化，很容易误判成「机器有问题」。所有生成入口统一走 `axisOptions()`
-    （含 swapAxes）。
+19. **Layout rotation, mirror, and axis direction are three different things** → this is the
+    one that cost the most time. Symptoms looked identical ("the output is wrong") but the
+    causes and fixes were unrelated, and tuning the wrong one made things worse. See the
+    table above.
 
-13. **回原点不能用 `PA0,0`** → SC 生效后 `PA0,0` 只回到 P1，
-    P1 反向后就在右端了。力宇的机械归位指令是 `!PG;`。
+20. **Never infer state by comparing button text** → the pause handler read
+    `$('btnPause').textContent === '暂停'`. After internationalisation that test is always
+    false in the English UI and the pause button silently stops working. Button labels
+    change with the language; the predicate must read `state.jobState`.
 
-14. **`reverseSubpath` 把圆弧离散了** → 一条 AA 膨胀成上百个 PA，
-    且离散误差让圆角矩形长度偏 8%（表现为「刻短了」）。
+21. **A local variable can shadow the module-level `t`** → the translation lookup is `t`,
+    but `logLine` already had `const t = <timestamp>`. After shadowing, `logLine` can no
+    longer reach the lookup function — and it **throws no error**, it just fails to
+    translate that one string. The same happened with `const t = $('connType').value` in the
+    connection-type handler. This class of bug is *introduced by the change you are making*,
+    not pre-existing, which is exactly why it is easy to miss.
 
-15. **静态资源缓存** → 改了代码浏览器仍跑旧逻辑，「代码改了没效果」极难排查。
-    已改为 ETag + `no-cache` 条件请求。
+22. **`duplicateLayer` in `transform.js` should not append its own "copy" suffix** → the
+    layer name is shown to the user, so it is a language concern. Hard-coding it leaks
+    Chinese into the English UI. It now only duplicates; the caller names the result in the
+    current language.
 
-16. **模块脚本在 DOMContentLoaded 前执行** → `getBoundingClientRect()` 返回 0，
-    画布尺寸算不出来。
-
-17. **单线字体度量** → 字形实际占 4×6 个字体单位而非 6×8，
-    按错误尺寸缩放会让字高小 40%、一行字宽 80mm。
-
-18. **config 里的旧值会静默覆盖预设** → 改了预设默认值，但板子 `data/config.json` 里
-    还存着上一轮校准保存的值，优先级更高，新预设被无声吃掉——
-    表现是「改了代码没效果」，第一反应会怀疑机器或固件。
-    界面既然不再暴露这些设置，`config` 也就彻底不读它们了。
-
-19. **版面旋转、镜像、轴方向是三件事** → 这条最耗时间。
-    症状看起来一样（「出来的结果不对」），但成因和修法完全不同，
-    调错一个还会让情况更糟。见上方那张对照表。
-
-20. **判状态不能拿按钮文案比** → 暂停按钮原文是 `$('btnPause').textContent === '暂停'`，
-    国际化后英文界面下这个判断永远为假，「暂停」按钮会失灵。
-    按钮文案随语言变，判据必须用 `state.jobState`。
-
-21. **局部变量遮蔽模块顶层的 `t`** → 提取词函数叫 `t`，而 `logLine` 里原本有个
-    `const t = 时间戳`。遮蔽后 `logLine` 内部再也调不到取词函数——
-    且**不报错**，只是那一处的文案永远取不到词。
-    同理 `connType` 的 change 回调里原本是 `const t = $('connType').value`。
-    「加个翻译」时最容易踩，因为这属于**改动引入的新 bug**而非原有 bug。
-
-22. **`transform.js` 的 `duplicateLayer` 不该自己拼「副本」后缀** → 它返回的图层名是要显示
-    给用户看的，属于语言问题。写死后英文界面会露出中文图层名。
-    改成只复制，命名权交给调用方按当前语言起。
+23. **JS-generated `<option>` elements are invisible to `data-i18n`** → the "no serial port
+    found" placeholder is written by `scanPorts()` and carries no `data-i18n` attribute, so
+    switching language left it stranded in the previous language while the rest of the UI
+    translated. Fixed by tagging the placeholder with `data-i18n`. Real port names
+    (`/dev/ttyACM0`) have no prose and need no translation.
 
 ---
 

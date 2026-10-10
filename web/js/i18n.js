@@ -654,8 +654,19 @@ export function initLang() {
   let saved = null;
   try { saved = localStorage.getItem(STORAGE_KEY); } catch { /* 忽略 */ }
   if (saved !== 'zh' && saved !== 'en') {
-    const nav = (navigator.language || 'zh-CN').toLowerCase();
-    saved = nav.startsWith('zh') ? 'zh' : 'en';
+    // 用户没手动选过时，按系统/浏览器语言自动选。
+    // 用 navigator.languages（用户完整的偏好排序）而不是只看主语言，
+    // 这样「系统语言是英语」一定能命中英文；中文偏好排在前面才落中文。
+    const prefs = (navigator.languages && navigator.languages.length)
+      ? navigator.languages
+      : [navigator.language || 'zh-CN'];
+    let match = null;
+    for (const l of prefs) {
+      const low = String(l).toLowerCase();
+      if (low.startsWith('zh')) { match = 'zh'; break; }
+      if (low.startsWith('en')) { match = 'en'; break; }
+    }
+    saved = match || 'en';
   }
   setLang(saved, false);
   return current;
