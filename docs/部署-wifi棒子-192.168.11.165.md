@@ -55,8 +55,9 @@ curl -s localhost/api/state        # 查状态
 改代码后重新部署（在项目目录执行）：
 
 ```bash
-tar czf /tmp/plotter-one.tar.gz \
-  --exclude='.git' --exclude='.workbuddy' --exclude='node_modules' \
+# ⚠️ macOS 的 tar 默认把 ._* 苹果双文件打进包，Linux 解压会炸。必须 COPYFILE_DISABLE=1 + --exclude='._*'
+COPYFILE_DISABLE=1 tar czf /tmp/plotter-one.tar.gz \
+  --exclude='._*' --exclude='.git' --exclude='.workbuddy' --exclude='node_modules' \
   --exclude='data/config.json' server web package.json
 
 scp /tmp/plotter-one.tar.gz root@192.168.11.165:/root/

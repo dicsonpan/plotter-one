@@ -132,11 +132,17 @@ if (typeof window !== 'undefined') {
 
   // ---------------------------------------------------------------- API
   async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      method: opts.method || 'GET',
-      headers: opts.body ? { 'Content-Type': 'application/json' } : {},
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-    });
+    let res;
+    try {
+      res = await fetch(path, {
+        method: opts.method || 'GET',
+        headers: opts.body ? { 'Content-Type': 'application/json' } : {},
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+    } catch (netErr) {
+      console.error(`[api] 网络请求失败 ${path}:`, netErr);
+      throw new Error(t('srv.networkError'));
+    }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       // 服务端把中文放在 error（既有契约）、英文挂在 errorEn。
@@ -1921,21 +1927,21 @@ if (typeof window !== 'undefined') {
     if (!layers || !layers.length) {
       return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 75" class="thumb-empty"><rect width="100" height="75" fill="#f1f5f9" rx="6"/><text x="50" y="42" text-anchor="middle" fill="#94a3b8" font-size="12">空</text></svg>';
     }
+
+    // 第一遍：计算整体包围盒与收集有效子路径
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    const pathsD = [];
+    const allSubs = [];
     for (const layer of layers) {
       if (layer.hidden) continue;
       for (const sub of (layer.subpaths || [])) {
         if (!sub.start) continue;
-        let d = `M ${sub.start.x.toFixed(1)} ${sub.start.y.toFixed(1)} `;
+        allSubs.push(sub);
         if (sub.start.x < minX) minX = sub.start.x;
         if (sub.start.y < minY) minY = sub.start.y;
         if (sub.start.x > maxX) maxX = sub.start.x;
         if (sub.start.y > maxY) maxY = sub.start.y;
-
         for (const el of (sub.elems || [])) {
           if (el.type === 'line') {
-            d += `L ${el.x2.toFixed(1)} ${el.y2.toFixed(1)} `;
             if (el.x2 < minX) minX = el.x2;
             if (el.y2 < minY) minY = el.y2;
             if (el.x2 > maxX) maxX = el.x2;
@@ -1944,29 +1950,79 @@ if (typeof window !== 'undefined') {
             const rad = (el.a1 * Math.PI) / 180;
             const ex = el.cx + el.r * Math.cos(rad);
             const ey = el.cy + el.r * Math.sin(rad);
-            const large = Math.abs(el.a1 - el.a0) > 180 ? 1 : 0;
-            const sweep = el.a1 > el.a0 ? 1 : 0;
-            d += `A ${el.r.toFixed(1)} ${el.r.toFixed(1)} 0 ${large} ${sweep} ${ex.toFixed(1)} ${ey.toFixed(1)} `;
             if (ex < minX) minX = ex;
             if (ey < minY) minY = ey;
             if (ex > maxX) maxX = ex;
             if (ey > maxY) maxY = ey;
           }
         }
-        if (sub.closed) d += 'Z ';
-        pathsD.push(d);
       }
     }
 
-    if (!isFinite(minX) || !pathsD.length) {
+    if (!isFinite(minX) || !allSubs.length) {
       return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 75" class="thumb-empty"><rect width="100" height="75" fill="#f1f5f9" rx="6"/><text x="50" y="42" text-anchor="middle" fill="#94a3b8" font-size="12">空</text></svg>';
     }
 
-    const pad = Math.max((maxX - minX), (maxY - minY)) * 0.08 || 2;
+    const spanX = Math.max(1e-4, maxX - minX);
+    const spanY = Math.max(1e-4, maxY - minY);
+    const maxSpan = Math.max(spanX, spanY);
+    const minStep = maxSpan / 250; // 缩略图分辨率阈值（低于此距离的点可合并）
+    const minStepSq = minStep * minStep;
+
+    // 若子路径过多，按步长均匀抽稀子路径，保证超复杂大工程缩略图在 20KB 以内且轮廓完整
+    const maxSubs = 600;
+    const subStride = allSubs.length > maxSubs ? Math.ceil(allSubs.length / maxSubs) : 1;
+
+    const pathsD = [];
+    let totalSegments = 0;
+    const MAX_SEGMENTS = 1500;
+
+    for (let i = 0; i < allSubs.length; i += subStride) {
+      if (totalSegments >= MAX_SEGMENTS) break;
+      const sub = allSubs[i];
+      if (!sub.start) continue;
+
+      let d = `M ${sub.start.x.toFixed(1)} ${sub.start.y.toFixed(1)} `;
+      let lastX = sub.start.x;
+      let lastY = sub.start.y;
+      const elems = sub.elems || [];
+
+      for (let j = 0; j < elems.length; j++) {
+        if (totalSegments >= MAX_SEGMENTS) break;
+        const el = elems[j];
+        if (el.type === 'line') {
+          const isLast = (j === elems.length - 1);
+          const dx = el.x2 - lastX;
+          const dy = el.y2 - lastY;
+          if (!isLast && (dx * dx + dy * dy < minStepSq)) {
+            continue; // 跳过过密微小线段
+          }
+          d += `L ${el.x2.toFixed(1)} ${el.y2.toFixed(1)} `;
+          lastX = el.x2;
+          lastY = el.y2;
+          totalSegments++;
+        } else if (el.type === 'arc') {
+          const rad = (el.a1 * Math.PI) / 180;
+          const ex = el.cx + el.r * Math.cos(rad);
+          const ey = el.cy + el.r * Math.sin(rad);
+          const large = Math.abs(el.a1 - el.a0) > 180 ? 1 : 0;
+          const sweep = el.a1 > el.a0 ? 1 : 0;
+          d += `A ${el.r.toFixed(1)} ${el.r.toFixed(1)} 0 ${large} ${sweep} ${ex.toFixed(1)} ${ey.toFixed(1)} `;
+          lastX = ex;
+          lastY = ey;
+          totalSegments++;
+        }
+      }
+
+      if (sub.closed) d += 'Z ';
+      pathsD.push(d);
+    }
+
+    const pad = maxSpan * 0.08 || 2;
     const vbX = minX - pad;
     const vbY = minY - pad;
-    const vbW = Math.max(1, (maxX - minX) + pad * 2);
-    const vbH = Math.max(1, (maxY - minY) + pad * 2);
+    const vbW = Math.max(1, spanX + pad * 2);
+    const vbH = Math.max(1, spanY + pad * 2);
 
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${vbX.toFixed(1)} ${vbY.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}" class="history-svg" preserveAspectRatio="xMidYMid meet"><g transform="scale(1, -1) translate(0, ${-(vbY * 2 + vbH).toFixed(1)})" stroke="#2563eb" stroke-width="${(vbW * 0.015).toFixed(2)}" fill="none" stroke-linecap="round" stroke-linejoin="round">${pathsD.map((p) => `<path d="${p}"/>`).join('')}</g></svg>`;
   }
@@ -2172,6 +2228,7 @@ if (typeof window !== 'undefined') {
     const name = prompt(t('history.promptName'), defaultName);
     if (!name) return;
 
+    showLoading(t('history.saving'));
     try {
       const thumb = generateLayersThumbnailSvg(renderer.layers);
       const entry = {
@@ -2198,7 +2255,10 @@ if (typeof window !== 'undefined') {
       toast(t('history.saved'), 'ok');
       await refreshHistoryList();
     } catch (e) {
-      toast(e.message, 'err');
+      console.error('save history error:', e);
+      toast(t('history.saveFail', { msg: e.message || '' }), 'err');
+    } finally {
+      hideLoading();
     }
   }
 

@@ -164,16 +164,29 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-function readBody(req, limit = 32 * 1024 * 1024) {
+function readBody(req, limit = 64 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let exceeded = false;
     req.on('data', (c) => {
       size += c.length;
-      if (size > limit) { reject(new Error('请求体过大')); req.destroy(); return; }
-      chunks.push(c);
+      if (size > limit) {
+        exceeded = true;
+      } else {
+        chunks.push(c);
+      }
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      if (exceeded) {
+        const error = new Error('请求体过大（超出64MB上限）');
+        error.status = 413;
+        error.errorEn = 'Payload too large (exceeds 64MB limit)';
+        reject(error);
+      } else {
+        resolve(Buffer.concat(chunks));
+      }
+    });
     req.on('error', reject);
   });
 }

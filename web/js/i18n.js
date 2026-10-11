@@ -57,6 +57,8 @@ const DICT = {
     'history.defaultMat': '默认材料',
     'history.incomplete': '任务数据不完整',
     'history.defaultTpl': '样式模板',
+    'history.saving': '正在保存至历史任务…',
+    'history.saveFail': '保存历史任务失败：{msg}',
     'toast.historyFail': '获取历史失败：{msg}',
     'conn.outputting': '输出中',
     'conn.paused': '已暂停',
@@ -148,6 +150,7 @@ const DICT = {
     'layer.text': '文字「{text}」',
     'demo.sign': '示例招牌',
     'srv.httpFail': '请求失败 {code}',
+    'srv.networkError': '网络请求失败（连接中断或数据超出服务上限）',
 
     // ---- 画布
     'tool.select': '选择',
@@ -377,6 +380,8 @@ const DICT = {
     'history.defaultMat': 'Default material',
     'history.incomplete': 'Incomplete job data',
     'history.defaultTpl': 'Design Template',
+    'history.saving': 'Saving to history…',
+    'history.saveFail': 'Failed to save history: {msg}',
     'toast.historyFail': 'Failed to load history: {msg}',
     'conn.outputting': 'Running',
     'conn.paused': 'Paused',
@@ -468,6 +473,7 @@ const DICT = {
     'layer.text': 'Text "{text}"',
     'demo.sign': 'Sample sign',
     'srv.httpFail': 'Request failed ({code})',
+    'srv.networkError': 'Network request failed (connection interrupted or payload exceeds limit)',
 
     // ---- Canvas
     'tool.select': 'Select',
