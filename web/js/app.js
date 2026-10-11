@@ -7,10 +7,12 @@ import * as G from '../geom.js';
 import { Renderer } from './render.js';
 import * as T from './transform.js';
 import { t, lang, initLang, setLang, onLangChange } from './i18n.js';
+import { Vectorizer } from './vectorizer.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('stage');
 const renderer = new Renderer(canvas);
+let vectorizer = null;
 // 调试钩子：浏览器控制台里可用 __plotter.renderer / __probe.T 查状态
 if (typeof window !== 'undefined') {
   window.__plotter = { renderer, get state() { return state; } };
@@ -1327,6 +1329,7 @@ if (typeof window !== 'undefined') {
     $('btnImportFile').addEventListener('click', () => $('fileInput').click());
     $('fileInput').addEventListener('change', onFile);
     $('btnImportDemo').addEventListener('click', loadDemo);
+    $('btnOpenVectorizer')?.addEventListener('click', () => vectorizer?.open());
     $('btnOpenHistory')?.addEventListener('click', openHistoryModal);
     $('btnHistory')?.addEventListener('click', openHistoryModal);
     $('btnCloseHistory')?.addEventListener('click', closeHistoryModal);
@@ -1334,6 +1337,15 @@ if (typeof window !== 'undefined') {
     $('btnClearHistory')?.addEventListener('click', clearAllHistory);
     $('btnSaveCurrentTpl')?.addEventListener('click', saveCurrentAsTemplate);
     $('historySearchInput')?.addEventListener('input', () => renderHistoryItems(cachedHistoryList));
+
+    // 矢量化工具初始化
+    vectorizer = new Vectorizer({
+      toast,
+      onImport: async (svgText, filename) => {
+        await importVectorContent(svgText, filename);
+      },
+    });
+    vectorizer.init();
 
     // 文字
     $('btnAddText').addEventListener('click', async () => {
@@ -1727,16 +1739,13 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 文件
-  async function onFile(e) {
-    const f = e.target.files[0];
-    if (!f) return;
+  async function importVectorContent(text, filename = 'vectorized.svg') {
     showLoading(t('loading.importing'));
-    logLine(t('toast.parsing', { name: f.name }));
+    logLine(t('toast.parsing', { name: filename }));
     try {
-      const text = await f.text();
       const r = await api('/api/import', {
         method: 'POST',
-        body: { content: text, filename: f.name },
+        body: { content: text, filename },
       });
       if (!r.path.subpaths.length) {
         toast(t('toast.noPath'), 'err');
@@ -1751,12 +1760,12 @@ if (typeof window !== 'undefined') {
         }));
       } else if (r.path.subpaths.length > 1) {
         children = r.path.subpaths.map((sub, i) => ({
-          name: `${f.name} #${i + 1}`,
+          name: `${filename} #${i + 1}`,
           subpaths: [structuredClone(sub)],
         }));
       }
       const isGroup = !!(children && children.length > 1);
-      const layer = addLayer(f.name, r.path, { isGroup, children });
+      const layer = addLayer(filename, r.path, { isGroup, children });
 
       // 自动校准到工作区：纠正负坐标并将大尺寸图形等比缩放到材料幅面内
       const bed = state.preset || { width: 600, height: 710 };
@@ -1778,7 +1787,7 @@ if (typeof window !== 'undefined') {
       state.selectedIds = new Set([layer.id]);
       renderer.selectedId = layer.id;
       renderer.selectedIds = state.selectedIds;
-      toast(t('toast.imported', { name: f.name }), 'ok');
+      toast(t('toast.imported', { name: filename }), 'ok');
       logLine(t('log.importOk', { n: r.path.subpaths.length, len: r.info.length.toFixed(0) }));
       for (const w of r.warnings || []) { logLine(t('log.notice', { msg: pickLang(w) || w })); }
       fitToContent();
@@ -1788,6 +1797,16 @@ if (typeof window !== 'undefined') {
       logLine(t('log.parseFail', { msg: err.message }), 'err');
     } finally {
       hideLoading();
+    }
+  }
+
+  async function onFile(e) {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const text = await f.text();
+      await importVectorContent(text, f.name);
+    } finally {
       e.target.value = '';
     }
   }
