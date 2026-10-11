@@ -49,7 +49,7 @@ a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 imple
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# self-test (237 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
+# self-test (248 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
 npm run selftest
 
 # i18n audit (verify every string has both zh and en)
@@ -393,6 +393,29 @@ its own.
 ---
 
 ## Features
+
+### 🪄 Image Vectorization & AI Smoothing (Zero-dependency Web Engine)
+
+**Why & Key Benefits:**
+- **No Heavy Third-Party Software Needed**: Forget fiddling with manual trace dialogs and plugins across Illustrator, CorelDRAW, or Inkscape. Upload, vectorize, calibrate to bed, and plot straight from your browser.
+- **Engineered to Vanquish AI Diffusion Artifacts**: Images from Midjourney, Stable Diffusion, and DALL-E suffer from high-frequency micro-texture grain, anti-aliased staircasing, and scattered floating specks. Naive vectorizers generate tens of thousands of tiny jittery loops that cause intense pen-lift chatter (pen-up thrashing) or tear through thin paper. Our pipeline applies **bilateral edge-preserving filtering + connected component island area thresholding (Turdsize)** to eradicate noise at the root.
+- **True Centerline / Skeleton Tracing**: Pen plotters and drawing machines draw with ballpoint pens, gel pens, or markers. Our integrated Zhang-Suen thinning algorithm extracts **true 1px single-stroke skeleton centerlines**, eradicating the common pitfall of outlining thin lines into hollow double loops. Features topological spur pruning to snip off diffusion whisker branches.
+- **Mechanical Smoothing & Decimation**: Built-in RDP path decimation and Chaikin curve subdivision smooth harsh corners into fluid arcs, keeping stepper motors gliding smoothly without abrupt deceleration jolts.
+
+**How to Use:**
+1. **Open Workspace**: Click **"🪄 Vectorize Image (AI Denoise)…"** in the left import sidebar.
+2. **Load Image**: Drag & drop or pick any PNG / JPG / WebP image, or click **"Load AI lineart sample"** for an instant hands-on preview.
+3. **Configure Denoising & Mode**:
+   - **Presets**: Pick `[AI Denoise (Recommended)]`, `[Light]`, or `[Heavy]`.
+   - **Mode Selection**:
+     - **Centerline (Single Stroke)**: Ideal for sketches, lineart, and single-stroke pen plotting. Includes adjustable spur pruning to trim micro-whiskers.
+     - **Outline (Contour)**: Traces outer boundaries for solid silhouettes, stamps, text, and logos.
+   - **Raster Tuning**: Adjust bilateral filter radius, island filter threshold (px²), and binary threshold (with auto Otsu detection and black/white inversion).
+   - **Vector Post-processing**: Tune RDP simplification epsilon, Chaikin curve smoothing iterations, and micro-path threshold.
+4. **Interactive Multi-View Compare**: Toggle between "Vector Paths", "Denoised Binary", "Overlay", and "Original Bitmap" views with real-time path count, node count, and latency stats.
+5. **One-Click Import or Export**:
+   - Click **"📥 Import to Canvas"**: Automatically translates, scales to fit your current machine bed, and creates a ready-to-plot layer.
+   - Click **"Download SVG"**: Exports clean, standalone SVG vector paths to your local machine.
 
 ### Import and edit
 
