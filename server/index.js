@@ -805,7 +805,8 @@ const server = http.createServer(async (req, res) => {
       await routes[key](req, res, url);
     } catch (routeErr) {
       console.error(`[${key}]`, routeErr);
-      if (!res.headersSent) sendJson(res, 500, err(routeErr.message, routeErr.errorEn || routeErr.message));
+      const status = routeErr.status || 500;
+      if (!res.headersSent) sendJson(res, status, err(routeErr.message, routeErr.errorEn || routeErr.message));
     }
     return;
   }
