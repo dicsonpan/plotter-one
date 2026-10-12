@@ -214,6 +214,17 @@ async function currentSerialCandidates() {
 async function tryReconnect() {
   if (connected && transport && transport.open) return true;
   connected = false;
+
+  const list = await SerialTransport.list();
+  if (!list.length) return false;
+
+  // 傻瓜化自动连接逻辑：
+  // 1. 如果仅检测到 1 个设备：毫无歧义，直接自动连接，用户零操作开箱即用；
+  // 2. 如果检测到多个设备 (>1)：严禁盲目随便连一个，必须让用户明确选择，避免连错其他 USB 设备导致刻字机无响应。
+  if (list.length > 1) {
+    return false;
+  }
+
   const candidates = await currentSerialCandidates();
   for (const path of candidates) {
     try {
@@ -235,7 +246,7 @@ async function tryReconnect() {
         config.serial = { ...config.serial, path, baud };
         await saveConfig();
       }
-      console.log(`  ✓ 已自动连接串口 ${path} ${baud}`);
+      console.log(`  ✓ 检测到唯一串口设备，已自动连接 ${path} ${baud}`);
       broadcast('device:connected', { connected: true, info: deviceInfo });
       return true;
     } catch {
@@ -343,7 +354,11 @@ const routes = {
   'GET /api/serial-ports': async (req, res) => {
     const list = await SerialTransport.list();
     const detailed = await Promise.all(list.map((p) => SerialTransport.describe(p)));
-    sendJson(res, 200, { ports: detailed });
+    sendJson(res, 200, {
+      ports: detailed,
+      count: detailed.length,
+      multiple: detailed.length > 1,
+    });
   },
 
   'POST /api/connect': async (req, res) => {

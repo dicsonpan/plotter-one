@@ -221,6 +221,9 @@
             <select id="portSel" style="flex:3"></select>
             <button class="btn btn-sm" id="btnScanPorts" style="flex:1" data-i18n="dev.refresh">刷新</button>
           </div>
+          <div class="notice notice-warn" id="multiPortHint" style="display:none; margin-top:7px; font-size:11.5px; padding:6px 10px; border-radius:6px;">
+            <span data-i18n="dev.multiPortHint">💡 提示：检测到多个端口。刻字机通常使用 CH340 或 FTDI 芯片连接线；若不确定，可先选择带有标注的端口连接测试。</span>
+          </div>
         </div>
         <div class="field" id="baudWrap">
           <label class="field-label" for="baudSel" data-i18n="dev.baud">波特率</label>

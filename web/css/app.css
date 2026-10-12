@@ -432,6 +432,24 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   margin-top: 3px;
   margin-left: 16px;
 }
+.conn-card.warn {
+  border-color: #f59e0b;
+  background: var(--warn-soft);
+}
+.conn-card.warn:hover {
+  border-color: #d97706;
+}
+.conn-card.warn .conn-card-title {
+  color: #92400e;
+}
+.conn-card.warn .conn-card-sub {
+  color: #b45309;
+}
+.conn-dot.warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(217, 119, 6, .18);
+  animation: pulse 1.4s ease-in-out infinite;
+}
 .pad-coords {
   display: grid;
   grid-template-columns: 1fr 1fr;

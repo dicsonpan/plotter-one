@@ -81,26 +81,69 @@ export class SerialTransport extends EventEmitter {
       path: devPath,
       vendorId: null, productId: null,
       product: null, manufacturer: null, serial: null,
+      chipName: null, chipNameZh: null, chipNameEn: null,
     };
     const name = devPath.replace(/^\/dev\//, '');
-    const base = `/sys/class/tty/${name}/device/..`;
-    const readOne = async (field) => {
+
+    // 向上遍历 sysfs 节点（最多 5 层），应对各类直连、Hub 或复合 USB 串口
+    let curr = `/sys/class/tty/${name}/device`;
+    for (let depth = 0; depth < 5; depth++) {
       try {
-        const s = await readFile(`${base}/${field}`, 'utf8');
-        return s.trim() || null;
-      } catch {
-        return null;
-      }
+        const vid = await readFile(`${curr}/idVendor`, 'utf8').then((s) => s.trim()).catch(() => null);
+        if (vid) {
+          info.vendorId = vid;
+          info.productId = await readFile(`${curr}/idProduct`, 'utf8').then((s) => s.trim()).catch(() => null);
+          info.product = await readFile(`${curr}/product`, 'utf8').then((s) => s.trim()).catch(() => null);
+          info.manufacturer = await readFile(`${curr}/manufacturer`, 'utf8').then((s) => s.trim()).catch(() => null);
+          info.serial = await readFile(`${curr}/serial`, 'utf8').then((s) => s.trim()).catch(() => null);
+          break;
+        }
+      } catch {}
+      curr = `${curr}/..`;
+    }
+
+    // udevadm 属性兜底（Linux 下若 sysfs 相对路径层级超出或特殊驱动）
+    if (!info.vendorId) {
+      try {
+        const { stdout } = await execAsync(`udevadm info -q property -n "${devPath}" 2>/dev/null || true`);
+        const lines = stdout.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('ID_VENDOR_ID=')) info.vendorId = line.slice(13).trim();
+          else if (line.startsWith('ID_MODEL_ID=')) info.productId = line.slice(12).trim();
+          else if (line.startsWith('ID_MODEL_FROM_DATABASE=')) info.product = line.slice(23).trim();
+          else if (!info.product && line.startsWith('ID_MODEL=')) info.product = line.slice(9).trim();
+          else if (line.startsWith('ID_VENDOR_FROM_DATABASE=')) info.manufacturer = line.slice(24).trim();
+          else if (!info.manufacturer && line.startsWith('ID_VENDOR=')) info.manufacturer = line.slice(10).trim();
+          else if (line.startsWith('ID_SERIAL_SHORT=')) info.serial = line.slice(16).trim();
+        }
+      } catch {}
+    }
+
+    // 常见 USB 转串口芯片数据库（刻字机与写字机常用）
+    const KNOWN_CHIPS = {
+      '1a86:7523': { zh: '沁恒 CH340 刻字机连接线', en: 'WCH CH340 Plotter Adapter' },
+      '1a86:5523': { zh: '沁恒 CH341 USB转串口', en: 'WCH CH341 Adapter' },
+      '1a86:7522': { zh: '沁恒 CH340G 芯片', en: 'WCH CH340G' },
+      '0403:6001': { zh: 'FTDI FT232R 工业级串口', en: 'FTDI FT232R' },
+      '0403:6015': { zh: 'FTDI FT230X', en: 'FTDI FT230X' },
+      '0403:6011': { zh: 'FTDI FT4232H 多口串口', en: 'FTDI FT4232H' },
+      '0403:6014': { zh: 'FTDI FT232H 高速串口', en: 'FTDI FT232H' },
+      '10c4:ea60': { zh: 'CP2102 / CP210x (Silicon Labs)', en: 'CP2102 / CP210x' },
+      '067b:2303': { zh: 'PL2303 (Prolific 串口线)', en: 'Prolific PL2303' },
+      '067b:23a3': { zh: 'PL2303GS (Prolific 新版)', en: 'Prolific PL2303GS' },
+      '2341:0043': { zh: 'Arduino Uno 控制板', en: 'Arduino Uno' },
+      '2341:0042': { zh: 'Arduino Mega 控制板', en: 'Arduino Mega' },
     };
-    const [vid, pid, prod, manu, ser] = await Promise.all([
-      readOne('idVendor'), readOne('idProduct'), readOne('product'),
-      readOne('manufacturer'), readOne('serial'),
-    ]);
-    info.vendorId = vid;
-    info.productId = pid;
-    info.product = prod;
-    info.manufacturer = manu;
-    info.serial = ser;
+
+    if (info.vendorId && info.productId) {
+      const key = `${info.vendorId.toLowerCase()}:${info.productId.toLowerCase()}`;
+      if (KNOWN_CHIPS[key]) {
+        info.chipNameZh = KNOWN_CHIPS[key].zh;
+        info.chipNameEn = KNOWN_CHIPS[key].en;
+        info.chipName = KNOWN_CHIPS[key].zh;
+      }
+    }
+
     return info;
   }
 

@@ -25,6 +25,7 @@ if (typeof window !== 'undefined') {
     presets: {},
     materials: [],
     connected: false,
+    deviceInfo: null,
     gcode: '',
     ws: null,
     jobState: 'idle',
@@ -189,6 +190,50 @@ if (typeof window !== 'undefined') {
     setInterval(refreshState, 5000);
   }
 
+  let cachedPorts = [];
+  let userToggledConnManually = false;
+
+  function updateConnCardDisplay() {
+    const dot = $('connCardDot');
+    const title = $('connCardTitle');
+    const sub = $('connCardSub');
+    const card = $('connCard');
+    const details = $('connDetails');
+    if (!dot || !title || !sub) return;
+
+    if (state.connected) {
+      card?.classList.remove('warn');
+      dot.className = 'conn-dot on';
+      title.textContent = `${state.preset?.name || t('dev.defaultMachine')} · ${t('dev.connectedSub')}`;
+      const en = lang() === 'en';
+      const dev = state.deviceInfo;
+      const chip = dev ? (en ? (dev.chipNameEn || dev.chipName) : (dev.chipNameZh || dev.chipName)) : '';
+      sub.textContent = (dev?.path || t('btn.connected')) + (chip ? ` (${chip})` : '');
+    } else {
+      const n = cachedPorts.length;
+      if (n > 1) {
+        // 检测到多个设备：不自动盲连！显示醒目提示并展开面板让用户选择
+        card?.classList.add('warn');
+        dot.className = 'conn-dot warn';
+        title.textContent = t('dev.multiplePorts', { n });
+        sub.textContent = t('dev.multiplePortsSub');
+        if (details && !userToggledConnManually) {
+          details.style.display = 'block';
+        }
+      } else if (n === 1) {
+        card?.classList.remove('warn');
+        dot.className = 'conn-dot';
+        title.textContent = t('dev.autoConn');
+        sub.textContent = t('dev.autoConnSub');
+      } else {
+        card?.classList.remove('warn');
+        dot.className = 'conn-dot';
+        title.textContent = t('dev.noDevice');
+        sub.textContent = t('dev.noDeviceSub');
+      }
+    }
+  }
+
   async function refreshState() {
     try {
       const s = await api('/api/state');
@@ -197,6 +242,7 @@ if (typeof window !== 'undefined') {
       state.presets = s.presets;
       state.materials = s.materials;
       state.connected = s.device.connected;
+      state.deviceInfo = s.device.info;
 
       // 机器下拉。nameEn 由服务端一并下发，避免在前端再维护一份机型名对照表——
       // 两份表必然会漂移，改了一处忘了另一处，界面就会显示错型号（且不报错）。
@@ -275,21 +321,7 @@ if (typeof window !== 'undefined') {
       $('btnDisconnect').disabled = !s.device.connected;
       $('btnConnectTop').textContent = t(s.device.connected ? 'btn.connected' : 'btn.connect');
 
-      // 更新折叠卡片连接状态
-      const dot = $('connCardDot');
-      const title = $('connCardTitle');
-      const sub = $('connCardSub');
-      if (dot && title && sub) {
-        if (s.device.connected) {
-          dot.className = 'conn-dot on';
-          title.textContent = `${s.preset.name} · ${t('dev.connectedSub')}`;
-          sub.textContent = s.device.info?.path || t('btn.connected');
-        } else {
-          dot.className = 'conn-dot';
-          title.textContent = t('dev.autoConn');
-          sub.textContent = t('dev.autoConnSub');
-        }
-      }
+      updateConnCardDisplay();
 
       // 手动控制只有连上机器才有意义，未连接时置灰。
       // .pad-key 是 button，disabled 有效；用 class 让样式一起变灰。
@@ -1319,6 +1351,7 @@ if (typeof window !== 'undefined') {
     });
 
     const toggleConn = () => {
+      userToggledConnManually = true;
       const el = $('connDetails');
       if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
     };
@@ -1687,26 +1720,56 @@ if (typeof window !== 'undefined') {
       const sel = $('portSel');
       const prev = sel.value;
       sel.innerHTML = '';
-      if (!r.ports.length) {
+      cachedPorts = r.ports || [];
+      const en = lang() === 'en';
+      const hint = $('multiPortHint');
+
+      if (!cachedPorts.length) {
         sel.innerHTML = emptyPortOption();
         logLine(t('log.portNone'), 'err');
+        if (hint) hint.style.display = 'none';
+        updateConnCardDisplay();
         return;
       }
-      for (const p of r.ports) {
+
+      if (hint) {
+        hint.style.display = cachedPorts.length > 1 ? 'block' : 'none';
+      }
+
+      cachedPorts.forEach((p, idx) => {
         const o = document.createElement('option');
         o.value = p.path;
-        const vid = p.vendorId ? ` [${p.vendorId}:${p.productId}]` : '';
-        o.textContent = p.path + (p.product ? ` — ${p.product}` : '') + vid;
+
+        let chip = en ? (p.chipNameEn || p.chipName) : (p.chipNameZh || p.chipName);
+        let detail = chip || p.product || '';
+        if (p.manufacturer && !detail.includes(p.manufacturer)) {
+          detail = `${p.manufacturer} ${detail}`.trim();
+        }
+
+        if (!detail) {
+          if (p.path.includes('ttyUSB')) detail = t('port.serialAdapter');
+          else if (p.path.includes('ttyACM')) detail = t('port.acmDevice');
+        }
+
+        const portNum = t('port.num', { n: idx + 1 });
+        o.textContent = `[${portNum}] ${p.path}${detail ? ' — ' + detail : ''}`;
         sel.appendChild(o);
+      });
+
+      if (prev && cachedPorts.some((p) => p.path === prev)) {
+        sel.value = prev;
+      } else if (state.config?.serial?.path && cachedPorts.some((p) => p.path === state.config.serial.path)) {
+        sel.value = state.config.serial.path;
+      } else {
+        const best = cachedPorts.find((p) => p.chipName || p.path.includes('ttyACM')) || cachedPorts[0];
+        if (best) sel.value = best.path;
       }
-      if (prev) sel.value = prev;
-      else if (state.config?.serial?.path) sel.value = state.config.serial.path;
-      else {
-        const acm = r.ports.find((p) => p.path.includes('ttyACM'));
-        if (acm) sel.value = acm.path;
-      }
-      logLine(t('log.portFound', { n: r.ports.length }));
-    } catch (e) { logLine(t('log.scanFail', { msg: e.message }), 'err'); }
+
+      logLine(t('log.portFound', { n: cachedPorts.length }));
+      updateConnCardDisplay();
+    } catch (e) {
+      logLine(t('log.scanFail', { msg: e.message }), 'err');
+    }
   }
 
   async function doConnect() {
