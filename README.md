@@ -16,7 +16,7 @@ Windows, Mac, iPad, Android phone, even a bare thin client with nothing installe
         │  RK3399 / any ARM64  │   3-5W idle
         │  Node.js, zero deps  │
         └──────────┬───────────┘
-                   │ RS-232 9600 8N1
+                   │ USB / RS-232 115200 8N1
                    ▼
             engraving machine
 ```
@@ -49,7 +49,7 @@ a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 imple
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# self-test (248 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
+# self-test (270 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
 npm run selftest
 
 # i18n audit (verify every string has both zh and en)
@@ -61,7 +61,10 @@ npm start
 
 Open `http://localhost:8080`.
 
-To run it on a board next to the engraver, see **[Deployment](#deployment)** below — it is one command (`sudo bash deploy/install.sh --port 8080`).
+To run it on a board next to the engraver, see **[Deployment](#deployment)** below — it is one command
+(`sudo bash deploy/install.sh --port 8080`). 8080 is only the default; a board install will often
+bind **port 80** instead so you can reach it as bare `http://<board-ip>/` (that needs
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit — see `docs/`).
 
 For how to design artwork, see [docs/设计工作流.md](docs/设计工作流.md).
 
@@ -359,22 +362,26 @@ These were all learned the hard way; recorded here so nobody repeats the experim
 
 | Behaviour | Explanation |
 |---|---|
+| **The firmware never answers** | `OI;` / `OA;` / `IN;` all come back empty. The machine is a **pure simplex receiver** — it consumes data and says nothing. Any design that waits for an acknowledgement or a version string will hang forever (measured on a GD32F30x CDC firmware, `GD32F30X-3.0.0-*` serial number) |
 | **`IN;` must be sent first** | After cold start the firmware is uninitialised and **silently ignores all motion commands** without `IN;`. Serial writes succeed and the job shows "complete", but the machine does not move — indistinguishable from a dead serial port |
-| **Reverse `SC` is not supported** | `SC23622,0,...` (Xmin > Xmax) makes the firmware compute a **negative scale factor**, sending the whole machine into a runaway (Y spinning, X fleeing). `SC` must always be in ascending order |
-| **`!PG;` gives no completion signal** | Mechanical homing has no done signal and the serial stream does not wait. The host must wait itself (~3s), or the new coordinates take effect mid-homing |
-| **Manual operations must lift the pen unconditionally** | The software's notion of pen state can diverge from the machine's (after an aborted job or a reconnect). Safety operations must send `PU;` regardless |
+| **Never send `SC`** | On a roll-feed machine `SC` zeroes the Y scale factor (no physical $P2_y$) and kills the feed axis. Reverse `SC` (`Xmin > Xmax`) is worse: a negative scale factor sends the machine into a runaway. This project never emits `SC` at all — coordinates are converted to integer machine pulses on the host |
+| **Never send `!PG;`** | Mechanical homing searches the **X** limit switch, and the roll-feed Y axis has no limit switch at all. Some firmwares ignore it (button looks broken); those that honour it discard the operator's datum and slam the rail. Home / End return to the user origin with a relative `PR dx,dy;` + `IP0,0;` instead |
+| **Avoid `SP0;`** | On some firmwares selecting pen 0 drops the machine offline and it then refuses to move at all. Stop / End only ever send `PU;` |
+| **Long command lines get swallowed** | The reference CDC demo's OUT buffer is 64 bytes. Multi-coordinate lines spanning several USB packets risk reassembly corruption — the classic "data was received, machine never moved, power-cycle required" symptom |
+| **Manual operations must lift the pen unconditionally** | The software's notion of pen state can diverge from the machine's (after an aborted job or a reconnect). Safety operations send `PA;` + `PU;` + `PR0,0;` regardless of what the software thinks |
 
 ### Safety design
 
 Deliberately biased towards "wait longer rather than crash":
 
-- **No homing at job start**: the first `PA` is absolute positioning, and where the head sits
-  before cutting is unknown. Jumping from an unknown position to the start of the artwork
-  drives straight into the limit switch.
+- **No mechanical homing, ever**: `!PG;` is not emitted at job start, not by the Home button,
+  not at End. Homing destroys the operator's datum and drives into the rail limit switch.
+  Home / End walk back to the recorded origin with a relative `PR` instead.
 - **Rate limiting + e-stop**: all manual actions go through the job queue and never bypass
   rate limiting; e-stop sends only `PU;` and **no motion command at all**
-- **`SC` always ascending**: a wrong direction setting can at worst mirror the graphic, it
-  can never drive the firmware into a negative scale
+- **No `SC` at all**: rather than keeping it ascending, the host converts to integer machine
+  pulses itself, so a wrong direction setting can at worst mirror the graphic — it can never
+  drive the firmware into a negative scale
 - **200mm cap per manual move**, so a slip of the hand cannot run away
 - **Relative moves for diagnostics**: 5mm, pen up, out and back — safe even when not homed
 - **Pen lifted on exit**: a service restart or crash does not leave the head pressing on
@@ -434,11 +441,17 @@ its own.
 - **Precise numeric control**: X / Y / width / height / angle, with aspect lock, six-way alignment, flip, duplicate
 - **Quick text**: a built-in single-stroke font (Stroker) designed for engraving — ordinary fonts turned into outlines blob together on 3mm acrylic, single-stroke letters stay legible
 - **Two-tier Geometry Optimization & De-speckle**:
-  - **CAM Process Simplification (RDP & Collinear Reduction)**: Adaptive Douglas-Peucker simplification with 0.02mm physical tolerance (smaller than the machine's 0.0254mm step pulse and blade kerf). Compresses over-sampled polylines and vector tracing paths by 70%–95% (e.g. from 295k commands down to 94k), drastically slashing 9600-baud serial bottleneck.
+  - **CAM Process Simplification (RDP & Collinear Reduction)**: Adaptive Douglas-Peucker simplification with 0.02mm physical tolerance (smaller than the machine's 0.0254mm step pulse and blade kerf). Compresses over-sampled polylines and vector tracing paths by 70%–95% (e.g. from 295k commands down to 94k), drastically slashing physical transfer time and cutting wait.
   - **Import-level De-speckle (1.0mm threshold)**: Automatically filters isolated tiny stray artifacts/floating islands from bitmap tracing ($Max(W, H) < 1.0\text{mm}$, perimeter $< 4.0\text{mm}$), preventing the blade from cutting messy speckles and ruining adhesive vinyl.
   - **Ultra-conservative 0.005mm Pre-simplification**: Merges exact collinear segments and sub-micron jitter at import time, keeping canvas zoom/pan and layer ungrouping completely lag-free.
-- **Instruction Layer: HP-GL Continuous Coordinate Stream Merging (20%~30% Speedup)**:
-  Automatically batches continuous cutting polyline coordinates into streamed multi-coordinate commands (e.g. `PA x1,y1,x2,y2,...,x30,y30;`), eliminating tens of thousands of redundant `PA` command mnemonics, delimiters, and newline characters. This reduces total byte size by 20%~30% and compresses line counts by 80%~95%, significantly accelerating 9600 baud serial transmission and improving firmware motion planning smoothness, while remaining fully safe for serial input buffers.
+- **Instruction layer: ArtCut/文泰-compatible HP-GL output**:
+  Emits the command set these firmwares actually implement — `IN; SP1; PA;` header, pen-up
+  travel as `PU x,y;`, cutting as `PD x,y;`. No `SC`, no `LT;`. Arcs are discretised into
+  `PD` polylines (0.02mm chord height) because 2D engraving firmwares do not implement
+  `AA`/`CI` interpolation — this is exactly what 文泰/ArtCut drivers do.
+  Multi-coordinate batching (`PD x1,y1,x2,y2,…`) is available but **off by default**
+  (`maxBatchPairs = 1`): it saves 20–30% of bytes, but a long line spanning several 64-byte
+  USB packets is the one thing that reliably makes a GD32 firmware stop executing.
 - **Mac Keyboard Polish & Focus Management**: Full support for Mac `Delete`, `Backspace`, `Cmd+Backspace` deletion and `Cmd+A` select-all; autofocus management transfers keyboard focus seamlessly from input fields back to the stage canvas, working reliably even under IME composition.
 - **Full-screen Loading Mask**: Modal semi-opaque spinner during vector import and CAM compilation with user interaction lock to prevent duplicate actions.
 - 6 material presets (ivory board / PVC foam / acrylic / vinyl / KT board + foil / thin paper), each with its own speed and force
@@ -455,12 +468,35 @@ A pad mirroring the basic operations of Ucancam / 文泰:
   - press-and-hold to move continuously, Shift to reverse; arrow keys work on desktop
 - **Pen up / pen down / home / set origin / reset origin / feed / eject / pen-up-and-home**
 - 200mm cap per move, so a slip of the hand cannot run away
+- **Home / End walk back, they do not home**: both return to the operator's origin with a
+  relative `PR dx,dy;` and re-anchor with `IP0,0;`. Neither ever issues `!PG;` or `SP0;`
+
+### Output link hardening (learned on real hardware)
+
+Commercial Liyue / GD32 firmwares are **simplex** — they consume data and never answer.
+That one fact drove four decisions:
+
+| Behaviour | What the service does |
+|---|---|
+| **The machine never replies** | On connect, and before each job when the engine is idle, the host writes a probe (`IN;`). If the write goes through but nothing comes back, the link is flagged **one-way** (`deviceInfo.silent`) and the device card says so. A version-string handshake is impossible on this firmware |
+| **A stalled USB layer** | Every write runs under a **5s watchdog**. A write that never completes disconnects the port and raises a bilingual "machine stopped receiving" error instead of hanging forever |
+| **Bursting floods the controller** | Jobs are **paced, not poured**: 1000ms look-ahead window, 60ms feed tick, at most 48 units per tick, with each line's physical motion time debited as the machine works |
+| **Long lines get mangled** | No emitted line exceeds **64 bytes** (one USB full-speed packet). Over-long `PD` runs are split into semantically equivalent shorter ones, and coordinates are **never** re-serialised from numbers (that would rewrite them in exponential notation) |
+
+Two consequences worth internalising:
+
+- **On a one-way machine, "complete" means "transmission finished and the simulated timer ran
+  out."** The log says exactly that and asks for visual confirmation. It is not a machine
+  acknowledgement — no such thing exists on this firmware.
+- **If the firmware's application layer hangs, the USB pump keeps accepting writes.** The host
+  cannot detect that in principle. Watch the panel's ONLINE lamp instead: flashing means data
+  reached the application layer but is not executing; dark means data is not getting through.
 
 ### Output Control & Job History
 
 - **SparkMinds Branding**: Browser tab favicon with the geometric cube icon, and top navigation bar integrated with the horizontal "SparkMinds 创智实验室" brand logo.
 - **Job History & Parameter Archive**: All cut jobs automatically archived (or saved as templates) with complete layer geometries, user origin, machine preset, material, cut speed, force, and direction; supports one-click recall & edit, re-cutting, and card-based vector thumbnail previews.
-- **Kinematic Virtual Pacing**: Because commercial plotter firmwares operate as open-loop, simplex receivers without bi-directional status reporting, the platform features a kinematic motion model that simulates physical cutting and rapid travel speeds, pen up/down latencies, and homing dwell time. This decouples **buffer transfer progress** from **physical execution progress**, providing true real-time cutting progress and remaining time countdowns.
+- **Kinematic Virtual Pacing**: Because commercial plotter firmwares operate as open-loop, simplex receivers without bi-directional status reporting, the platform features a kinematic motion model that simulates physical cutting and rapid travel speeds, pen up/down latencies, and homing dwell time. This decouples **buffer transfer progress** from **physical execution progress**, providing true real-time cutting progress and remaining time countdowns. The model is shared by the estimate and the feeder, so a job's ETA tracks physical execution rather than "bytes handed to the driver" — see [Output link hardening](#output-link-hardening-learned-on-real-hardware).
 - **Job queue with dual-stage progress**: Live display of onboard buffer load alongside physical cutting percentage and countdown
 - Pause / resume / stop / e-stop
 - Live toolpath preview and cutting path length metrics during output
@@ -516,12 +552,15 @@ name/status/progress/byte count; the UI is unaffected.
 | Idle | **< 1%** (load average ~0.05) |
 | Outputting | ~1-3% |
 
-**The tiny CPU footprint is dictated by the serial baud rate**: 9600 baud = 960 bytes/second
-ceiling. Shipping 76KB of commands takes 91 seconds of transfer alone; the machine moves far
-slower than the data. The CPU was never the bottleneck — the mechanics are.
+**The CPU was never the bottleneck — the mechanics are.** Note that on a USB-CDC link
+(`/dev/ttyACM0`) the configured baud rate is not a real throughput limit: a line can be
+written in under a millisecond, so a naive implementation can push tens of kilobytes into the
+machine in seconds — far faster than it can cut.
 
-> This is also why `jobEngine` throttles by byte count and feeds line by line:
-> not to save CPU, but to avoid **overrunning the controller's data buffer**.
+> That is why `jobEngine` **paces** the feed instead of pouring it: a fixed look-ahead window
+> on a 60ms tick, with each line's physical motion time debited as the machine works.
+> The goal is not to save CPU, it is to avoid **overrunning the controller's 64-byte
+> receive buffer** and to keep progress honest.
 
 ### Temperature and stability
 
@@ -592,7 +631,7 @@ manual-control note carries both languages.
 plotter-one/
 ├── server/
 │   ├── index.js              HTTP routes + WebSocket
-│   ├── selftest.js           237 self-checks
+│   ├── selftest.js           270 self-checks
 │   ├── geom/path.js          geometry kernel (paths / matrices / transforms)
 │   ├── cam/
 │   │   ├── toolpath.js       toolpath generation (arcs preserved, not flattened)
@@ -625,7 +664,7 @@ over there".
 ## Development
 
 ```bash
-npm run selftest         # 237 self-checks, no machine required
+npm run selftest         # 270 self-checks, no machine required
 node tools/i18n-check.js # i18n audit
 npm start                # default port 8080
 npm start -- --port 9000
@@ -637,8 +676,14 @@ npm start -- --port 9000
 ./deploy/sync-geom.sh
 ```
 
-Self-test coverage: geometry invariants, HPGL round-trip consistency, job engine state
-machine, mirrored-axis generation, machine bed sizes, serial write paths, bilingual messages.
+Self-test coverage: geometry invariants, HPGL round-trip consistency (compile → reparse),
+job engine state machine, mirrored-axis generation, machine bed sizes, serial write paths,
+paced streaming and the 64-byte line cap, one-way vs. two-way link semantics, the write
+watchdog, and bilingual messages.
+
+Every one of these runs without a machine attached, which is the point: the failure modes that
+matter on this hardware (silently ignored commands, swallowed long lines, fake "complete")
+cannot be reproduced on demand, so they are pinned as assertions instead.
 
 ---
 
