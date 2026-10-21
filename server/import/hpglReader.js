@@ -99,7 +99,8 @@ export function parseHpgl(text, opts = {}) {
       continue;
     }
     if (c === 'P' && mnemonic === 'PU') {
-      if (penDown) penDown = false;
+      penDown = false;
+      sub = null;
       const pts = rest.split(',').filter((s) => s !== '').map(Number);
       if (pts.length >= 2) {
         if (mode === 'PR') { cx += pts[0]; cy += pts[1]; } else { cx = pts[0]; cy = pts[1]; }

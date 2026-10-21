@@ -208,7 +208,11 @@ if (typeof window !== 'undefined') {
       const en = lang() === 'en';
       const dev = state.deviceInfo;
       const chip = dev ? (en ? (dev.chipNameEn || dev.chipName) : (dev.chipNameZh || dev.chipName)) : '';
-      sub.textContent = (dev?.path || t('btn.connected')) + (chip ? ` (${chip})` : '');
+      let subText = (dev?.path || t('btn.connected')) + (chip ? ` (${chip})` : '');
+      // 单工链路（力宇等 GD32 方案）：机器不回话，完成状态是仿真推算。
+      // 必须在连接卡片上明示，否则「日志说完成、机器没动」会被误判成软件 bug。
+      if (dev?.silent) subText += ` · ${t('dev.oneWay')}`;
+      sub.textContent = subText;
     } else {
       const n = cachedPorts.length;
       if (n > 1) {
@@ -1536,7 +1540,9 @@ if (typeof window !== 'undefined') {
     try {
       const r = await api('/api/manual', { method: 'POST', body: cmd });
       if (r.notes && r.notes.length) {
-        logLine(r.notes.map((x) => pickLang(x)).join(lang() === 'en' ? '; ' : '；'), 'ok');
+        const msg = r.notes.map((x) => pickLang(x)).join(lang() === 'en' ? '; ' : '；');
+        logLine(msg, 'ok');
+        if (label !== 'move') toast(msg, 'ok');
       }
     } catch (e) {
       logLine(t('log.manualFail', { msg: e.message }), 'err');
@@ -1616,12 +1622,14 @@ if (typeof window !== 'undefined') {
           sendManual({ action: 'setorigin', x: state.userOrigin.x, y: state.userOrigin.y }, action);
           return;
         }
-        if (action === 'home') {
+        const cmd = { action };
+        if (action === 'home' || action === 'end') {
+          cmd.dx = round1(state.userOrigin.x - state.knifePos.x);
+          cmd.dy = round1(state.userOrigin.y - state.knifePos.y);
           state.knifePos = { x: state.userOrigin.x, y: state.userOrigin.y };
           updateKnifeCoordsDisplay();
           renderer.dirty = true;
         }
-        const cmd = { action };
         if (btn.dataset.dist) {
           const d = +btn.dataset.dist;
           cmd.distance = d;

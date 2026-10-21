@@ -144,6 +144,33 @@ function broadcast(type, payload) {
   wss.broadcast({ type, payload, t: Date.now() });
 }
 
+/**
+ * 连接后的链路探测（2026-10-19 实测驱动的加固）。
+ *
+ * 背景：力宇 SC 系列的 USB 口是 GD32 CDC ACM，纯单工——
+ * OI;/OA;/IN; 等所有查询指令零回应，机器永远不回话。
+ * 所以「打开设备节点成功」不代表机器在工作，唯一能探测的信号是：
+ * **写入能否在短时间内被设备收讫**（USB 层 ACK）。
+ *
+ * 这里发一条无害的 `IN;`（无运动，顺带预初始化固件）：
+ *   - 写入超时/失败 → 机器 USB 层已停摆，连接应视为不可用；
+ *   - 写入成功 + 期间收到回传 → 双向链路（少数机型会回版本行）；
+ *   - 写入成功 + 无回传   → 单工链路，标记 silent 供 UI 与日志明示。
+ */
+async function probeLink(t) {
+  await t.write('IN;');
+  await new Promise((r) => setTimeout(r, 300)); // 给双向机器留应答窗口
+  const silent = t.everRx === false;
+  if (t instanceof SerialTransport || t instanceof TcpTransport) {
+    if (silent) {
+      console.log('  · 链路探测：机器无应答（单向链路，完成状态将按仿真推算）');
+    } else {
+      console.log('  · 链路探测：收到机器应答（双向链路）');
+    }
+  }
+  return silent;
+}
+
 engine.on('state', (s) => broadcast('job:state', s));
 engine.on('progress', (p) => broadcast('job:progress', p));
 engine.on('log', (l) => broadcast('job:log', l));
@@ -238,9 +265,18 @@ async function tryReconnect() {
         rtscts: !!config.serial?.rtscts,
       });
       await t.connect();
+      // 链路探测：写不进去（超时）就视为这个口不可用，换下一个候选
+      let silent = false;
+      try {
+        silent = await probeLink(t);
+      } catch (probeErr) {
+        try { await t.disconnect(); } catch { /* 忽略 */ }
+        continue;
+      }
       attachTransport(t);
       connected = true;
       deviceInfo = await SerialTransport.describe(path);
+      if (deviceInfo) deviceInfo.silent = silent;
       // 记住实际连上的路径：USB 重新插拔后节点可能变
       if (config.serial?.path !== path || config.serial?.baud !== baud) {
         config.serial = { ...config.serial, path, baud };
@@ -389,8 +425,22 @@ const routes = {
       } else {
         return sendJson(res, 400, err('未知连接类型', 'Unknown connection type'));
       }
+      // 链路探测：机器 USB 层停摆（写不进）时直接报错，
+      // 而不是绿灯连上、输出时才发现没反应。
+      let silent = false;
+      if (type === 'serial' || type === 'tcp') {
+        try {
+          silent = await probeLink(t);
+        } catch (probeErr) {
+          try { await t.disconnect(); } catch { /* 忽略 */ }
+          return sendJson(res, 400, err(
+            '端口已打开但机器不应答：' + probeErr.message,
+            'Port opened but machine not responding: ' + (probeErr.errorEn || probeErr.message)));
+        }
+      }
       attachTransport(t);
       connected = true;
+      if (deviceInfo) deviceInfo.silent = silent;
       // 用户主动连上了 → 停掉自动重连，由 attachTransport 的 close/error 重新触发
       stopReconnectLoop();
       setTimeout(() => { if (!shuttingDown) startReconnectLoop(); }, 1000);
@@ -662,6 +712,7 @@ const routes = {
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
     if (!body.gcode) return sendJson(res, 400, err('没有指令内容', 'No command content'));
     const preset = getPreset(config.machineId);
+
     const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
     const id = engine.enqueue({
       name: body.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,

@@ -55,6 +55,15 @@ export class SerialTransport extends EventEmitter {
     this.fd = null;
     this._rx = null;
     this._pending = '';
+    // 写入看门狗超时（毫秒）。0 = 禁用。
+    // 力宇这类 GD32 CDC 方案：固件停止消费数据时端点不再 re-arm，
+    // cdc-acm 驱动的 write() 会无限阻塞（NAK 背压）——上层必须设超时，
+    // 否则任务永远卡在 caching 阶段（2026-10-19 实测分析）。
+    this.writeTimeoutMs = opts.writeTimeoutMs ?? 5000;
+    // 是否收到过机器的任何回传字节。
+    // 力宇实测：OI;/OA;/IN; 等全部查询指令零回应 → 纯单工链路。
+    // 上位机永远无法从这台机器得到回执，完成状态只能靠仿真推算。
+    this.everRx = false;
   }
 
   static async list() {
@@ -153,6 +162,11 @@ export class SerialTransport extends EventEmitter {
     this.fd = await open(this.path, 'r+');
     this._startRx();
     this.open = true;
+    // 打开端口后的稳定延迟。
+    // stty 配置与 open() 各会让 USB CDC 的 DTR 翻转一次（usbmon 实测可见），
+    // 部分 GD32 固件对 DTR 边沿敏感，紧跟着的首包可能被丢弃。
+    // 100ms 足够让控制线稳定，再对外宣告「已连接」。
+    await new Promise((r) => setTimeout(r, 100));
     // 定期检查设备节点是否存在（应对关机断电或 USB 拔出的情况）
     this._healthTimer = setInterval(async () => {
       if (!this.open) return;
@@ -207,6 +221,7 @@ export class SerialTransport extends EventEmitter {
         try {
           const { bytesRead } = await this.fd.read(buf, 0, buf.length, null);
           if (bytesRead > 0) {
+            this.everRx = true; // 收到过回传 → 双向链路（能做真握手）
             const chunk = buf.toString('utf8', 0, bytesRead);
             this._pending += chunk;
             this.emit('data', chunk);
@@ -231,16 +246,43 @@ export class SerialTransport extends EventEmitter {
     if (!this.open || !this.fd) throw biErr('串口未连接', 'Serial port not connected');
     const buf = typeof data === 'string' ? Buffer.from(data, 'ascii') : data;
     let written = 0;
-    try {
+
+    // 写入看门狗：健康链路下一行指令几毫秒内即完成（usbmon 实测 <1ms）。
+    // 若 write() 卡住超过 writeTimeoutMs，说明设备端停止 ACK/消费
+    // （固件死机或环形缓冲满后不再 re-arm 端点）——必须中止而不是无限等待。
+    const writeOnce = async () => {
       while (written < buf.length) {
         const r = await this.fd.write(buf, written, buf.length - written);
         written += r.bytesWritten;
       }
+      return written;
+    };
+
+    let timer = null;
+    try {
+      const guarded = this.writeTimeoutMs > 0
+        ? Promise.race([
+            writeOnce(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error('__WRITE_TIMEOUT__')), this.writeTimeoutMs);
+            }),
+          ])
+        : writeOnce();
+      return await guarded;
     } catch (err) {
+      if (err && err.message === '__WRITE_TIMEOUT__') {
+        await this.disconnect();
+        throw biErr(
+          `写入超时（>${this.writeTimeoutMs}ms）：机器已停止接收数据。` +
+          '可能原因：机器面板脱机/暂停、固件死机（断电重启可恢复）。',
+          `Write timed out (>${this.writeTimeoutMs}ms): machine stopped accepting data. ` +
+          'Likely causes: panel OFFLINE/paused, or firmware hung (power-cycle to recover).');
+      }
       await this.disconnect();
       throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    return written;
   }
 
   async disconnect() {
@@ -269,6 +311,7 @@ export class TcpTransport extends EventEmitter {
     this.port = opts.port || 9100;
     this.socket = null;
     this.open = false;
+    this.everRx = false; // 网口刻字机通常有回执；收到任何数据即为双向
   }
 
   async connect() {
@@ -280,7 +323,7 @@ export class TcpTransport extends EventEmitter {
         resolve();
       });
       s.setNoDelay(true);
-      s.on('data', (d) => this.emit('data', d.toString('ascii')));
+      s.on('data', (d) => { this.everRx = true; this.emit('data', d.toString('ascii')); });
       s.on('error', (err) => {
         if (!this.open) reject(err);
         else this.emit('error', err);
@@ -327,6 +370,7 @@ export class VirtualPlotter extends EventEmitter {
     this.spi = opts.stepsPerInch || 1000;
     this.firmware = opts.firmware || 'grbl-like';
     this.open = true;
+    this.everRx = true; // 虚拟机会回应答（banner），模拟双向链路
     this.pos = { x: 0, y: 0 };
     this.penDown = false;
     this.running = false;

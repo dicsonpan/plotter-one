@@ -299,10 +299,14 @@ export class HpglBuilder {
     this.bytes = 0;
     this._coordBatch = [];
     this._flushing = false;
-    // 连续坐标流合并：每条 PA 指令最多合并 30 对坐标（约 300~360 字节），
-    // 既能消除数以万计重复的 PA 助记符与分号/换行符传输开销（提速 20%~30%），
-    // 又完全适配 9600 串口小缓冲与固件接收能力。
-    this.maxBatchPairs = options.maxBatchPairs !== undefined ? options.maxBatchPairs : 30;
+    // 默认单点直发 PD x,y;（兼容所有力宇/国产 GD32 刻字机精简固件，避免长包/多坐标被忽略）；
+    // 仅在显式指定 maxBatchPairs > 1 时合并为批量 PD x1,y1,x2,y2...;
+    this.maxBatchPairs = options.maxBatchPairs !== undefined ? options.maxBatchPairs : 1;
+    // 2D 刻字机固件普遍不支持 AA/CI 硬件圆弧插补（文泰驱动一律离散为 PD 折线），默认离散化
+    this.useNativeArc = options.useNativeArc === true;
+    // 文泰闭合过切补偿（datacllt.dll SetCutterCloseAddDist / FUN_1001b2ac）：
+    // 闭合子路径切回起点后，顺着起始段继续多切 overcutMm（默认 0.3mm），防止起收刀处留连皮
+    this.overcutMm = options.overcutMm !== undefined ? Number(options.overcutMm) : 0.3;
   }
 
   // -------------------------------------------------------------------------
@@ -450,7 +454,7 @@ export class HpglBuilder {
       const coords = this._coordBatch.join(',');
       this._coordBatch = [];
       this._flushing = true;
-      this.emit(`PA${coords};`);
+      this.emit(`PD${coords};`);
       this._flushing = false;
     }
     return this;
@@ -488,17 +492,10 @@ export class HpglBuilder {
   /**
    * 初始化机器与设定状态。
    *
-   * 🔴 严禁在卷筒刻字机上发送 SC 指令：
-   *   HP-GL 的 SC Xmin,Xmax,Ymin,Ymax 指令依赖物理缩放点 P1 与 P2：
-   *     Scale_Y = (P2y - P1y) / (Ymax - Ymin)
-   *   刻字机采用滚筒进纸（卷材），Y 轴为连续进纸滚筒，硬件根本没有固定的 Y 轴物理上限（P2y = 0 或未初始化）。
-   *   一旦下发 SC，固件算出的 Y 轴缩放比例直接被归零（Scale_Y = 0），
-   *   导致后续所有 Y 轴运动指令在固件内部全部乘以 0，表现为「Y 轴彻底失去响应」；
-   *   同时 X 轴因错误的缩放基准导致失控狂奔。
-   *
-   *   上位机在 moveTo() / lineTo() / arcTo() 中已经通过 toPlotterUnits()
-   *   把毫米精确按机器脉冲分辨率（如 1000 步/英寸）量化成了整数步进，
-   *   因此直发原生绘图仪步进即可，完全不需要也绝不能下发 SC。
+   * 🔴 严禁在卷筒刻字机上发送 SC 指令与 LT 指令：
+   *   1. HP-GL 的 SC 指令在无固定 Y 上限的卷筒刻字机上会导致 Scale_Y 归零、Y 轴失灵；
+   *   2. LT; 是笔式绘图仪虚线线型指令，部分刻字机精简固件不识别；
+   *   3. 显式发送 PA; 锁定绝对坐标模式，对齐文泰（ArtCut）标准 PLT 头部。
    */
   setupCoords(origin) {
     this.emit('IN;');
@@ -506,8 +503,11 @@ export class HpglBuilder {
       this.emit(';:');
       this.emit('IN;');
     }
+    this.emit('PA;');
     this.emit('SP1;');
-    this.emit('LT;');
+    this.emit('PU0,0;');
+    this.penDown = false;
+    this.pos = { x: 0, y: 0 };
     return this;
   }
 
@@ -524,25 +524,15 @@ export class HpglBuilder {
     return this;
   }
 
-  /** 抬刀。已在抬刀状态时不重复发指令——9600 波特下每个字节都要花时间 */
+  /** 结束落刀批次并标记抬刀（对齐文泰 WritePlt：不发孤立无坐标的 PU;，由后续 PU x,y; 执行抬刀空移） */
   penUp() {
     this._flushCoords();
-    if (this.penDown) { this.emit('PU;'); this.penDown = false; }
+    this.penDown = false;
     return this;
   }
 
   /**
-   * 无条件抬刀：不管软件以为刀是抬着还是落着，都发一条 `PU;`。
-   *
-   * `penUp()` 是给生成任务用的省字节优化（9600 波特下每个字节都要花时间），
-   * 但**手动「抬刀」按钮不能用它**：
-   *   软件对刀状态的认知来自「我这次任务有没有下发过 PD」，
-   *   而机器的真实状态可能与它不一致——比如上一次任务中途被停止、
-   *   串口断线重连、或者换了控制板。
-   *   这时按「抬刀」却因为「我认为刀本来就是抬着的」而不发任何指令，
-   *   结果就是**按钮点了没反应**，而且刀还压着材料。
-   *
-   * 抬刀是安全操作，多发一个字节的成本可以忽略；不发指令的风险不行。
+   * 无条件抬刀：显式发一条 `PU;`（供手动按钮或安全測試调用）。
    */
   forcePenUp() {
     this._flushCoords();
@@ -552,32 +542,41 @@ export class HpglBuilder {
   }
 
   penSelectOn() {
-    this.penUp();
-    // 初始化时已发过 SP1，不重复
+    this._flushCoords();
+    this.penDown = false;
     return this;
   }
 
+  /**
+   * 抬刀空移到绝对坐标 (x, y)：使用文泰标准 `PU x,y;` 格式。
+   * 力宇等国产刻字机固件把 `PA;` 仅作为模态切换指令，直接发 `PA x,y;` 会被部分固件忽略，
+   * 必须用带坐标的 `PU x,y;` 执行空移定位。
+   */
   moveTo(x, y) {
     this._flushCoords();
     const p = this.toMachine(x, y);
     const px = toPlotterUnits(p.x, this.spi);
     const py = toPlotterUnits(p.y, this.spi);
-    this.emit(`PA${px},${py};`);
+    this.emit(`PU${px},${py};`);
+    this.penDown = false;
     this.pos = { x: px, y: py };
     return this;
   }
 
+  /**
+   * 落刀切割到绝对坐标 (x, y)：使用文泰标准 `PD x,y;` 格式。
+   */
   lineTo(x, y) {
     const p = this.toMachine(x, y);
     const px = toPlotterUnits(p.x, this.spi);
     const py = toPlotterUnits(p.y, this.spi);
-    if (!this.penDown) {
-      this.emit('PD;');
-      this.penDown = true;
-    }
-    // 连续落刀切割坐标流合并：将连续的点缓存在当前批次中
-    this._coordBatch.push(px, py);
+    this.penDown = true;
     this.pos = { x: px, y: py };
+    if (this.maxBatchPairs <= 1) {
+      this.emit(`PD${px},${py};`);
+      return this;
+    }
+    this._coordBatch.push(px, py);
     if (this.maxBatchPairs > 0 && this._coordBatch.length >= this.maxBatchPairs * 2) {
       this._flushCoords();
     }
@@ -585,26 +584,27 @@ export class HpglBuilder {
   }
 
   /**
-   * 绝对圆弧：AA cx,cy,起始角,扫掠角（角度制，只能逆时针）
+   * 圆弧：默认按 0.02mm 弦高离散为标准 `PD x,y;` 折线。
    *
-   * 🔴 反射变换（镜像 / 换轴）有两个坑，都必须处理：
-   *
-   *   1. **绕向翻转**：X 镜像 x→w-x 与轴交换 x,y→y,x 都是反射（det = -1），
-   *      会把用户坐标里逆时针的弧变成机器坐标里顺时针的弧。
-   *      而 HP-GL 的 AA 只能逆时针。
-   *      换算：顺时针 s 段 ≡ 逆时针 (360-s) 段，落点与圆弧完全一致。
-   *      反射次数为偶数（如换轴 + 单轴反向 = 旋转 180°）时绕向不变。
-   *
-   *   2. **起始角也要镜像**：起点角 a0 在反射后不再是 a0。
-   *      （X 镜像：a0 → 180-a0；Y 镜像：a0 → -a0）
-   *      起点角发错，固件会从当前位置直线拉到「算出来的圆弧起点」——
-   *      也就是凭空多刻一条不在设计里的线。
-   *
-   * 起点角不手算，直接由**当前实际位置**与映射后的圆心反解：
-   * 当前点必然是 runSubpath 走出来的、已经映射过的真实位置，
-   * 这样起点角与实际位置永远自洽，不依赖任何角度变换公式。
+   * 2D 刻字机固件普遍不支持 `AA` / `CI` 圆弧插补指令（收到会拒动或静默忽略），
+   * 在用户坐标系下离散成折线再走 `lineTo()` 不仅 100% 兼容所有刻字机固件，
+   * 而且天然继承 `toMachine()` 的旋转与镜像变换。
    */
   arcTo(cx, cy, r, a0, a1) {
+    if (!this.useNativeArc) {
+      const rAbs = Math.max(0.001, Math.abs(r));
+      const step = rAbs <= 0.02
+        ? Math.PI / 4
+        : 2 * Math.acos(Math.max(-1, Math.min(1, 1 - 0.02 / rAbs)));
+      const abs = Math.abs(a1 - a0);
+      const n = Math.max(12, Math.ceil(abs / step));
+      for (let i = 1; i <= n; i++) {
+        const t = a0 + ((a1 - a0) * i) / n;
+        this.lineTo(cx + rAbs * Math.cos(t), cy + rAbs * Math.sin(t));
+      }
+      return this;
+    }
+
     this._flushCoords();
     const c = this.toMachine(cx, cy);
     const cxq = toPlotterUnits(c.x, this.spi);
@@ -612,35 +612,26 @@ export class HpglBuilder {
     const rq = toPlotterUnits(r, this.spi);
     if (!this.penDown) { this.emit('PD;'); this.penDown = true; }
 
-    // 起点角由当前点反解（atan2 结果规范化到 0-360）
     let d0 = Math.round(Math.atan2(this.pos.y - cyq, this.pos.x - cxq) / DEG) % 360;
     if (d0 < 0) d0 += 360;
 
-    // 扫掠角：反射则取反，再统一成「逆时针为正」。
-    // isReflection 已把 swapAxes 计入（交换轴也是一次反射，det = -1）。
     let sweep = (a1 - a0) / DEG;
     if (this.isReflection) sweep = -sweep;
     if (Math.abs(sweep) >= 360 - 1e-9) {
-      sweep = 360;              // 整圆：不能被换算成 0（那会退化成零长度弧）
+      sweep = 360;
     } else if (sweep < 0) {
       sweep += 360;
     }
     const d1 = Math.round(sweep);
     this.emit(`AA${cxq},${cyq},${d0},${d1};`);
 
-    // 终点按实际下发的扫掠角推算（绕向换算过，与原始 a1 可能不同）
     const endA = d0 * DEG + d1 * DEG;
     this.pos = { x: cxq + rq * Math.cos(endA), y: cyq + rq * Math.sin(endA) };
     return this;
   }
 
   /**
-   * 椭圆：降级为折线。
-   *
-   * HPGL 的 EA 指令中心量是「相对当前位置」，且不同厂商固件对 Y 轴正方向的
-   * 处理不一致（有的是屏幕坐标向下，有的是数学坐标向上）——实测风险大于收益。
-   * 椭圆在刻字机作业里本来就少见，离散后按 0.02mm 弦高走，肉眼与工件都无差别。
-   * 整圆走 CI/AA 是原生的，不受影响。
+   * 椭圆：离散为折线 `PD x,y;`。
    */
   ellipseTo(cx, cy, rx, ry, a0, a1) {
     const rMax = Math.max(rx, ry);
@@ -657,29 +648,76 @@ export class HpglBuilder {
   }
 
   /**
-   * 整圆：CI 以**当前位置**为起点画圆，所以必须先把笔移到映射后的圆心位置。
-   *
-   * 圆是镜像不变的（反射后仍是同一个圆），所以半径不用改，
-   * 但圆心坐标要经过 toMachine——否则镜像机器上整圆会跑到材料另一头。
-   *
-   * 🔴 这里**不能**调 `moveTo(toMachine(x,y))`：moveTo 内部会再变换一次，
-   * 等于把用户坐标变换了两遍。原点附近两次变换的结果相同，看不出问题；
-   * 但版面旋转 90° 时两次变换会把它推到材料另一头去。
-   * 所以直接发已经映射好的机器坐标。
+   * 整圆：默认离散为闭合折线 `PU x,y;` + `PD x,y;`。
    */
   circleAt(x, y, r) {
+    if (!this.useNativeArc) {
+      this.penUp();
+      this.moveTo(x + r, y);
+      this.arcTo(x, y, r, 0, Math.PI * 2);
+      this.penUp();
+      return this;
+    }
     const c = this.toMachine(x, y);
     this.penUp();
-    this.emit(`PA${toPlotterUnits(c.x, this.spi)},${toPlotterUnits(c.y, this.spi)};`);
+    this.emit(`PU${toPlotterUnits(c.x, this.spi)},${toPlotterUnits(c.y, this.spi)};`);
     this.pos = { x: toPlotterUnits(c.x, this.spi), y: toPlotterUnits(c.y, this.spi) };
     if (!this.penDown) { this.emit('PD;'); this.penDown = true; }
     const rq = toPlotterUnits(r, this.spi);
     this.emit(`CI${rq};`);
-    // CI 结束在圆心正右方（机器坐标），记录真实终点供后续闭合判断。
-    // 镜像时圆心正右方会翻到左侧，所以偏移方向要跟着 axisX 走。
     const dir = this.axisX >= 0 ? 1 : -1;
     this.pos = { x: toPlotterUnits(c.x + r * dir, this.spi), y: toPlotterUnits(c.y, this.spi) };
     return this;
+  }
+
+  /**
+   * 文泰闭合过切补偿（datacllt.dll FUN_1001b2ac / SetCutterCloseAddDist）：
+   * 闭合环切回起点后，顺着起始段方向继续多走 overcutMm，彻底切断起收刀交界处的材料。
+   */
+  _emitOvercut(sub, distMm) {
+    let remain = distMm;
+    let curX = sub.start.x;
+    let curY = sub.start.y;
+    for (const e of sub.elems) {
+      if (remain <= 1e-6) break;
+      if (e.type === 'line') {
+        const dx = e.x2 - curX;
+        const dy = e.y2 - curY;
+        const segLen = Math.hypot(dx, dy);
+        if (segLen > 1e-9) {
+          if (remain <= segLen) {
+            const t = remain / segLen;
+            this.lineTo(curX + dx * t, curY + dy * t);
+            break;
+          }
+          this.lineTo(e.x2, e.y2);
+          remain -= segLen;
+          curX = e.x2;
+          curY = e.y2;
+        }
+      } else if (e.type === 'arc') {
+        const rAbs = Math.max(0.001, Math.abs(e.r));
+        const sweep = e.a1 - e.a0;
+        const arcLen = Math.abs(sweep) * rAbs;
+        if (arcLen > 1e-9) {
+          const takeAngle = Math.min(Math.abs(sweep), remain / rAbs) * (sweep >= 0 ? 1 : -1);
+          this.arcTo(e.cx, e.cy, rAbs, e.a0, e.a0 + takeAngle);
+          if (remain <= arcLen) break;
+          remain -= arcLen;
+          curX = e.cx + rAbs * Math.cos(e.a1);
+          curY = e.cy + rAbs * Math.sin(e.a1);
+        }
+      } else if (e.type === 'ellipse') {
+        const rMax = Math.max(0.001, e.rx, e.ry);
+        const sweep = e.a1 - e.a0;
+        const approxLen = Math.abs(sweep) * rMax;
+        if (approxLen > 1e-9) {
+          const takeAngle = Math.min(Math.abs(sweep), remain / rMax) * (sweep >= 0 ? 1 : -1);
+          this.ellipseTo(e.cx, e.cy, e.rx, e.ry, e.a0, e.a0 + takeAngle);
+          break;
+        }
+      }
+    }
   }
 
   /** 走完一条子路径 */
@@ -692,68 +730,64 @@ export class HpglBuilder {
       else if (e.type === 'ellipse') this.ellipseTo(e.cx, e.cy, e.rx, e.ry, e.a0, e.a1);
     }
     // 闭合子路径若最后一段没回到起点，补一条，否则图形缺边
-    if (sub.closed || closeAll) {
+    const isClosed = sub.closed || closeAll;
+    if (isClosed) {
       const end = currentPoint(sub);
       if (Math.hypot(end.x - sub.start.x, end.y - sub.start.y) > 1e-9) {
         this.lineTo(sub.start.x, sub.start.y);
+      }
+      if (this.overcutMm > 0 && sub.elems.length > 0) {
+        this._emitOvercut(sub, this.overcutMm);
       }
     }
     this.penUp();
     return this;
   }
 
-  /** 回到原点。力宇私有指令 !PG，通用 HPGL 用 PU 移到原点 */
   /**
-   * 回机械原点。
+   * 回到对刀原点 (0,0)。
    *
-   * 🔴 关键区分（踩过坑）：
-   *   - `PU;PA0,0;` 只是**回到 P1 点**。SC 生效后 P1 在哪由映射决定，
-   *     如果 X 轴反向，P1 在右侧，PA0,0 就跑到右端去了——**不是机械原点**。
-   *   - `!PG;` 才是力宇的**机械归位**指令（文泰驱动文档里明确写「归位 !PG;」）。
-   *
-   * 刻完必须机械归位，否则下次开机的位置不对，材料会刻歪。
-   * 所以这里统一用 !PG;，不管当前 SC 怎么设。
-   *
-   * `!PG` 是机器的**物理**动作，不经过任何坐标换算，
-   * 因此它对轴向设置免疫——这也是方向填错时它仍然安全的原因。
+   * 🔴 严禁默认发送 `!PG;`：
+   *   `!PG;` 是机械限位搜索动作（仅 X 轴有开关，滚筒 Y 轴无开关），
+   *   发 `!PG;` 会抛弃对刀原点去撞右端限位，或被部分固件直接忽略。
+   *   回原点统一用 `PU0,0;` 抬刀返回用户对刀原点。
    */
   home() {
-    this.penUp();
-    // DMPL 与 HPGL 都用 !PG；力宇的归位不依赖 SC
-    this.emit('!PG;');
+    this._flushCoords();
+    this.emit('PU0,0;');
+    this.penDown = false;
+    this.pos = { x: 0, y: 0 };
     return this;
   }
 
   end() {
     this.penUp();
-    this.emit('SP0;');
     return this;
   }
 
   /**
    * 生成完整任务指令。
    *
-   * 🔴 原点保护原则：
-   *   刻字机通常由操作者在材料上手动定位刀尖后，按下机身面板的【原点】(Origin) 按钮，
-   *   将当前对刀位置设为局部原点 (0,0)。
-   *   因此任务开头**绝不能默认发送 !PG; 机械归位**！
-   *   `!PG;` 是机械限位搜索动作（仅 X 轴导轨有机械开关，滚筒 Y 轴无开关），
-   *   发 `!PG;` 会使刀头抛弃用户对刀原点、横跨整个导轨去撞右端限位，造成 X 轴疯狂远离原点。
-   *   默认从用户当前对刀原点开始刻绘；仅当明确指定 `options.homeFirst === true` 时才归位。
-   *   刻绘收尾默认抬刀并返回原点 `PA0,0;`，不强行机械撞限位。
+   * 🔴 原点保护与指令合规原则：
+   *   1. 任务开头**绝不发送 !PG; 机械归位**（保护用户在机器面板设置的对刀原点）；
+   *   2. 初始化采用文泰标准 `IN; PA; SP1; PU0,0;`，不发非标的 `LT;`、`SC` 或无坐标的孤立 `PU;`；
+   *   3. 空移统一采用 `PU x,y;`，切割统一采用 `PD x,y;`，圆弧统一离散为 `PD x,y;`；
+   *   4. 收尾统一抬刀返回对刀原点 `PU0,0;`，不发 `SP0;` 或 `!PG;`。
    */
   build(path, options = {}) {
     const origin = options.origin || { x: 0, y: 0 };
 
-    // 1. 默认不发 !PG;（保护用户在机器面板设置的对刀原点）
+    // 1. 默认绝不发 !PG;（仅当显式传入 homeFirst === true 时才发）
     if (options.homeFirst === true) {
       this.penUp();
       this.emit('!PG;');
     }
 
-    // 2. 初始化与设置（IN; SP1; LT;）
+    // 2. 初始化与设置（文泰标准：IN; PA; SP1; PU0,0;）
     this.setupCoords(origin);
-    this.setSpeed(options.speedMmPerSec || 30);
+    if (options.emitSpeed === true || this.dialect === 'hpgl3d' || this.dialect === 'dmpl') {
+      this.setSpeed(options.speedMmPerSec || 30);
+    }
     if (options.force) this.setForce(options.force);
     this.penSelectOn();
 
@@ -766,12 +800,12 @@ export class HpglBuilder {
       this.runSubpath(sub, { closeAll: !!options.closeAll });
     }
 
-    // 4. 收尾：抬刀回到起点并关笔
+    // 4. 收尾：抬刀回到对刀原点 (0,0)
     this.penUp();
     if (options.homeEnd === true) {
-      this.home();
+      this.emit('!PG;');
     } else {
-      this.emit('PA0,0;');
+      this.emit('PU0,0;');
     }
     this.end();
     this._flushCoords();
@@ -791,14 +825,16 @@ export function hpglToDmpl(hpglText) {
   // DMPL: A=绝对, R=相对, D=落刀, U=抬刀, V=速度, S=选笔, Z=复位
   const map = {
     'IN;': ';:A;',
+    'PA;': 'A;',
     'PA': 'A',
     'PR': 'R',
-    'PD;': 'D',
-    'PU;': 'U',
+    'PD;': 'D;',
+    'PU;': 'U;',
     'SP1;': 'S1;',
     'SP0;': 'S0;',
     'LT;': 'T0;',
     'PA0,0;': 'U0,0;',
+    'PU0,0;': 'U0,0;',
   };
   const out = [];
   for (let line of hpglText.split('\n')) {
@@ -807,6 +843,8 @@ export function hpglToDmpl(hpglText) {
     if (map[line]) { out.push(map[line]); continue; }
     let m;
     if ((m = line.match(/^PA((?:-?\d+,-?\d+,?)+);$/))) { out.push(`A${m[1].replace(/,$/, '')};`); continue; }
+    if ((m = line.match(/^PU((?:-?\d+,-?\d+,?)+);$/))) { out.push(`U;A${m[1].replace(/,$/, '')};`); continue; }
+    if ((m = line.match(/^PD((?:-?\d+,-?\d+,?)+);$/))) { out.push(`D;A${m[1].replace(/,$/, '')};`); continue; }
     if ((m = line.match(/^PD;$/))) { out.push('D;'); continue; }
     if ((m = line.match(/^PU;$/))) { out.push('U;'); continue; }
     if ((m = line.match(/^VS(\d+);$/))) { out.push(`V${m[1]};`); continue; }
@@ -833,130 +871,150 @@ export function compileToPlotterLanguage(path, preset, options = {}) {
  * 抬刀快移速度、抬落刀机械时延与机械归位驻留耗时，进行物理执行时间仿真。
  */
 export function estimateHpglMotion(text, options = {}) {
+  const w = createMotionWalker(options);
+  for (const raw of splitCommands(text)) w.feed(raw);
+  return w.summary();
+}
+
+/**
+ * 逐行（每行一条或多条 ';' 指令）的物理耗时（毫秒）。
+ *
+ * 这是节奏化下发的时基：jobEngine 用它把「下发」与「机器执行」对齐。
+ * 与 estimateHpglMotion 共用 createMotionWalker，避免两份换算逻辑漂移。
+ */
+export function estimateLineMotionMs(lines, options = {}) {
+  const w = createMotionWalker(options);
+  return lines.map((line) => {
+    let sum = 0;
+    for (const raw of splitCommands(line)) sum += w.feed(raw);
+    return sum;
+  });
+}
+
+function splitCommands(text) {
+  return text.split(';').map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * 运动学遍历器：逐条喂入指令，**逐条**返回物理耗时（毫秒）。
+ *
+ * 🔴 为什么需要从「一次性总估算」升级到「逐条估算」（2026-10-19 实测驱动）：
+ * 力宇的 USB 口是 GD32 CDC ACM，数据以 USB 速度灌进去（不是真实波特率），
+ * 上位机一次性把上万条指令倒进机器后自己打完勾，机器却还在慢慢刻——
+ * 表现为「日志显示完成、机器还在原地」。
+ * 只有知道**每条指令要花多少时间**，上位机才能按机器的节奏喂数据，
+ * 让「下发」与「执行」保持同步（见 jobEngine 的节奏化流式下发）。
+ */
+function createMotionWalker(options = {}) {
   const stepsPerInch = options.stepsPerInch || 1000;
   const mmPerUnit = 25.4 / stepsPerInch;
-  let cutSpeed = options.defaultSpeed || 30; // mm/s
   const rapidRatio = options.rapidRatio || 4;
-  let rapidSpeed = Math.max(cutSpeed * rapidRatio, 150); // mm/s
+  const homingDwellMs = options.homingDwellMs ?? 3000;
 
+  let cutSpeed = options.defaultSpeed || 30; // mm/s
+  let rapidSpeed = Math.max(cutSpeed * rapidRatio, 150); // mm/s
   let cutLengthMm = 0;
   let rapidLengthMm = 0;
   let penDrops = 0;
   let penLifts = 0;
   let homingCount = 0;
-
   let penDown = false;
   let curX = 0, curY = 0;
 
-  const commands = text.split(';').map((s) => s.trim()).filter(Boolean);
-  for (const raw of commands) {
+  /** 走一段位移：返回耗时（ms），并按当前刀状态计入 cut/rapid 长度 */
+  const walkSegment = (nx, ny) => {
+    const dist = Math.hypot(nx - curX, ny - curY);
+    if (penDown) cutLengthMm += dist;
+    else rapidLengthMm += dist;
+    curX = nx; curY = ny;
+    return (dist / Math.max(1, penDown ? cutSpeed : rapidSpeed)) * 1000;
+  };
+
+  /** 走一串「绝对坐标列表」（PA / PD 带坐标的形式） */
+  const walkCoordList = (coords) => {
+    if (!coords) return 0;
+    let cost = 0;
+    const nums = coords.split(',').map(Number);
+    for (let i = 0; i + 1 < nums.length; i += 2) {
+      if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
+        cost += walkSegment(nums[i] * mmPerUnit, nums[i + 1] * mmPerUnit);
+      }
+    }
+    return cost;
+  };
+
+  /** 喂一条指令（不含分号），返回它的物理耗时（ms） */
+  const feed = (raw) => {
     if (raw === '!PG' || raw === 'H') {
       homingCount++;
       curX = 0; curY = 0;
       penDown = false;
-      continue;
+      // 机械归位没有完成信号，驻留时间计入本条指令的耗时
+      return homingDwellMs;
     }
     const vsM = raw.match(/^(?:VS|V)(\d+)/);
     if (vsM) {
       cutSpeed = Math.max(1, +vsM[1] * 10);
       rapidSpeed = Math.max(cutSpeed * rapidRatio, 150);
-      continue;
+      return 0;
     }
     if (raw.startsWith('PU') || raw === 'U') {
-      if (penDown) { penLifts++; penDown = false; }
-      const coords = raw.startsWith('PU') ? raw.slice(2).trim() : '';
-      if (coords) {
-        const nums = coords.split(',').map(Number);
-        for (let i = 0; i + 1 < nums.length; i += 2) {
-          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
-            const nx = nums[i] * mmPerUnit, ny = nums[i + 1] * mmPerUnit;
-            rapidLengthMm += Math.hypot(nx - curX, ny - curY);
-            curX = nx; curY = ny;
-          }
-        }
-      }
-      continue;
+      let cost = 0;
+      if (penDown) { penLifts++; penDown = false; cost += 30; }
+      return cost + walkCoordList(raw.startsWith('PU') ? raw.slice(2).trim() : '');
     }
     if (raw.startsWith('PD') || raw === 'D') {
-      if (!penDown) { penDrops++; penDown = true; }
-      const coords = raw.startsWith('PD') ? raw.slice(2).trim() : '';
-      if (coords) {
-        const nums = coords.split(',').map(Number);
-        for (let i = 0; i + 1 < nums.length; i += 2) {
-          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
-            const nx = nums[i] * mmPerUnit, ny = nums[i + 1] * mmPerUnit;
-            cutLengthMm += Math.hypot(nx - curX, ny - curY);
-            curX = nx; curY = ny;
-          }
-        }
-      }
-      continue;
+      let cost = 0;
+      if (!penDown) { penDrops++; penDown = true; cost += 40; }
+      return cost + walkCoordList(raw.startsWith('PD') ? raw.slice(2).trim() : '');
     }
     if (raw.startsWith('PA') || raw.startsWith('A')) {
-      const prefix = raw.startsWith('PA') ? 2 : 1;
-      const coords = raw.slice(prefix).trim();
-      if (coords) {
-        const nums = coords.split(',').map(Number);
-        for (let i = 0; i + 1 < nums.length; i += 2) {
-          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
-            const nx = nums[i] * mmPerUnit, ny = nums[i + 1] * mmPerUnit;
-            const dist = Math.hypot(nx - curX, ny - curY);
-            if (penDown) cutLengthMm += dist;
-            else rapidLengthMm += dist;
-            curX = nx; curY = ny;
-          }
-        }
-      }
-      continue;
+      return walkCoordList(raw.slice(raw.startsWith('PA') ? 2 : 1).trim());
     }
     if (raw.startsWith('PR') || raw.startsWith('R')) {
-      const prefix = raw.startsWith('PR') ? 2 : 1;
-      const coords = raw.slice(prefix).trim();
-      if (coords) {
-        const nums = coords.split(',').map(Number);
-        for (let i = 0; i + 1 < nums.length; i += 2) {
-          if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
-            const dx = nums[i] * mmPerUnit, dy = nums[i + 1] * mmPerUnit;
-            const dist = Math.hypot(dx, dy);
-            if (penDown) cutLengthMm += dist;
-            else rapidLengthMm += dist;
-            curX += dx; curY += dy;
-          }
+      const coords = raw.slice(raw.startsWith('PR') ? 2 : 1).trim();
+      if (!coords) return 0;
+      let cost = 0;
+      const nums = coords.split(',').map(Number);
+      for (let i = 0; i + 1 < nums.length; i += 2) {
+        if (!isNaN(nums[i]) && !isNaN(nums[i + 1])) {
+          cost += walkSegment(curX + nums[i] * mmPerUnit, curY + nums[i + 1] * mmPerUnit);
         }
       }
-      continue;
+      return cost;
     }
     if (raw.startsWith('AA')) {
       const parts = raw.slice(2).split(',').map(Number);
       if (parts.length >= 3 && !parts.some(isNaN)) {
         const cx = parts[0] * mmPerUnit, cy = parts[1] * mmPerUnit;
-        const angle = parts[2];
-        const r = Math.hypot(curX - cx, curY - cy);
-        const arcLen = Math.abs(angle) * (Math.PI / 180) * r;
-        if (penDown) cutLengthMm += arcLen;
-        else rapidLengthMm += arcLen;
-        const rad = angle * (Math.PI / 180);
+        const rad = parts[2] * (Math.PI / 180);
         const cos = Math.cos(rad), sin = Math.sin(rad);
         const rx = curX - cx, ry = curY - cy;
-        curX = cx + rx * cos - ry * sin;
-        curY = cy + rx * sin + ry * cos;
+        return walkSegment(cx + rx * cos - ry * sin, cx + rx * sin + ry * cos);
       }
-      continue;
+      return 0;
     }
-  }
-
-  const cutSeconds = cutLengthMm / Math.max(1, cutSpeed);
-  const rapidSeconds = rapidLengthMm / Math.max(1, rapidSpeed);
-  const latencySeconds = (penDrops * 0.04) + (penLifts * 0.03) + (homingCount * 3.0);
-  const totalSeconds = cutSeconds + rapidSeconds + latencySeconds;
+    return 0; // IN / SP / LT 等非运动指令：不产生物理位移
+  };
 
   return {
-    cutLengthMm,
-    rapidLengthMm,
-    cutSeconds,
-    rapidSeconds,
-    latencySeconds,
-    totalSeconds,
-    totalMs: Math.max(200, Math.round(totalSeconds * 1000)),
+    feed,
+    summary() {
+      const cutSeconds = cutLengthMm / Math.max(1, cutSpeed);
+      const rapidSeconds = rapidLengthMm / Math.max(1, rapidSpeed);
+      const latencySeconds = (penDrops * 0.04) + (penLifts * 0.03) + (homingCount * 3.0);
+      const totalSeconds = cutSeconds + rapidSeconds + latencySeconds;
+
+      return {
+        cutLengthMm,
+        rapidLengthMm,
+        cutSeconds,
+        rapidSeconds,
+        latencySeconds,
+        totalSeconds,
+        totalMs: Math.max(200, Math.round(totalSeconds * 1000)),
+      };
+    },
   };
 }
+

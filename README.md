@@ -49,7 +49,7 @@ a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 imple
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# self-test (248 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
+# self-test (270 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
 npm run selftest
 
 # i18n audit (verify every string has both zh and en)
@@ -360,6 +360,9 @@ These were all learned the hard way; recorded here so nobody repeats the experim
 | Behaviour | Explanation |
 |---|---|
 | **`IN;` must be sent first** | After cold start the firmware is uninitialised and **silently ignores all motion commands** without `IN;`. Serial writes succeed and the job shows "complete", but the machine does not move — indistinguishable from a dead serial port |
+| **No query responses at all (one-way link)** | The Liyue GD32 CDC ACM firmware answers nothing — `OI;` / `OA;` / `IN;` are all silent. "Complete" can only be inferred by simulation, and the UI badges the connection as one-way so the operator verifies the cut visually |
+| **A stalled firmware hangs `write()` forever** | When the USB endpoint stops re-arming, the driver blocks in NAK backpressure. A 5-second write watchdog aborts the job with a bilingual error instead of freezing at "caching" forever |
+| **`!PG;` in manual home / end is forbidden** | Mechanical homing searches the X limit switch: it abandons the operator's datum and rams the rail. Home / end now return to the user origin with a relative `PR` move plus `IP0,0;` to lock the datum |
 | **Reverse `SC` is not supported** | `SC23622,0,...` (Xmin > Xmax) makes the firmware compute a **negative scale factor**, sending the whole machine into a runaway (Y spinning, X fleeing). `SC` must always be in ascending order |
 | **`!PG;` gives no completion signal** | Mechanical homing has no done signal and the serial stream does not wait. The host must wait itself (~3s), or the new coordinates take effect mid-homing |
 | **Manual operations must lift the pen unconditionally** | The software's notion of pen state can diverge from the machine's (after an aborted job or a reconnect). Safety operations must send `PU;` regardless |
@@ -371,6 +374,10 @@ Deliberately biased towards "wait longer rather than crash":
 - **No homing at job start**: the first `PA` is absolute positioning, and where the head sits
   before cutting is unknown. Jumping from an unknown position to the start of the artwork
   drives straight into the limit switch.
+- **Write watchdog**: if a serial write makes no progress for 5 seconds the job is aborted
+  with a bilingual error — a stalled GD32 firmware otherwise blocks the driver forever.
+- **One-way links are labelled**: when the machine never answers, "complete" is simulated.
+  The connection card and the job log both say so, so the operator confirms the cut by eye.
 - **Rate limiting + e-stop**: all manual actions go through the job queue and never bypass
   rate limiting; e-stop sends only `PU;` and **no motion command at all**
 - **`SC` always ascending**: a wrong direction setting can at worst mirror the graphic, it
@@ -451,9 +458,16 @@ A pad mirroring the basic operations of Ucancam / 文泰:
 - **True Connection Health Check & Auto Reconnect**:
   - 1.5s periodic health heartbeat and proactive disconnection handling on read/write errors. Turning off or unplugging the engraver immediately sets the UI status to disconnected, eliminating misleading "connected" indicators.
   - Silent background auto-detection and self-healing reconnection upon power-on or USB re-plug.
+- **Link probe after connect** (2026-10-19 hardening): a harmless `IN;` is written right after
+  connecting. If the write times out, the USB layer is stalled — the port is declared unusable
+  and the next candidate is tried instead of showing a green light that dies at the first job.
+  A machine that never answers is badged **"One-way link (no ack, progress is simulated)"**
+  on the connection card.
 - **Direction pad** (▲◀●▶▼), step 0.1 / 1 / 5 / 10 / 25 / 50 mm
   - press-and-hold to move continuously, Shift to reverse; arrow keys work on desktop
 - **Pen up / pen down / home / set origin / reset origin / feed / eject / pen-up-and-home**
+  - **Home / end return to the operator's user origin** with a relative move + `IP0,0;` —
+    never `!PG;` mechanical homing, which would search the X limit and destroy the datum
 - 200mm cap per move, so a slip of the hand cannot run away
 
 ### Output Control & Job History
@@ -592,7 +606,7 @@ manual-control note carries both languages.
 plotter-one/
 ├── server/
 │   ├── index.js              HTTP routes + WebSocket
-│   ├── selftest.js           237 self-checks
+│   ├── selftest.js           270 self-checks
 │   ├── geom/path.js          geometry kernel (paths / matrices / transforms)
 │   ├── cam/
 │   │   ├── toolpath.js       toolpath generation (arcs preserved, not flattened)
@@ -625,7 +639,7 @@ over there".
 ## Development
 
 ```bash
-npm run selftest         # 237 self-checks, no machine required
+npm run selftest         # 270 self-checks, no machine required
 node tools/i18n-check.js # i18n audit
 npm start                # default port 8080
 npm start -- --port 9000

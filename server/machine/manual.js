@@ -112,32 +112,45 @@ export function buildManualCommand(preset, cmd) {
 
     case 'home': {
       /**
-       * 机械归位：先 `IN;` 初始化（否则固件拒绝执行），再抬刀 + `!PG`。
+       * 回用户对刀原点 (0,0)。
        *
-       * `!PG` 是物理归位，不经过坐标换算，所以**不带 SC**——
-       * 归位不该掺入任何坐标系假设，这是它对轴向设置免疫的原因。
+       * 🔴 严禁发送 `!PG;` 机械归位：
+       *   `!PG;` 是搜索右端 X 轴机械限位开关的动作（滚筒 Y 轴无限位开关），
+       *   不仅部分固件直接忽略导致「点了没反应」，在响应的机器上还会抛弃对刀原点去撞限位。
+       *   因为每次手动移动开头都会发 `IN;` 重置固件内部原点，所以优先用前端记录的
+       *   相对偏移 (dx, dy) 通过已实机验证 100% 有效的 `PR dx,dy;` 退回原点，
+       *   并补发 `PA; PU0,0; IP0,0;` 锁定原点基准。
        */
       initPrefix();
+      b.setSpeed(speed);
       b.forcePenUp();
-      b.emit('!PG;');
-      notes.push(n('回机械原点（抬刀后归位，不受坐标设置影响）',
-        'Mechanical home (pen up, independent of coordinate settings)'));
+      const dx = Number(cmd.dx) || 0;
+      const dy = Number(cmd.dy) || 0;
+      if (dx !== 0 || dy !== 0) {
+        const d = b.toMachineDelta(dx, dy);
+        b.emit(`PR${u(d.dx)},${u(d.dy)};`);
+        b.emit('PA;');
+      } else {
+        b.emit('PA;');
+        b.emit('PU0,0;');
+      }
+      b.emit('IP0,0;');
+      notes.push(n('已抬刀并返回当前对刀原点 (0,0)',
+        'Pen up and returned to current user origin (0,0)'));
       break;
     }
 
     case 'penup': {
       /**
-       * 用 forcePenUp() 而不是 penUp()。
-       *
-       * penUp() 在「软件认为刀已抬起」时不发任何指令。手动按钮场景下这是个坑：
-       * 上一次任务被停止 / 串口重连 / 换控制板之后，软件认知与机器真实状态
-       * 可能不一致，此时按「抬刀」会一条指令都不发——按钮点了没反应，
-       * 而刀可能还压着材料。抬刀是安全操作，多发一个字节的成本可忽略。
+       * 用 forcePenUp() 而不是 penUp()，并显式带上 PA; 与 PR0,0; 确保固件立即执行抬刀。
        */
       initPrefix();
+      b.emit('PA;');
       b.forcePenUp();
-      notes.push(n('抬刀（已强制下发 PU，不依赖软件对刀状态的判断）',
-        'Pen up (PU forced, does not rely on software pen state)'));
+      b.emit('PR0,0;');
+      b.emit('PA;');
+      notes.push(n('已抬刀（已强制下发 PU；若刀头原本已抬起则无机械动作）',
+        'Pen up (PU forced; no physical movement if blade was already up)'));
       break;
     }
 
@@ -165,8 +178,8 @@ export function buildManualCommand(preset, cmd) {
     case 'setorigin': {
       // 力宇兼容 HP-GL，IP 就是「设定用户原点」：把当前位置定义为 (0,0)
       initPrefix();
-      b.penUp();
-      b.emit('PU;');
+      b.emit('PA;');
+      b.forcePenUp();
       b.emit('IP0,0;');
       notes.push(n('已把当前位置设为新原点（后续坐标以此为基准）',
         'Current position set as new origin (all coordinates relative to it)'));
@@ -179,11 +192,7 @@ export function buildManualCommand(preset, cmd) {
        * 进纸 / 出纸。
        *
        * 🔴 这台机器（以及力宇 SC 系列）的 **Y 轴就是走纸轴**：
-       * 用户报「回原点时 Y 轴疯狂转动」，那个转的就是走纸滚筒。
        * 所以进纸必须沿 Y 相对移动。
-       *
-       * 原来写的是 `moveTo(d, 0)`——那是**绝对**移动到 (d, 0)，
-       * 名为「进纸 50mm」实际却是把刀头横移到画面某个位置。
        */
       let d = Math.abs(Number(cmd.distance) || 0);
       if (d === 0) { notes.push(n('距离为 0，未发送进纸指令', 'Zero distance, no feed command sent')); break; }
@@ -199,8 +208,7 @@ export function buildManualCommand(preset, cmd) {
 
     case 'stop': {
       b.emit('PU;');
-      b.emit('SP0;');
-      notes.push(n('抬刀并关笔，停止输出', 'Pen up and deselect pen, stop output'));
+      notes.push(n('已抬刀并停止输出', 'Pen up and output stopped'));
       break;
     }
 
@@ -214,12 +222,26 @@ export function buildManualCommand(preset, cmd) {
     }
 
     case 'end': {
+      /**
+       * 抬刀回位：先强制抬刀，再退回当前对刀原点 (0,0)。
+       * 严禁下发 `!PG;`（撞限位）与 `SP0;`（部分固件收到 SP0 后进入脱机拒动状态）。
+       */
       initPrefix();
+      b.setSpeed(speed);
       b.forcePenUp();
-      b.home();
-      b.emit('SP0;');
-      notes.push(n('抬刀并回机械原点，本次控制指令结束',
-        'Pen up and return to mechanical home, control session ended'));
+      const dx = Number(cmd.dx) || 0;
+      const dy = Number(cmd.dy) || 0;
+      if (dx !== 0 || dy !== 0) {
+        const d = b.toMachineDelta(dx, dy);
+        b.emit(`PR${u(d.dx)},${u(d.dy)};`);
+        b.emit('PA;');
+      } else {
+        b.emit('PA;');
+        b.emit('PU0,0;');
+      }
+      b.emit('IP0,0;');
+      notes.push(n('已抬刀并返回对刀原点，本次控制结束',
+        'Pen up and returned to user origin, control session ended'));
       break;
     }
 

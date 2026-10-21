@@ -5,6 +5,18 @@ data/
 # AI 助手的本地工作记忆（个人调试笔记，含机器 IP / 密码等环境信息）
 .workbuddy/
 
+# 🔴 SSH 私钥/公钥误落在仓库目录——严禁入库
+dicson's m1pro
+dicson's m1pro.pub
+
+# 内网部署文档（含设备 IP / 登录口令，按约定不进公开库）
+docs/部署-*.md
+
+# 本地沙盒 demo 与第三方逆向参考资料（不属于本项目交付物）
+haiou_farm_sandbox_3d.html
+haiou_sandbox_deploy/
+reference/
+
 # 依赖（本项目零依赖，留着以防万一）
 node_modules/
 
