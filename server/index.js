@@ -713,6 +713,22 @@ const routes = {
     if (!body.gcode) return sendJson(res, 400, err('没有指令内容', 'No command content'));
     const preset = getPreset(config.machineId);
 
+    // 任务前试探（仅引擎空闲时；忙时跳过，避免与在跑任务交错写字节）。
+    // 力宇是单工机器，无法用「查询应答」判断死活，唯一信号是写入是否畅通：
+    // 写不进 = 机器 USB 层停摆，此刻输出必然「假完成」，直接拒绝并给出对策。
+    // （自远端 10-19 提交移植；本地紧凑流规范下探活指令不带换行符。）
+    if (!engine.busy && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
+      try {
+        await transport.write('IN;');
+      } catch (probeErr) {
+        connected = false;
+        broadcast('device:closed', {});
+        return sendJson(res, 400, err(
+          '机器不应答，已阻止本次输出：' + probeErr.message + '。请断电重启刻字机后重试。',
+          'Machine not responding, output blocked: ' + (probeErr.errorEn || probeErr.message) + ' Power-cycle the plotter and retry.'));
+      }
+    }
+
     const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
     const id = engine.enqueue({
       name: body.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,

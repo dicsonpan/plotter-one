@@ -29,3 +29,20 @@ Thumbs.db
 # 编辑器
 .vscode/
 .idea/
+
+# 🔴 凭据与私钥：绝不进版本库
+dicson's m1pro
+dicson's m1pro.pub
+*.pem
+*.key
+id_rsa
+id_ed25519
+.env
+.env.*
+
+# 🔴 现场部署记录：含设备 IP、登录口令、内网拓扑
+docs/部署-*.md
+
+# 网盘/同步盘产生的冲突副本垃圾（Synology Drive 等持续生成）
+*冲突副本*
+*.sync-conflict-*
