@@ -206,6 +206,40 @@ export const MACHINE_PRESETS = {
     note: '标准 HPGL 分辨率，进口机与部分国产板卡',
     noteEn: 'Standard HPGL resolution; imported machines and some domestic boards',
   },
+  /**
+   * 通用 1016 机（600mm 刻绘宽）—— 金利来新机，2026-10-28 按文泰实机设置匹配。
+   *
+   * 🔴 stepsPerInch = 1016 的判据来自**原厂在用的文泰配置**：
+   *   文泰「刻绘机设置 → 幅面和原点」里水平/纵向分辨率均为 1016。
+   *   行业通例：**力宇系（国产）出厂默认 1000**，即 0.0254mm/step；
+   *   **1016（40 步/mm）是进口机与皮卡 / 精卡 / 酷刻 / 图云一类国产机的取值**。
+   *   所以这台**不是力宇** —— 沿用 liyue-* 预设会引入 1.6% 的系统缩放误差
+   *   （600mm 幅面末端偏离约 9.6mm，图形整体偏小）。
+   *
+   * ⚠️ 方向参数一律给**中性值**：axisX/axisY/swapAxes/layoutRotate 是
+   *   **具体某台机器的机械属性**，换机后旧的实测值全部失效。
+   *   这台机器还没做过方向标定，必须先跑一遍实机校准再刻正式件。
+   *
+   * ⚠️ 方言待确认：文泰里若选的是「支持 DMPL 指令刻字机」则应为 DMPL。
+   *   先按 HPGL 走（项目 HPGL 链路更成熟），现场确认后切 dialect。
+   */
+  'generic-1016-600': {
+    id: 'generic-1016-600',
+    name: '通用 1016（600mm 刻绘宽）',
+    nameEn: 'Generic 1016 (600mm plot width)',
+    width: 600, height: 710,
+    stepsPerInch: 1016,
+    dialect: 'hpgl',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 0,
+    serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
+    maxSpeed: 800, minSpeed: 12.5,
+    force: { min: 70, max: 500, default: 250, unit: 'g' },
+    note: '文泰实测 1016 步/英寸（非力宇的 1000）。刻绘宽 600mm，进纸 710mm 待标定。方向为中性值，需实机校准。',
+    noteEn: 'ArtCut resolution 1016 steps/inch (not Liyu 1000). 600mm plot width, 710mm feed TBD. Neutral axis values - calibrate on machine.',
+  },
   'liyue-4axis': {
     id: 'liyue-4axis',
     name: '力宇四轴 / 伺服刻字机（3D）',

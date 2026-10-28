@@ -450,9 +450,12 @@ const routes = {
       }
       broadcast('device:connected', { connected: true, info: deviceInfo });
       sendJson(res, 200, { ok: true, device: deviceInfo });
-    } catch (err) {
+    } catch (e) {
+      // 🔴 变量名不能叫 err：外层有一个同名的 err(zh, en) 辅助函数，
+      // catch 绑定会遮蔽它，于是 err(...) 调用的是 Error 对象 →
+      // "err is not a function"，真实原因永远出不来（2026-10-28 金利来实测撞到）。
       connected = false;
-      sendJson(res, 400, err(err.message, err.errorEn));
+      sendJson(res, 400, err(e.message, e.errorEn));
     }
   },
 
@@ -587,8 +590,9 @@ const routes = {
       const preset = getPreset(config.machineId);
       const info = analyze(path, preset);
       sendJson(res, 200, { path: pathToClient(path), info });
-    } catch (err) {
-      sendJson(res, 400, err(err.message, err.errorEn));
+    } catch (e) {
+      // 同上：不能用 err 作为 catch 变量名，会遮蔽 err() 辅助函数
+      sendJson(res, 400, err(e.message, e.errorEn));
     }
   },
 
