@@ -23,6 +23,7 @@ if (typeof window !== 'undefined') {
     config: null,
     preset: null,
     presets: {},
+    originPositions: {},
     materials: [],
     connected: false,
     deviceInfo: null,
@@ -32,9 +33,98 @@ if (typeof window !== 'undefined') {
     compiled: null,
     selectedId: null,
     selectedIds: new Set(),
-    knifePos: { x: 0, y: 0 },
-    userOrigin: { x: 0, y: 0 },
+    knifePos: { x: 600, y: 0 },
+    userOrigin: { x: 600, y: 0 },
+    originInitialized: false,
   };
+
+  /** 当前生效的机器原点方位（'bottom-right' | 'bottom-left' | 'top-right' | 'top-left'） */
+  function getOriginPos(presetOverride) {
+    return state.config?.originPosition
+      || (presetOverride || state.preset)?.originPosition
+      || 'bottom-right';
+  }
+
+  /** 当前机器物理原点在画布坐标系（左下为 0,0，X 向右，Y 向上）下的角点坐标 */
+  function getMechOrigin(presetOverride, posOverride) {
+    const p = presetOverride || state.preset || { width: 600, height: 710 };
+    const pos = posOverride || getOriginPos(p);
+    const W = p.width || 600;
+    const H = p.height || 710;
+    switch (pos) {
+      case 'bottom-right': return { x: W, y: 0 };
+      case 'top-right':    return { x: W, y: H };
+      case 'top-left':     return { x: 0, y: H };
+      case 'bottom-left':
+      default:             return { x: 0, y: 0 };
+    }
+  }
+
+  /**
+   * 画布坐标 (x, y) → 相对机械原点的正向距离 (ux, uy)，供状态栏显示。
+   * 例如右下角原点机型在 (W, 0) 处显示为 (0.0, 0.0)。
+   */
+  function modelToOriginCoords(x, y) {
+    const pos = getOriginPos();
+    const mech = getMechOrigin();
+    const isRight = pos === 'bottom-right' || pos === 'top-right';
+    const isTop   = pos === 'top-right' || pos === 'top-left';
+    return {
+      x: isRight ? (mech.x - x) : (x - mech.x),
+      y: isTop   ? (mech.y - y) : (y - mech.y),
+    };
+  }
+
+  /**
+   * 计算包围盒相对于当前工作原点 (state.userOrigin) 的内侧边距 (ox, oy)。
+   * 在右下角原点机型上，ox 是图形右边缘距原点 X 的距离，oy 是图形下边缘距原点 Y 的距离。
+   */
+  function bboxToOriginOffset(bb) {
+    const pos = getOriginPos();
+    const uo = state.userOrigin || getMechOrigin();
+    const isRight = pos === 'bottom-right' || pos === 'top-right';
+    const isTop   = pos === 'top-right' || pos === 'top-left';
+    return {
+      x: isRight ? (uo.x - bb.maxX) : (bb.minX - uo.x),
+      y: isTop   ? (uo.y - bb.maxY) : (bb.minY - uo.y),
+    };
+  }
+
+  /**
+   * 将单个或多个图层贴靠到当前工作原点内侧指定偏移 (marginX, marginY) 处，
+   * 确保刻绘时直接从原点旁起刀，消除刻字前 Y 轴大幅空走。
+   */
+  function snapLayersToOrigin(layers, marginX = 10, marginY = 10) {
+    const list = Array.isArray(layers) ? layers : [layers];
+    if (!list.length) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const l of list) {
+      const b = T.layerBBox(l);
+      if (b.w || b.h) {
+        if (b.minX < minX) minX = b.minX;
+        if (b.minY < minY) minY = b.minY;
+        if (b.maxX > maxX) maxX = b.maxX;
+        if (b.maxY > maxY) maxY = b.maxY;
+      }
+    }
+    if (!Number.isFinite(minX)) return;
+    const w = maxX - minX, h = maxY - minY;
+    const pos = getOriginPos();
+    const uo = state.userOrigin || getMechOrigin();
+    const isRight = pos === 'bottom-right' || pos === 'top-right';
+    const isTop   = pos === 'top-right' || pos === 'top-left';
+
+    const targetMinX = isRight ? (uo.x - marginX - w) : (uo.x + marginX);
+    const targetMinY = isTop   ? (uo.y - marginY - h) : (uo.y + marginY);
+    const dx = targetMinX - minX;
+    const dy = targetMinY - minY;
+
+    const bed = state.preset || { width: 600, height: 710 };
+    for (const l of list) {
+      T.translateLayer(l, dx, dy);
+      T.clampLayerIntoBed(l, bed.width, bed.height, 2);
+    }
+  }
 
   // ---------------------------------------------------------------- 撤销/重做
   const history = {
@@ -124,8 +214,6 @@ if (typeof window !== 'undefined') {
     const box = $('logView');
     const div = document.createElement('div');
     if (kind) div.className = 'log-line-' + kind;
-    // 变量名别叫 t —— 模块顶层的 t() 是取词函数，被局部变量遮蔽后
-    // 这个函数里就再也调不到它了（而且不报错，只是 logLine 里全部取不到词）。
     const stamp = new Date().toLocaleTimeString(lang() === 'en' ? 'en-GB' : 'zh-CN', { hour12: false });
     div.textContent = `[${stamp}] ${text}`;
     box.appendChild(div);
@@ -148,8 +236,6 @@ if (typeof window !== 'undefined') {
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      // 服务端把中文放在 error（既有契约）、英文挂在 errorEn。
-      // 这里按语言挑；都没有才退回状态码文案。
       const msg = (lang() === 'en' ? (data.errorEn || data.error) : data.error);
       throw new Error(msg || t('srv.httpFail', { code: res.status }));
     }
@@ -158,16 +244,11 @@ if (typeof window !== 'undefined') {
 
   // ---------------------------------------------------------------- 初始化
   async function boot() {
-    // 关键：模块脚本在 DOM 解析完成前就会执行，此时父容器可能还没布局，
-    // getBoundingClientRect 会返回 0。必须等布局就绪再量画布。
     if (document.readyState === 'loading') {
       await new Promise((r) => document.addEventListener('DOMContentLoaded', r, { once: true }));
     }
-    // 再等一帧，确保 grid 布局已生效
     await new Promise((r) => requestAnimationFrame(r));
 
-    // 语言必须在任何渲染之前定下来：静态文案靠 applyI18n 刷，
-    // 动态文案（统计、状态、下拉）则由下面的 onLangChange 回调重刷。
     initLang();
 
     renderer.resize();
@@ -175,8 +256,6 @@ if (typeof window !== 'undefined') {
     renderer.fit();
     wireCanvas();
     wireUI();
-    // 切语言后要重画一切动态文案。只刷 HTML 会出现
-    // 「按钮已是英文、统计数字还是中文」的半截状态，比不切还让人困惑。
     onLangChange(() => {
       refreshState();
       renderLayerList();
@@ -209,14 +288,11 @@ if (typeof window !== 'undefined') {
       const dev = state.deviceInfo;
       const chip = dev ? (en ? (dev.chipNameEn || dev.chipName) : (dev.chipNameZh || dev.chipName)) : '';
       let subText = (dev?.path || t('btn.connected')) + (chip ? ` (${chip})` : '');
-      // 单工链路（力宇等 GD32 方案）：机器不回话，完成状态是仿真推算。
-      // 必须在连接卡片上明示，否则「日志说完成、机器没动」会被误判成软件 bug。
       if (dev?.silent) subText += ` · ${t('dev.oneWay')}`;
       sub.textContent = subText;
     } else {
       const n = cachedPorts.length;
       if (n > 1) {
-        // 检测到多个设备：不自动盲连！显示醒目提示并展开面板让用户选择
         card?.classList.add('warn');
         dot.className = 'conn-dot warn';
         title.textContent = t('dev.multiplePorts', { n });
@@ -240,16 +316,20 @@ if (typeof window !== 'undefined') {
 
   async function refreshState() {
     try {
+      const prevPos = state.preset ? getOriginPos() : null;
+      const prevW = state.preset?.width;
+      const prevH = state.preset?.height;
+
       const s = await api('/api/state');
       state.config = s.config;
       state.preset = s.preset;
       state.presets = s.presets;
+      state.originPositions = s.originPositions || {};
       state.materials = s.materials;
       state.connected = s.device.connected;
       state.deviceInfo = s.device.info;
 
-      // 机器下拉。nameEn 由服务端一并下发，避免在前端再维护一份机型名对照表——
-      // 两份表必然会漂移，改了一处忘了另一处，界面就会显示错型号（且不报错）。
+      const curPos = getOriginPos(s.preset);
       const sel = $('machineSel');
       const en = lang() === 'en';
       if (sel.options.length === 0 || sel.dataset.lang !== lang()) {
@@ -262,12 +342,26 @@ if (typeof window !== 'undefined') {
         }
         sel.dataset.lang = lang();
       }
-      // 下拉框同理：聚焦时不回写，否则用户正打开着选项就被刷掉
       if (document.activeElement !== sel) sel.value = s.config.machineId;
-      renderer.setPreset(s.preset);
+
+      const origSel = $('originPosSel');
+      if (origSel && document.activeElement !== origSel) {
+        origSel.value = curPos;
+      }
+
+      renderer.setPreset(s.preset, curPos);
+
+      // 首次初始化或机器幅面/原点方位切换时，将默认原点与刀头同步到新的机械原点角点
+      if (!state.originInitialized || prevPos !== curPos || prevW !== s.preset.width || prevH !== s.preset.height) {
+        const mech = getMechOrigin(s.preset, curPos);
+        state.userOrigin = { ...mech };
+        state.knifePos = { ...mech };
+        state.originInitialized = true;
+      }
+      updateKnifeCoordsDisplay();
       renderer.dirty = true;
 
-      // 材料下拉（nameEn 同样由服务端下发，理由同机器下拉）
+      // 材料下拉
       const ms = $('matSel');
       if (ms.options.length === 0 || ms.dataset.lang !== lang()) {
         ms.innerHTML = '';
@@ -280,24 +374,18 @@ if (typeof window !== 'undefined') {
           ms.appendChild(o);
         }
         ms.dataset.lang = lang();
-        // 恢复上次选择的材料。若配置里的速度/刀压与该预设一致（说明用户没手动改过），
-        // 就把滑块也归位到预设值；否则保留用户的手动设置——
-        // 否则会出现「下拉写着 3mm 亚克力、滑块却是薄纸参数」这种自相矛盾。
         const lastId = s.config.lastMaterial || s.materials[0].id;
         ms.value = lastId;
-        const sel = ms.selectedOptions[0];
-        if (sel && +sel.dataset.speed === +s.config.defaultSpeed
-                   && +sel.dataset.force === +s.config.defaultForce) {
-          $('speedRange').value = sel.dataset.speed;
-          $('speedVal').textContent = sel.dataset.speed;
-          $('forceRange').value = sel.dataset.force;
-          $('forceVal').textContent = sel.dataset.force;
+        const selOpt = ms.selectedOptions[0];
+        if (selOpt && +selOpt.dataset.speed === +s.config.defaultSpeed
+                   && +selOpt.dataset.force === +s.config.defaultForce) {
+          $('speedRange').value = selOpt.dataset.speed;
+          $('speedVal').textContent = selOpt.dataset.speed;
+          $('forceRange').value = selOpt.dataset.force;
+          $('forceVal').textContent = selOpt.dataset.force;
         }
       }
 
-      // 滑块与走刀方向：只在用户没有正在操作时同步。
-      // refreshState 每 5 秒跑一次，无条件回写会把「正在拖动」的滑块拽回去，
-      // 手感很差（拖到一半跳回去）。聚焦中或正在拖动时一律不动。
       const editing = document.activeElement === $('speedRange')
                    || document.activeElement === $('forceRange')
                    || document.activeElement === $('dirSel');
@@ -327,15 +415,13 @@ if (typeof window !== 'undefined') {
 
       updateConnCardDisplay();
 
-      // 手动控制只有连上机器才有意义，未连接时置灰。
-      // .pad-key 是 button，disabled 有效；用 class 让样式一起变灰。
       const padOff = !s.device.connected;
       document.querySelectorAll('[data-manual]').forEach((b) => { b.disabled = padOff; });
       document.querySelectorAll('.pad-key').forEach((b) => { b.disabled = padOff; b.classList.toggle('off', padOff); });
 
-      // 地址由 t() 内部替换 {{host}}，不写死 IP——换网络时提示才准确
       $('qrHint').innerHTML = t('srv.qrHint') + `<br>${t('srv.qrHint2')}`;
 
+      updateTransformPanel();
       updateStats();
     } catch (e) {
       $('serverInfo').textContent = t('srv.unresponsive');
@@ -360,8 +446,6 @@ if (typeof window !== 'undefined') {
         onJobState(payload);
         return;
       }
-      // 服务端日志同时带两种语言，按当前语言取。
-      // 回退到 line 是为了兼容旧服务端（只发单语）时不至于显示空白。
       if (type === 'job:log') { logLine(pickLang(payload)); return; }
       if (type === 'device:data') {
         if (payload.data && payload.data.trim()) logLine('← ' + payload.data.trim().slice(0, 60), 'ok');
@@ -383,15 +467,6 @@ if (typeof window !== 'undefined') {
     ws.onerror = () => { /* onclose 会重连 */ };
   }
 
-  /**
-   * 从服务端消息里取当前语言的那一份。
-   *
-   * 服务端对每条面向用户的文案都同时下发中英两份，字段名有两套约定：
-   *   - 日志 / 警告：`{ zh, en }`（还有 `line` 兼容旧前端）
-   *   - meta.note：`{ note, noteEn }`（note 是既有字段，保留中文语义）
-   * 两种都支持，取不到就返回空串由调用方决定兜底——
-   * 宁可少显示，也不要给用户一串 undefined。
-   */
   function pickLang(p) {
     if (p === null || p === undefined) return '';
     if (typeof p === 'string') return p;
@@ -405,7 +480,7 @@ if (typeof window !== 'undefined') {
     state.config = s.config;
     state.preset = s.preset;
     state.jobState = s.job.state;
-    renderer.setPreset(s.preset);
+    renderer.setPreset(s.preset, getOriginPos(s.preset));
     refreshState();
   }
 
@@ -458,9 +533,6 @@ if (typeof window !== 'undefined') {
     $('jobPanel').style.display = 'block';
     const fill = $('progFill');
     fill.className = 'progress-fill' + (s.state === 'done' ? ' ok' : s.state === 'aborted' ? ' stop' : '');
-    // 按钮文案不能靠 data-i18n 自动刷：它是按状态动态切换的，
-    // 必须每次进这里都重设一遍，否则切语言后会与当前状态不符
-    // （比如暂停中却显示英文「Pause」）。
     if (s.state === 'idle') { $('btnPause').textContent = t('btn.pause'); }
     if (s.state === 'paused') { $('btnPause').textContent = t('btn.resume'); }
     if (s.state === 'running') { $('btnPause').textContent = t('btn.pause'); }
@@ -468,7 +540,6 @@ if (typeof window !== 'undefined') {
     refreshState();
   }
 
-  /** 毫秒 → 「1分 20秒」/「1m 20s」这类可读时长 */
   function fmtTime(ms) {
     const s = Math.round(ms / 1000);
     if (s < 60) return t('time.sec', { n: s });
@@ -478,17 +549,14 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 画布交互
-  // 交互手感常量。全部「慢」是刻字场景的合理默认：
-  // 刻字机一旦启动不好停，预览时看不清、抓不住比操作慢更麻烦。
   const TUNING = {
-    zoomStep: 1.06,        // 滚轮每格缩放 6%（原来 12%，太快看不清过程）
-    panKeyStep: 40,       // 方向键平移像素（原来 100）
-    dragThreshold: 4,     // 超过这个位移才算拖拽，否则算点击选择
-    pinchMin: 1.01,       // 触屏双指缩放的最小步进
+    zoomStep: 1.06,
+    panKeyStep: 40,
+    dragThreshold: 4,
+    pinchMin: 1.01,
   };
 
   function wireCanvas() {
-    // mode: null | 'pan' | 'move' | 'scale' | 'rotate'
     let mode = null;
     let lastX = 0, lastY = 0, moved = 0;
     let dragLayer = null;
@@ -509,14 +577,12 @@ if (typeof window !== 'undefined') {
       const p = localPos(e);
       lastX = e.clientX; lastY = e.clientY; moved = 0;
 
-      // 平移：中键 / 平移工具 / 空格 / 右键 —— 不碰图形
       if (renderer.tool === 'pan' || e.button === 1 || e.button === 2 || e.shiftKey) {
         mode = 'pan';
         canvas.style.cursor = 'grabbing';
         return;
       }
 
-      // 优先看是否抓到控制点（在图形之上）
       const hd = renderer.hitHandle(p.x, p.y);
       if (hd && hd.kind === 'rotate') {
         const layer = renderer.layers.find((l) => l.id === state.selectedId);
@@ -542,7 +608,6 @@ if (typeof window !== 'undefined') {
         return;
       }
 
-      // 否则尝试选中并拖动图形
       const m = renderer.toModel(p.x, p.y);
       const hit = renderer.hitTest(m.x, m.y);
       if (hit) {
@@ -569,7 +634,7 @@ if (typeof window !== 'undefined') {
           renderer.selectedId = null;
           renderer.selectedIds = state.selectedIds;
         }
-        mode = 'pan';   // 空白处拖动 = 平移画布
+        mode = 'pan';
       }
       renderer.dirty = true;
       renderLayerList();
@@ -582,7 +647,6 @@ if (typeof window !== 'undefined') {
       const p = localPos(e);
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
 
-      // 悬停提示：让用户知道哪里能抓
       if (!mode) {
         const hd = renderer.hitHandle(p.x, p.y);
         if (hd) {
@@ -625,18 +689,13 @@ if (typeof window !== 'undefined') {
         const c = scaleStart.corner;
         const dxPx = p.x - scaleStart.px;
         const dyPx = p.y - scaleStart.py;
-        // 抓住哪个角，就让那一侧跟着鼠标走：
-        //   nw（左上）→ 往右下拖 = 变小；往左上拖 = 变大
-        //   se（右下）→ 往右下拖 = 变大
-        // 屏幕 Y 向下、模型 Y 向上，纵向符号与横向相反。
         const sx0 = (c === 'nw' || c === 'sw') ? -dxPx : dxPx;
         const sy0 = (c === 'sw' || c === 'se') ? dyPx : -dyPx;
         let fx = 1 + sx0 / (renderer.scale * w0);
         let fy = 1 + sy0 / (renderer.scale * h0);
-        if (e.shiftKey) { const s = Math.max(fx, fy); fx = fy = s; }   // 锁定比例
+        if (e.shiftKey) { const s = Math.max(fx, fy); fx = fy = s; }
         if (fx < 0.05) fx = 0.05;
         if (fy < 0.05) fy = 0.05;
-        // 每次从起始快照重算，否则增量累积会漂
         dragLayer.subpaths = structuredClone(scaleStart.subpaths);
         T.scaleLayer(dragLayer, fx, fy);
         renderer.dirty = true;
@@ -648,7 +707,7 @@ if (typeof window !== 'undefined') {
         }
         const cur = Math.atan2(p.y - rotateStart.sy, p.x - rotateStart.sx);
         let deg = (cur - rotateStart.angle) * 180 / Math.PI;
-        if (e.shiftKey) deg = Math.round(deg / 15) * 15;   // Shift 吸 15°
+        if (e.shiftKey) deg = Math.round(deg / 15) * 15;
         dragLayer.subpaths = structuredClone(rotateStart.subpaths);
         T.rotateLayer(dragLayer, deg, rotateStart.cx, rotateStart.cy);
         renderer.dirty = true;
@@ -660,7 +719,6 @@ if (typeof window !== 'undefined') {
 
     const endDrag = () => {
       if (mode === 'move' && dragLayer) {
-        // 拖完把图形收回材料框内，避免移到外面刻不到
         const bed = state.preset || { width: 600, height: 710 };
         const targets = state.selectedIds.has(dragLayer.id)
           ? renderer.layers.filter((l) => state.selectedIds.has(l.id))
@@ -688,7 +746,6 @@ if (typeof window !== 'undefined') {
       updateZoomBadge();
     }, { passive: false });
 
-    // 触屏双指缩放
     let pinchStart = null;
     canvas.addEventListener('touchstart', (e) => {
       if (e.touches.length === 2) {
@@ -731,7 +788,6 @@ if (typeof window !== 'undefined') {
 
     window.addEventListener('resize', () => {
       renderer.resize();
-      // 视口尺寸变了，缩放比例要跟着重算，否则内容会跑出画面
       fitToContent();
     });
   }
@@ -758,7 +814,6 @@ if (typeof window !== 'undefined') {
     return layer;
   }
 
-  /** 让视图框住所有内容。首次加内容时调用，否则用户会看到空白画布。 */
   function fitToContent() {
     const visible = renderer.layers.filter((l) => !l.hidden);
     if (!visible.length) { renderer.fit(); renderer.dirty = true; updateZoomBadge(); return; }
@@ -778,15 +833,9 @@ if (typeof window !== 'undefined') {
     if (!isFinite(minX)) { renderer.fit(); renderer.dirty = true; return; }
 
     const preset = state.preset || { width: 630, height: 710 };
-    // 内容与材料框取并集：既要看清图形，也要看到机器边界。
-    // 但材料框常常远大于内容（630mm 幅面上放一块 300mm 的牌子），
-    // 若直接按并集算缩放，内容会缩成一小团。所以：
-    // 缩放按「并集」算（保证都能看见），偏移按「内容中心」算（保证主体居中）。
     const boxMinX = Math.min(0, minX), boxMinY = Math.min(0, minY);
     const boxMaxX = Math.max(preset.width, maxX), boxMaxY = Math.max(preset.height, maxY);
 
-    // 视口尺寸必须有效。Renderer.resize() 在父容器未布局时会保留旧值，
-    // 这里若拿到 0 就会算出 Infinity/NaN，坐标全部落到画布外——画布一片空白。
     let { vw, vh } = renderer;
     if (!vw || !vh) {
       renderer.resize();
@@ -794,7 +843,6 @@ if (typeof window !== 'undefined') {
       vh = renderer.vh || 1;
     }
 
-    // 缩放：取「内容」与「材料框」中较小的那套，让内容尽量放大看得清
     const pad = 28;
     const scaleContent = Math.min(
       (vw - pad * 2) / Math.max(1, maxX - minX),
@@ -804,10 +852,7 @@ if (typeof window !== 'undefined') {
       (vw - pad * 2) / Math.max(1, boxMaxX - boxMinX),
       (vh - pad * 2) / Math.max(1, boxMaxY - boxMinY)
     );
-    // 内容很小就按内容放大（并留一点余量让材料框可见），很大就按内容缩
     renderer.scale = Math.max(0.2, scaleContent > scaleBed * 2.2 ? scaleContent * 0.9 : scaleBed);
-
-    // 偏移按材料框中心，保证机器边界和内容一起居中
     renderer.offsetX = (boxMinX + boxMaxX) / 2;
     renderer.offsetY = (boxMinY + boxMaxY) / 2;
     renderer.dirty = true;
@@ -821,6 +866,7 @@ if (typeof window !== 'undefined') {
     $('layerEmpty').style.display = list.length ? 'none' : '';
     $('layerCount').textContent = list.length ? t('layers.count', { n: list.length }) : '';
     $('btnSend').disabled = list.length === 0;
+    if ($('btnFrame')) $('btnFrame').disabled = list.length === 0;
 
     for (const layer of list.slice().reverse()) {
       const el = document.createElement('div');
@@ -880,44 +926,6 @@ if (typeof window !== 'undefined') {
       });
       box.appendChild(el);
     }
-  }
-
-  function ungroupLayer(layer) {
-    if (!layer) return;
-    const idx = renderer.layers.indexOf(layer);
-    if (idx === -1) return;
-    let newLayers = [];
-    if (layer.children && layer.children.length > 0) {
-      newLayers = layer.children.map((child, i) => ({
-        id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6) + '_' + i,
-        name: child.name || `${layer.name} #${i + 1}`,
-        subpaths: structuredClone(child.subpaths),
-        hidden: false,
-        isGroup: !!child.isGroup,
-        children: child.children ? structuredClone(child.children) : null,
-      }));
-    } else if (layer.subpaths.length > 1) {
-      newLayers = layer.subpaths.map((sub, i) => ({
-        id: 'L' + Date.now() + Math.random().toString(36).slice(2, 6) + '_' + i,
-        name: `${layer.name} #${i + 1}`,
-        subpaths: [structuredClone(sub)],
-        hidden: false,
-        isGroup: false,
-        children: null,
-      }));
-    }
-    if (newLayers.length <= 1) return;
-    pushHistory();
-    renderer.layers.splice(idx, 1, ...newLayers);
-    state.selectedIds = new Set([newLayers[0].id]);
-    state.selectedId = newLayers[0].id;
-    renderer.selectedId = state.selectedId;
-    renderer.selectedIds = state.selectedIds;
-    renderer.dirty = true;
-    renderLayerList();
-    updateTransformPanel();
-    updateStats();
-    toast(t('toast.ungrouped', { n: newLayers.length }), 'ok');
   }
 
   function groupSelectedLayers() {
@@ -983,7 +991,6 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 对象属性
-  const selectedLayer = () => renderer.layers.find((l) => l.id === state.selectedId) || null;
   const round1 = (v) => Math.round(v * 10) / 10;
 
   function deleteSelected() {
@@ -1008,10 +1015,12 @@ if (typeof window !== 'undefined') {
     const toDup = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
     if (!toDup.length) return;
     pushHistory();
+    const pos = getOriginPos();
+    const isRight = pos === 'bottom-right' || pos === 'top-right';
     const copies = toDup.map((l) => {
       const copy = T.duplicateLayer(l);
       copy.name = t('prop.copySuffix', { name: l.name });
-      T.translateLayer(copy, 10, -10);
+      T.translateLayer(copy, isRight ? -10 : 10, 10);
       return copy;
     });
     renderer.layers.push(...copies);
@@ -1141,9 +1150,10 @@ if (typeof window !== 'undefined') {
       bb = T.layerBBox(selected[0]);
     }
 
-    // 用户正在输入时不要回写，否则打字打到一半被冲掉
-    if (document.activeElement !== $('propX')) $('propX').value = round1(bb.minX);
-    if (document.activeElement !== $('propY')) $('propY').value = round1(bb.minY);
+    // 属性栏 X / Y 显示相对于当前原点的距离（例如右下角原点时，距右边缘 10mm、下边缘 10mm 即显示 X=10, Y=10）
+    const origOff = bboxToOriginOffset(bb);
+    if (document.activeElement !== $('propX')) $('propX').value = round1(origOff.x);
+    if (document.activeElement !== $('propY')) $('propY').value = round1(origOff.y);
     if (document.activeElement !== $('propW')) $('propW').value = round1(bb.w);
     if (document.activeElement !== $('propH')) $('propH').value = round1(bb.h);
     if (document.activeElement !== $('propRot')) $('propRot').value = round1(selected[0].rotation || 0);
@@ -1156,7 +1166,7 @@ if (typeof window !== 'undefined') {
     }
   }
 
-  function afterTransform(layer) {
+  function afterTransform() {
     renderer.dirty = true;
     updateTransformPanel();
     updateStats();
@@ -1164,34 +1174,28 @@ if (typeof window !== 'undefined') {
   }
 
   function wireTransformPanel() {
-    // 坐标：把包围盒左上角挪到指定位置
+    // 坐标：按相对于当前原点的距离 (X, Y) 定位选中对象
     const applyXY = () => {
       const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
       if (!selected.length) return;
       pushHistory();
-      let bb;
-      if (selected.length > 1) {
-        let minX = Infinity, minY = Infinity;
-        for (const l of selected) {
-          const b = T.layerBBox(l);
-          if (b.minX < minX) minX = b.minX;
-          if (b.minY < minY) minY = b.minY;
-        }
-        bb = { minX, minY };
-      } else {
-        bb = T.layerBBox(selected[0]);
-      }
-      const targetX = +$('propX').value || 0;
-      const targetY = +$('propY').value || 0;
-      const dx = targetX - bb.minX;
-      const dy = targetY - bb.minY;
-      for (const l of selected) {
-        T.translateLayer(l, dx, dy);
-      }
-      afterTransform(selected[0]);
+      const targetOx = +$('propX').value || 0;
+      const targetOy = +$('propY').value || 0;
+      snapLayersToOrigin(selected, targetOx, targetOy);
+      afterTransform();
     };
     $('propX').addEventListener('change', applyXY);
     $('propY').addEventListener('change', applyXY);
+
+    $('btnSnapOrigin')?.addEventListener('click', () => {
+      const selected = renderer.layers.filter((l) => state.selectedIds.has(l.id) || l.id === state.selectedId);
+      const targets = selected.length ? selected : renderer.layers.filter((l) => !l.hidden);
+      if (!targets.length) return;
+      pushHistory();
+      snapLayersToOrigin(targets, 10, 10);
+      afterTransform();
+      toast(t('toast.snappedOrigin'), 'ok');
+    });
 
     // 尺寸：缩放到目标宽高（可锁比例）
     const applyWH = () => {
@@ -1221,7 +1225,7 @@ if (typeof window !== 'undefined') {
       for (const l of selected) {
         T.scaleLayer(l, sx, sy, cx, cy);
       }
-      afterTransform(selected[0]);
+      afterTransform();
     };
     $('propW').addEventListener('change', applyWH);
     $('propH').addEventListener('change', applyWH);
@@ -1251,7 +1255,7 @@ if (typeof window !== 'undefined') {
           l.rotation = target;
           T.rotateLayer(l, delta, cx, cy);
         }
-        afterTransform(selected[0]);
+        afterTransform();
       }
     });
 
@@ -1272,7 +1276,7 @@ if (typeof window !== 'undefined') {
         l.rotation = (l.rotation || 0) + deg;
         T.rotateLayer(l, deg, cx, cy);
       }
-      afterTransform(selected[0]);
+      afterTransform();
     };
     $('btnRotateL').addEventListener('click', () => spin(-90));
     $('btnRotateR').addEventListener('click', () => spin(90));
@@ -1295,20 +1299,19 @@ if (typeof window !== 'undefined') {
         }
         const allBb = { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
         let dx = 0, dy = 0;
-        if (a === 'left') dx = 2 - allBb.minX;
-        else if (a === 'right') dx = (bed.width - 2) - allBb.maxX;
+        if (a === 'left') dx = 10 - allBb.minX;
+        else if (a === 'right') dx = (bed.width - 10) - allBb.maxX;
         else if (a === 'hcenter') dx = bed.width / 2 - allBb.cx;
-        else if (a === 'bottom') dy = 2 - allBb.minY;
-        else if (a === 'top') dy = (bed.height - 2) - allBb.maxY;
+        else if (a === 'bottom') dy = 10 - allBb.minY;
+        else if (a === 'top') dy = (bed.height - 10) - allBb.maxY;
         else if (a === 'vcenter') dy = bed.height / 2 - allBb.cy;
         for (const l of selected) {
           T.translateLayer(l, round1(dx), round1(dy));
         }
-        afterTransform(selected[0]);
+        afterTransform();
       });
     });
 
-    // 翻转（镜像）：水平镜像与垂直镜像
     $('btnFlipX').addEventListener('click', () => flipSelected(true));
     $('btnFlipY').addEventListener('click', () => flipSelected(false));
 
@@ -1318,7 +1321,7 @@ if (typeof window !== 'undefined') {
       if (!selected.length) return;
       pushHistory();
       renderer.layers = renderer.layers.filter((x) => !selected.includes(x)).concat(selected);
-      afterTransform(selected[0]);
+      afterTransform();
     });
 
     $('btnDelLayer').addEventListener('click', deleteSelected);
@@ -1326,9 +1329,9 @@ if (typeof window !== 'undefined') {
     $('btnGroup')?.addEventListener('click', groupSelectedLayers);
     $('btnUngroup')?.addEventListener('click', ungroupSelectedLayers);
   }
+
   // ---------------------------------------------------------------- UI 绑定
   function wireUI() {
-    // 移动端标签
     document.querySelectorAll('.mtab').forEach((b) => {
       b.addEventListener('click', () => {
         document.querySelectorAll('.mtab').forEach((x) => x.classList.remove('active'));
@@ -1337,7 +1340,6 @@ if (typeof window !== 'undefined') {
         $('panelLeft').classList.toggle('show', p === 'left');
         $('panelRight').classList.toggle('show', p === 'right');
         if (p === 'none') {
-          // 侧栏收起后画布变宽，必须重算缩放，否则内容会偏在一侧
           requestAnimationFrame(() => { renderer.resize(); fitToContent(); });
         }
       });
@@ -1384,7 +1386,7 @@ if (typeof window !== 'undefined') {
     });
     vectorizer.init();
 
-    // 文字
+    // 文字：按距当前原点的偏移 (txtX, txtY) 自动放置，消除 Y 轴长距离空走
     $('btnAddText').addEventListener('click', async () => {
       const text = $('txtContent').value.trim();
       if (!text) { toast(t('toast.emptyText'), 'err'); return; }
@@ -1395,28 +1397,41 @@ if (typeof window !== 'undefined') {
             text,
             sizeMm: +$('txtSize').value,
             rotation: +$('txtRot').value,
-            x: +$('txtX').value,
-            y: +$('txtY').value,
+            x: 0,
+            y: 0,
           },
         });
-        addLayer(t('layer.text', { text: text.slice(0, 8) }), r.path);
-        // 服务端 note 也是双语的（meta.noteZh / meta.noteEn）
+        pushHistory();
+        const layer = addLayer(t('layer.text', { text: text.slice(0, 8) }), r.path);
+        const offX = +$('txtX').value || 10;
+        const offY = +$('txtY').value || 10;
+        snapLayersToOrigin(layer, offX, offY);
+        state.selectedId = layer.id;
+        state.selectedIds = new Set([layer.id]);
+        renderer.selectedId = layer.id;
+        renderer.selectedIds = state.selectedIds;
+        afterTransform();
         const note = pickLang(r.path.meta?.note);
         toast(note || t('toast.added'), r.path.meta?.unsupported?.length ? 'err' : 'ok');
       } catch (e) { toast(e.message, 'err'); }
     });
 
-    // 图形
+    // 图形：生成后默认贴靠在当前原点内侧 10mm 处
     $('btnAddShape').addEventListener('click', async () => {
       const type = $('shpType').value;
       const size = +$('shpSize').value;
-      const p = state.preset || { width: 630, height: 710 };
-      const cx = p.width / 2, cy = p.height / 2;
-      const body = { type, x: cx - size / 2, y: cy - size / 2, w: size, h: size, r: size / 2, rx: size / 2, ry: size / 3, x1: cx - size / 2, y1: cy, x2: cx + size / 2, y2: cy };
+      const body = { type, x: 0, y: 0, w: size, h: size, r: size / 2, rx: size / 2, ry: size / 3, x1: 0, y1: 0, x2: size, y2: 0 };
       try {
         const r = await api('/api/geometry', { method: 'POST', body: { items: [body] } });
-        // 形状名直接用下拉项自己的文案，所见即所得
-        addLayer($('shpType').selectedOptions[0].textContent, r.path);
+        pushHistory();
+        const layer = addLayer($('shpType').selectedOptions[0].textContent, r.path);
+        snapLayersToOrigin(layer, 10, 10);
+        state.selectedId = layer.id;
+        state.selectedIds = new Set([layer.id]);
+        renderer.selectedId = layer.id;
+        renderer.selectedIds = state.selectedIds;
+        afterTransform();
+        toast(t('toast.added'), 'ok');
       } catch (e) { toast(e.message, 'err'); }
     });
 
@@ -1435,16 +1450,34 @@ if (typeof window !== 'undefined') {
       refreshState();
     });
 
-    // 语言切换。setLang 内部会：刷 HTML 静态文案 → 触发 onLangChange 回调
-    // → 回调里重刷动态文案与画布。所以这里不用自己做任何刷新动作。
     $('btnLang').addEventListener('click', () => {
       setLang(lang() === 'zh' ? 'en' : 'zh');
     });
 
     $('machineSel').addEventListener('change', async () => {
-      await api('/api/config', { method: 'POST', body: { machineId: $('machineSel').value } });
+      const machineId = $('machineSel').value;
+      const nextPreset = state.presets[machineId];
+      const nextOriginPos = nextPreset?.originPosition || 'bottom-right';
+      await api('/api/config', { method: 'POST', body: { machineId, originPosition: nextOriginPos } });
+      state.originInitialized = false;
       toast(t('toast.machineChanged'));
-      refreshState();
+      await refreshState();
+      if (renderer.layers.length) {
+        snapLayersToOrigin(renderer.layers.filter((l) => !l.hidden), 10, 10);
+        afterTransform();
+      }
+    });
+
+    $('originPosSel')?.addEventListener('change', async () => {
+      const originPosition = $('originPosSel').value;
+      await api('/api/config', { method: 'POST', body: { originPosition } });
+      state.originInitialized = false;
+      toast(t('toast.originPosChanged'), 'ok');
+      await refreshState();
+      if (renderer.layers.length) {
+        snapLayersToOrigin(renderer.layers.filter((l) => !l.hidden), 10, 10);
+        afterTransform();
+      }
     });
 
     // 参数
@@ -1465,15 +1498,13 @@ if (typeof window !== 'undefined') {
     $('forceRange').addEventListener('change', saveConfig);
     $('dirSel').addEventListener('change', saveConfig);
 
-    // 输出
+    // 输出与走框预览
     $('btnPreview').addEventListener('click', previewAnim);
     $('btnCompile').addEventListener('click', doCompile);
+    $('btnFrame')?.addEventListener('click', doFrame);
     $('btnSend').addEventListener('click', doSend);
 
     $('btnPause').addEventListener('click', async () => {
-      // ⚠️ 判据必须用 state.jobState，**不能**比按钮文案。
-      // 按钮文案会随语言变化（中文「暂停」/ 英文「Pause」），
-      // 拿文案判状态在英文下必然失效——症状是「点了没反应」或「暂停/继续反了」。
       const pausing = state.jobState !== 'paused';
       await api(pausing ? '/api/job/pause' : '/api/job/resume', { method: 'POST' });
     });
@@ -1530,11 +1561,6 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 手动控制
-  /**
-   * 发送一条手动控制指令。
-   * 所有手动动作都走后端队列而非前端直写串口：
-   * 这样能限速、能看日志、并且急停依然有效——不能有绕过急停的路径。
-   */
   async function sendManual(cmd, label) {
     if (!state.connected) { toast(t('toast.noDevice'), 'err'); return; }
     try {
@@ -1551,11 +1577,13 @@ if (typeof window !== 'undefined') {
   }
 
   function updateKnifeCoordsDisplay() {
+    const kRel = modelToOriginCoords(state.knifePos.x, state.knifePos.y);
+    const oRel = modelToOriginCoords(state.userOrigin.x, state.userOrigin.y);
     if ($('knifePosVal')) {
-      $('knifePosVal').textContent = `X: ${state.knifePos.x.toFixed(1)}, Y: ${state.knifePos.y.toFixed(1)} mm`;
+      $('knifePosVal').textContent = `X: ${kRel.x.toFixed(1)}, Y: ${kRel.y.toFixed(1)} mm`;
     }
     if ($('userOriginVal')) {
-      $('userOriginVal').textContent = `X: ${state.userOrigin.x.toFixed(1)}, Y: ${state.userOrigin.y.toFixed(1)} mm`;
+      $('userOriginVal').textContent = `X: ${oRel.x.toFixed(1)}, Y: ${oRel.y.toFixed(1)} mm`;
     }
     renderer.knifePos = state.knifePos;
     renderer.userOrigin = state.userOrigin;
@@ -1564,7 +1592,6 @@ if (typeof window !== 'undefined') {
   function wirePad() {
     const step = () => +$('stepMm').value || 5;
 
-    // 方向键：支持按住连续移动（pointerdown 后定时重复）
     document.querySelectorAll('.pad-key[data-dx]').forEach((key) => {
       let timer = null;
       let repeat = null;
@@ -1585,7 +1612,6 @@ if (typeof window !== 'undefined') {
         key.classList.add('pressed');
         const sign = e.shiftKey ? -1 : 1;
         moveOnce(sign);
-        // 先等 400ms 再开始连发，避免轻点也触发一串
         timer = setTimeout(() => { repeat = setInterval(() => moveOnce(sign), 90); }, 400);
       });
 
@@ -1599,7 +1625,6 @@ if (typeof window !== 'undefined') {
       key.addEventListener('lostpointercapture', stop);
     });
 
-    // 中心键：落刀
     const center = document.querySelector('.pad-key.center');
     if (center) {
       center.addEventListener('click', () => {
@@ -1609,7 +1634,6 @@ if (typeof window !== 'undefined') {
       });
     }
 
-    // 动作按钮
     document.querySelectorAll('[data-manual]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const action = btn.dataset.manual;
@@ -1617,8 +1641,10 @@ if (typeof window !== 'undefined') {
           if (!confirm(t('confirm.setorigin'))) return;
           state.userOrigin = { x: state.knifePos.x, y: state.knifePos.y };
           updateKnifeCoordsDisplay();
+          updateTransformPanel();
           renderer.dirty = true;
-          toast(t('toast.originSet', { x: state.userOrigin.x.toFixed(1), y: state.userOrigin.y.toFixed(1) }), 'ok');
+          const oRel = modelToOriginCoords(state.userOrigin.x, state.userOrigin.y);
+          toast(t('toast.originSet', { x: oRel.x.toFixed(1), y: oRel.y.toFixed(1) }), 'ok');
           sendManual({ action: 'setorigin', x: state.userOrigin.x, y: state.userOrigin.y }, action);
           return;
         }
@@ -1642,15 +1668,17 @@ if (typeof window !== 'undefined') {
       });
     });
 
-    // 重置原点
+    // 重置原点：恢复到当前机器的机械原点角点（例如右下角 (W, 0)）
     $('btnResetOrigin')?.addEventListener('click', () => {
-      state.userOrigin = { x: 0, y: 0 };
+      const mech = getMechOrigin();
+      state.userOrigin = { ...mech };
+      state.knifePos = { ...mech };
       updateKnifeCoordsDisplay();
+      updateTransformPanel();
       renderer.dirty = true;
       toast(t('toast.originReset'), 'ok');
     });
 
-    // 键盘快捷键监听
     document.addEventListener('keydown', (e) => {
       if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
 
@@ -1667,7 +1695,6 @@ if (typeof window !== 'undefined') {
         return;
       }
 
-      // 全选快捷键 (Cmd+A / Ctrl+A)
       if (isCmdOrCtrl && e.key.toLowerCase() === 'a') {
         e.preventDefault();
         state.selectedIds = new Set(renderer.layers.filter((l) => !l.hidden).map((l) => l.id));
@@ -1680,8 +1707,6 @@ if (typeof window !== 'undefined') {
         return;
       }
 
-      // 删除快捷键：全方位支持 Mac (Backspace/Delete, Cmd+Backspace, Cmd+Delete) 与 Windows (Delete, Backspace)
-      // 包含中文输入法 (keyCode 229 / key Process 时靠 e.code 匹配)
       const isDeleteKey = e.key === 'Delete' || e.key === 'Backspace' ||
                           e.code === 'Delete' || e.code === 'Backspace' ||
                           e.keyCode === 8 || e.keyCode === 46;
@@ -1708,16 +1733,6 @@ if (typeof window !== 'undefined') {
   }
 
   // ---------------------------------------------------------------- 串口
-  /**
-   * 串口下拉里那一行「未检测到串口设备」是**占位项**，不是真实串口。
-   *
-   * 它在 scanPorts 时写进去，但切语言时不会被 data-i18n 刷到
-   * （那是 JS 生成的 option，不带 data-i18n 属性）——
-   * 症状就是「界面都切成中文了，串口下拉里还挂着英文 No serial port found」。
-   *
-   * 解决办法：给这个 option 打上 data-i18n，让 applyI18n 也能扫到它。
-   * 真实串口（/dev/ttyACM0 之类）没有文案，不需要也不能翻译。
-   */
   function emptyPortOption() {
     return `<option value="" data-i18n="port.none">${t('port.none')}</option>`;
   }
@@ -1795,7 +1810,6 @@ if (typeof window !== 'undefined') {
       $('btnConnect').disabled = true;
       $('btnConnect').textContent = t('btn.connecting');
       const r = await api('/api/connect', { method: 'POST', body });
-      // pathEn 存在时说明这是内置虚拟机的标签（唯一一处非真实路径的中文文案）
       const dev = (lang() === 'en' ? (r.device?.pathEn || r.device?.path) : r.device?.path) || type;
       toast(t('toast.connectOk', { dev }), 'ok');
       logLine(t('log.connectOk', { dev }), 'ok');
@@ -1838,14 +1852,8 @@ if (typeof window !== 'undefined') {
       const isGroup = !!(children && children.length > 1);
       const layer = addLayer(filename, r.path, { isGroup, children });
 
-      // 自动校准到工作区：纠正负坐标并将大尺寸图形等比缩放到材料幅面内
+      // 1. 若超出幅面则等比缩放到材料框内
       const bed = state.preset || { width: 600, height: 710 };
-      const bb = T.layerBBox(layer);
-      let dx = 0, dy = 0;
-      if (bb.minX < 10) dx = 10 - bb.minX;
-      if (bb.minY < 10) dy = 10 - bb.minY;
-      if (dx !== 0 || dy !== 0) T.translateLayer(layer, dx, dy);
-
       const curBb = T.layerBBox(layer);
       const maxW = bed.width - 20;
       const maxH = bed.height - 20;
@@ -1854,10 +1862,14 @@ if (typeof window !== 'undefined') {
         T.scaleLayer(layer, sf, sf, curBb.minX, curBb.minY);
       }
 
+      // 2. 自动贴靠到当前机器原点内侧 10mm 处（右下角原点机型即自动对齐到右下角，彻底避免 Y 轴先走 590mm）
+      snapLayersToOrigin(layer, 10, 10);
+
       state.selectedId = layer.id;
       state.selectedIds = new Set([layer.id]);
       renderer.selectedId = layer.id;
       renderer.selectedIds = state.selectedIds;
+      updateTransformPanel();
       toast(t('toast.imported', { name: filename }), 'ok');
       logLine(t('log.importOk', { n: r.path.subpaths.length, len: r.info.length.toFixed(0) }));
       for (const w of r.warnings || []) { logLine(t('log.notice', { msg: pickLang(w) || w })); }
@@ -1883,8 +1895,6 @@ if (typeof window !== 'undefined') {
   }
 
   function loadDemo() {
-    // 一块招牌，占材料区大部分，比例接近真实作业。
-    // 布局按 mm 算：外框 60..570 × 60..380，中心 (315, 220)
     const CX = 315, CY = 220;
     const p = G.makePath();
 
@@ -1905,19 +1915,16 @@ if (typeof window !== 'undefined') {
     for (const sub of G.circleToPath(115, CY, 26).subpaths) p.subpaths.push(sub);
     for (const sub of G.circleToPath(515, CY, 26).subpaths) p.subpaths.push(sub);
 
-    // 分隔线在文字下方
     const div = G.makeSubpath(150, 165);
     G.addLine(div, 480, 165);
     p.subpaths.push(div);
 
-    // 底部装饰点
     for (let i = 0; i < 11; i++) {
       for (const sub of G.circleToPath(235 + i * 16, 300, 5).subpaths) p.subpaths.push(sub);
     }
 
-    addLayer(t('demo.sign'), p);
+    const signLayer = addLayer(t('demo.sign'), p);
 
-    // 文字：42mm 高时宽约 356mm，起点 137 正好居中（中心 315）
     fetch('/api/text-to-path', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1925,21 +1932,67 @@ if (typeof window !== 'undefined') {
     })
       .then((r) => r.json())
       .then((r) => {
+        const layersToSnap = [signLayer];
         if (r.path) {
-          addLayer(t('layer.text', { text: 'SPARKMINDS' }), r.path);
+          const txtLayer = addLayer(t('layer.text', { text: 'SPARKMINDS' }), r.path);
+          layersToSnap.push(txtLayer);
           logLine(t('toast.demoLoaded'));
         }
+        snapLayersToOrigin(layersToSnap, 10, 10);
         fitToContent();
+        updateTransformPanel();
         updateStats();
       });
   }
 
-  // ---------------------------------------------------------------- 编译输出
+  // ---------------------------------------------------------------- 编译、走框预览与输出
   function buildItems() {
     return renderer.layers.filter((l) => !l.hidden).map((l) => ({
       id: l.id,
       subpaths: l.subpaths,
     }));
+  }
+
+  /**
+   * 走框预览（巡边确认范围）：
+   * 刀头保持抬刀状态（PU）沿当前图形的外接矩形走一圈并回到原点，
+   * 同时在画布上高亮并动画演示走框轨迹。
+   */
+  async function doFrame() {
+    const items = buildItems();
+    if (!items.length) { toast(t('toast.emptyLayout'), 'err'); return; }
+    try {
+      if ($('btnFrame')) $('btnFrame').disabled = true;
+      const r = await api('/api/frame', {
+        method: 'POST',
+        body: {
+          items: items.map((i) => ({ path: { subpaths: i.subpaths } })),
+          speed: +$('speedRange').value,
+          origin: state.userOrigin || getMechOrigin(),
+          originPosition: getOriginPos(),
+          runNow: true,
+        },
+      });
+      if (r.framePath) {
+        renderer.startFrameAnim(r.framePath, r.bbox, r.originBBox, +$('speedRange').value);
+      }
+      const wStr = r.bbox ? r.bbox.w.toFixed(1) : '0';
+      const hStr = r.bbox ? r.bbox.h.toFixed(1) : '0';
+      const noteMsg = (r.notes && r.notes.length) ? pickLang(r.notes[0]) : `${wStr}×${hStr}mm`;
+      if (r.sent) {
+        $('jobPanel').style.display = 'block';
+        toast(t('toast.frameSent', { w: wStr, h: hStr }), 'ok');
+        logLine(t('log.frameSent', { msg: noteMsg }), 'ok');
+      } else {
+        toast(t('toast.framePreviewOnly', { w: wStr, h: hStr }), 'ok');
+        logLine(t('log.framePreviewOnly', { msg: noteMsg }));
+      }
+    } catch (e) {
+      toast(t('toast.frameFail', { msg: e.message }), 'err');
+      logLine(t('toast.frameFail', { msg: e.message }), 'err');
+    } finally {
+      if ($('btnFrame')) $('btnFrame').disabled = renderer.layers.length === 0;
+    }
   }
 
   async function doCompile() {
@@ -1955,7 +2008,8 @@ if (typeof window !== 'undefined') {
           speed: +$('speedRange').value,
           force: +$('forceRange').value,
           direction: $('dirSel').value,
-          origin: state.userOrigin || { x: 0, y: 0 },
+          origin: state.userOrigin || getMechOrigin(),
+          originPosition: getOriginPos(),
         },
       });
       state.gcode = r.gcode;
@@ -1989,6 +2043,7 @@ if (typeof window !== 'undefined') {
     const items = buildItems();
     if (!items.length) { toast(t('toast.emptyLayout'), 'err'); return; }
     try {
+      const origin = state.userOrigin || getMechOrigin();
       const r = await api('/api/compile', {
         method: 'POST',
         body: {
@@ -1996,12 +2051,13 @@ if (typeof window !== 'undefined') {
           speed: +$('speedRange').value,
           force: +$('forceRange').value,
           direction: $('dirSel').value,
+          origin,
+          originPosition: getOriginPos(),
         },
       });
-      // 用 POST 路由回显解析，避免大 G-code 导致 URL 超过 8KB 返回 HTTP 431
       const back = await api('/api/preview', {
         method: 'POST',
-        body: { gcode: r.gcode },
+        body: { gcode: r.gcode, origin },
       });
       const merged = { subpaths: back.path.subpaths };
       renderer.startAnim(merged, +$('speedRange').value);
@@ -2018,7 +2074,6 @@ if (typeof window !== 'undefined') {
       return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 75" class="thumb-empty"><rect width="100" height="75" fill="#f1f5f9" rx="6"/><text x="50" y="42" text-anchor="middle" fill="#94a3b8" font-size="12">空</text></svg>';
     }
 
-    // 第一遍：计算整体包围盒与收集有效子路径
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     const allSubs = [];
     for (const layer of layers) {
@@ -2056,10 +2111,9 @@ if (typeof window !== 'undefined') {
     const spanX = Math.max(1e-4, maxX - minX);
     const spanY = Math.max(1e-4, maxY - minY);
     const maxSpan = Math.max(spanX, spanY);
-    const minStep = maxSpan / 250; // 缩略图分辨率阈值（低于此距离的点可合并）
+    const minStep = maxSpan / 250;
     const minStepSq = minStep * minStep;
 
-    // 若子路径过多，按步长均匀抽稀子路径，保证超复杂大工程缩略图在 20KB 以内且轮廓完整
     const maxSubs = 600;
     const subStride = allSubs.length > maxSubs ? Math.ceil(allSubs.length / maxSubs) : 1;
 
@@ -2085,7 +2139,7 @@ if (typeof window !== 'undefined') {
           const dx = el.x2 - lastX;
           const dy = el.y2 - lastY;
           if (!isLast && (dx * dx + dy * dy < minStepSq)) {
-            continue; // 跳过过密微小线段
+            continue;
           }
           d += `L ${el.x2.toFixed(1)} ${el.y2.toFixed(1)} `;
           lastX = el.x2;
@@ -2217,13 +2271,20 @@ if (typeof window !== 'undefined') {
       pushHistory();
 
       renderer.layers = structuredClone(full.layers);
-      state.userOrigin = full.userOrigin ? { ...full.userOrigin } : { x: 0, y: 0 };
-
       if (full.machineId && state.presets[full.machineId]) {
         $('machineSel').value = full.machineId;
         state.config.machineId = full.machineId;
-        renderer.setPreset(state.presets[full.machineId]);
+        state.preset = state.presets[full.machineId];
+        renderer.setPreset(state.preset, getOriginPos(state.preset));
       }
+      const mech = getMechOrigin();
+      if (full.userOrigin && (full.userOrigin.x !== 0 || full.userOrigin.y !== 0)) {
+        state.userOrigin = { ...full.userOrigin };
+      } else {
+        state.userOrigin = { ...mech };
+      }
+      updateKnifeCoordsDisplay();
+
       if (full.materialId) {
         $('matSel').value = full.materialId;
         state.config.lastMaterial = full.materialId;

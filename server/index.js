@@ -19,7 +19,7 @@ import * as os from 'node:os';
 import { sendJson, readBody, tokenEquals, serveStatic, WebSocketServer, DATA_ROOT, WEB_ROOT } from './api/httpKit.js';
 import { SerialTransport, TcpTransport, VirtualPlotter, NullTransport, createTransport } from './machine/transport.js';
 import { JobEngine, JobState } from './machine/jobEngine.js';
-import { MACHINE_PRESETS, MATERIAL_PRESETS, compileToPlotterLanguage, HpglBuilder } from './machine/hpgl.js';
+import { MACHINE_PRESETS, MATERIAL_PRESETS, ORIGIN_POSITIONS, getOriginCorner, compileToPlotterLanguage, buildFrameCommand, HpglBuilder } from './machine/hpgl.js';
 import { buildManualCommand } from './machine/manual.js';
 import { compileToolpath, analyze, estimateTime, Direction } from './cam/toolpath.js';
 import { parseDxf } from './import/dxf.js';
@@ -52,8 +52,6 @@ const DEFAULT_CONFIG = {
   defaultForce: 250,
   direction: Direction.CCW,
   optimize: true,
-  // 轴向三项缺省不写，由 axisOptions() 回落到机型预设。
-  // 写死在这里会覆盖预设，导致换机型时轴向被上一台机器的设置污染。
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -117,26 +115,25 @@ function getPreset(id) {
 }
 
 /**
- * 当前生效的机器朝向配置。
+ * 当前生效的机器朝向与原点方位配置。
  *
- * 🔴 2026-10-05 起：**一律以机型预设为唯一来源，不再读 config。**
- *
- * 之前是 `config > preset`，本项目因此踩过一次很隐蔽的坑：
- * 改了预设里的默认值，但板子上 `data/config.json` 里存着上一轮校准保存的
- * 旧值，优先级更高，于是**新预设静默失效**——表现是「代码改了、界面没报错、
- * 但机器上还是老样子」，第一反应会误判成机器或固件的问题。
- *
- * 既然界面上已经没有这些开关（实机全部确认后移除），
- * 留着 config 覆盖层就只剩「静默吃掉新预设」这一个作用，纯属负收益。
- * 换机器/改朝向 = 改 `machine/hpgl.js` 里的预设，那里有完整注释。
+ * 原点位置（originPosition）默认取机型预设（如力宇滚筒机均为 'bottom-right' 右下角），
+ * 也支持用户在界面中针对不同机器切换原点位置（右下/左下/右上/左上），并联动推导版面旋转角。
  */
-function axisOptions() {
-  const preset = getPreset(config.machineId);
+function axisOptions(presetOverride) {
+  const preset = presetOverride || getPreset(config.machineId);
+  const originPosition = (config.originPosition && ORIGIN_POSITIONS[config.originPosition])
+    ? config.originPosition
+    : (preset.originPosition || 'bottom-right');
+  const layoutRotate = ORIGIN_POSITIONS[originPosition]
+    ? ORIGIN_POSITIONS[originPosition].rotate
+    : (preset.layoutRotate ?? 0);
   return {
+    originPosition,
     axisX: preset.axisX ?? 1,
     axisY: preset.axisY ?? 1,
     swapAxes: !!preset.swapAxes,
-    layoutRotate: preset.layoutRotate ?? 0,
+    layoutRotate,
   };
 }
 
@@ -146,20 +143,10 @@ function broadcast(type, payload) {
 
 /**
  * 连接后的链路探测（2026-10-19 实测驱动的加固）。
- *
- * 背景：力宇 SC 系列的 USB 口是 GD32 CDC ACM，纯单工——
- * OI;/OA;/IN; 等所有查询指令零回应，机器永远不回话。
- * 所以「打开设备节点成功」不代表机器在工作，唯一能探测的信号是：
- * **写入能否在短时间内被设备收讫**（USB 层 ACK）。
- *
- * 这里发一条无害的 `IN;`（无运动，顺带预初始化固件）：
- *   - 写入超时/失败 → 机器 USB 层已停摆，连接应视为不可用；
- *   - 写入成功 + 期间收到回传 → 双向链路（少数机型会回版本行）；
- *   - 写入成功 + 无回传   → 单工链路，标记 silent 供 UI 与日志明示。
  */
 async function probeLink(t) {
   await t.write('IN;');
-  await new Promise((r) => setTimeout(r, 300)); // 给双向机器留应答窗口
+  await new Promise((r) => setTimeout(r, 300));
   const silent = t.everRx === false;
   if (t instanceof SerialTransport || t instanceof TcpTransport) {
     if (silent) {
@@ -202,29 +189,11 @@ function attachTransport(t) {
 // ---------------------------------------------------------------------------
 // 自动重连
 // ---------------------------------------------------------------------------
-/**
- * 串口连接**必须自动恢复**，否则服务一重启机器就「失联」。
- *
- * 之前每次重启服务（改代码、崩溃重启、systemctl restart）都会丢掉串口，
- * 界面上所有手动按钮随之置灰，表现为「点什么都不反应」——
- * 用户会以为是按钮坏了或机器死了，实际上只是没人重新连串口。
- * 这个坑在本次调试里反复出现（我自己重启了好几次）。
- *
- * 为什么必须自动：
- *   - 串口是独占资源，进程退出就释放，没有「重连」这回事，只能重新 open；
- *   - 配置里已经记了 path/baud（用户连过一次就存下来了），具备自动重连条件；
- *   - USB 转串口经常被重新插拔，设备节点会变（ttyACM0 → ttyACM1），
- *     所以不能只认死一个路径，要在候选列表里找。
- *
- * 策略：每 3 秒试一次，连上就停。失败不刷日志（避免刷屏），
- * 只在状态变化时广播，界面上的连接灯会自己亮起来。
- */
 const RECONNECT_INTERVAL_MS = 3000;
 let reconnectTimer = null;
 let lastConnected = null;
 
 async function currentSerialCandidates() {
-  // 优先用配置里记的路径，其次扫一遍所有可用串口（优先 ttyACM，再 ttyUSB）
   const list = await SerialTransport.list();
   list.sort((a, b) => {
     const aAcm = a.includes('ttyACM') ? 0 : 1;
@@ -244,13 +213,7 @@ async function tryReconnect() {
 
   const list = await SerialTransport.list();
   if (!list.length) return false;
-
-  // 傻瓜化自动连接逻辑：
-  // 1. 如果仅检测到 1 个设备：毫无歧义，直接自动连接，用户零操作开箱即用；
-  // 2. 如果检测到多个设备 (>1)：严禁盲目随便连一个，必须让用户明确选择，避免连错其他 USB 设备导致刻字机无响应。
-  if (list.length > 1) {
-    return false;
-  }
+  if (list.length > 1) return false;
 
   const candidates = await currentSerialCandidates();
   for (const path of candidates) {
@@ -265,7 +228,6 @@ async function tryReconnect() {
         rtscts: !!config.serial?.rtscts,
       });
       await t.connect();
-      // 链路探测：写不进去（超时）就视为这个口不可用，换下一个候选
       let silent = false;
       try {
         silent = await probeLink(t);
@@ -277,7 +239,6 @@ async function tryReconnect() {
       connected = true;
       deviceInfo = await SerialTransport.describe(path);
       if (deviceInfo) deviceInfo.silent = silent;
-      // 记住实际连上的路径：USB 重新插拔后节点可能变
       if (config.serial?.path !== path || config.serial?.baud !== baud) {
         config.serial = { ...config.serial, path, baud };
         await saveConfig();
@@ -295,7 +256,6 @@ async function tryReconnect() {
 function startReconnectLoop() {
   if (reconnectTimer) return;
   reconnectTimer = setInterval(async () => {
-    // 服务正在退出时别再连
     if (shuttingDown) return;
     if (connected) {
       if (!transport || !transport.open) {
@@ -320,7 +280,6 @@ function startReconnectLoop() {
       if (!ok) broadcast('device:closed', {});
     }
   }, RECONNECT_INTERVAL_MS);
-  // 不要因为这个定时器而阻止进程退出
   if (typeof reconnectTimer.unref === 'function') reconnectTimer.unref();
 }
 
@@ -329,20 +288,14 @@ function stopReconnectLoop() {
   if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
 }
 
-/**
- * 手动连接成功后停掉自动重连。
- *
- * 用户主动点「连接设备」时若还挂着自动重连，会出现两个连接互相抢占：
- * 自动重连每 3 秒试一次，可能把用户刚连上的传输层替换掉，
- * 表现为「刚连上又断」。所以手动连上后要让位。
- */
-
 function fullState() {
   const preset = getPreset(config.machineId);
+  const ax = axisOptions(preset);
   return {
-    config,
-    preset,
+    config: { ...config, originPosition: ax.originPosition },
+    preset: { ...preset, originPosition: ax.originPosition, layoutRotate: ax.layoutRotate },
     presets: MACHINE_PRESETS,
+    originPositions: ORIGIN_POSITIONS,
     materials: MATERIAL_PRESETS,
     device: { connected, info: deviceInfo, type: transport.constructor.name },
     job: { state: engine.state, queue: engine.list(), log: engine.log.slice(-50) },
@@ -369,7 +322,6 @@ function importVector(text, filename) {
     const r = parseHpgl(text, { stepsPerInch: getPreset(config.machineId).stepsPerInch });
     path = r.path; warnings.push(...r.warnings);
   } else {
-    // 猜：DXF 以 0\nSECTION 开头，SVG 以 < 开头，HPGL 以 IN; 开头
     if (/^\s*0\s*[\r\n]+\s*SECTION/.test(text)) { path = parseDxf(text).path; }
     else if (/^\s*</.test(text)) {
       const r = parseSvg(text);
@@ -378,6 +330,30 @@ function importVector(text, filename) {
     else { path = parseHpgl(text, { stepsPerInch: getPreset(config.machineId).stepsPerInch }).path; }
   }
   return { path, elements, warnings };
+}
+
+/** 合并请求中的图层列表为单一路径 */
+function mergeItemsToPath(items) {
+  const merged = makePath();
+  const warnings = [];
+  for (const it of items) {
+    if (it.hidden) continue;
+    if (it.kind === 'import') {
+      const { path: p, warnings: w } = importVector(it.content || '', it.filename || '');
+      warnings.push(...w);
+      for (const s of p.subpaths) merged.subpaths.push(s);
+    } else if (it.path) {
+      for (const s of it.path.subpaths || []) merged.subpaths.push(s);
+    } else if (it.subpaths) {
+      for (const s of it.subpaths || []) merged.subpaths.push(s);
+    }
+  }
+  for (const it of items) {
+    if (it.hidden || !it.path || !it.matrix) continue;
+    const m = it.matrix;
+    applyMatrixToPath(it.path, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f });
+  }
+  return { merged, warnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -425,8 +401,6 @@ const routes = {
       } else {
         return sendJson(res, 400, err('未知连接类型', 'Unknown connection type'));
       }
-      // 链路探测：机器 USB 层停摆（写不进）时直接报错，
-      // 而不是绿灯连上、输出时才发现没反应。
       let silent = false;
       if (type === 'serial' || type === 'tcp') {
         try {
@@ -441,7 +415,6 @@ const routes = {
       attachTransport(t);
       connected = true;
       if (deviceInfo) deviceInfo.silent = silent;
-      // 用户主动连上了 → 停掉自动重连，由 attachTransport 的 close/error 重新触发
       stopReconnectLoop();
       setTimeout(() => { if (!shuttingDown) startReconnectLoop(); }, 1000);
       if (type === 'serial') {
@@ -451,9 +424,6 @@ const routes = {
       broadcast('device:connected', { connected: true, info: deviceInfo });
       sendJson(res, 200, { ok: true, device: deviceInfo });
     } catch (e) {
-      // 🔴 变量名不能叫 err：外层有一个同名的 err(zh, en) 辅助函数，
-      // catch 绑定会遮蔽它，于是 err(...) 调用的是 Error 对象 →
-      // "err is not a function"，真实原因永远出不来（2026-10-28 金利来实测撞到）。
       connected = false;
       sendJson(res, 400, err(e.message, e.errorEn));
     }
@@ -469,6 +439,11 @@ const routes = {
 
   'POST /api/config': async (req, res) => {
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+    // 当切换机型且未显式指定新的 originPosition 时，自动同步为该机型预设的默认原点位置
+    if (body.machineId && body.machineId !== config.machineId && !body.originPosition) {
+      const nextPreset = getPreset(body.machineId);
+      body.originPosition = nextPreset.originPosition || 'bottom-right';
+    }
     config = { ...config, ...body };
     await saveConfig();
     broadcast('config:updated', config);
@@ -544,12 +519,12 @@ const routes = {
     try {
       body = JSON.parse(raw.toString('utf8'));
     } catch {
-      // 直接传文件内容
       const filename = req.headers['x-filename'] || 'unknown.dxf';
       const text = raw.toString('utf8');
       const { path, elements, warnings } = importVector(text, filename);
       const preset = getPreset(config.machineId);
-      const info = analyze(path, preset);
+      const ax = axisOptions(preset);
+      const info = analyze(path, preset, null, ax.originPosition);
       return sendJson(res, 200, {
         path: pathToClient(path),
         elements: elements ? pathToClient(elements) : null,
@@ -558,7 +533,8 @@ const routes = {
     }
     const { path, elements, warnings } = importVector(body.content || '', body.filename || '');
     const preset = getPreset(config.machineId);
-    const info = analyze(path, preset);
+    const ax = axisOptions(preset);
+    const info = analyze(path, preset, null, ax.originPosition);
     sendJson(res, 200, {
       path: pathToClient(path),
       elements: elements ? pathToClient(elements) : null,
@@ -567,11 +543,11 @@ const routes = {
   },
 
   'POST /api/geometry': async (req, res) => {
-    // 轻量设计：前端构造几何，交给服务端统一处理
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
     const path = buildGeometry(body.items || []);
     const preset = getPreset(config.machineId);
-    const info = analyze(path, preset);
+    const ax = axisOptions(preset);
+    const info = analyze(path, preset, null, ax.originPosition);
     sendJson(res, 200, { path: pathToClient(path), info });
   },
 
@@ -588,10 +564,10 @@ const routes = {
         rotation: +(body.rotation || 0),
       });
       const preset = getPreset(config.machineId);
-      const info = analyze(path, preset);
+      const ax = axisOptions(preset);
+      const info = analyze(path, preset, null, ax.originPosition);
       sendJson(res, 200, { path: pathToClient(path), info });
     } catch (e) {
-      // 同上：不能用 err 作为 catch 变量名，会遮蔽 err() 辅助函数
       sendJson(res, 400, err(e.message, e.errorEn));
     }
   },
@@ -600,52 +576,35 @@ const routes = {
     try {
       const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
       const preset = getPreset(body.machineId || config.machineId);
+      const ax = axisOptions(preset);
+      if (body.originPosition && ORIGIN_POSITIONS[body.originPosition]) {
+        ax.originPosition = body.originPosition;
+        ax.layoutRotate = ORIGIN_POSITIONS[body.originPosition].rotate;
+      }
       const items = body.items || [];
       if (!items.length) return sendJson(res, 400, err('没有可输出的内容', 'Nothing to output'));
 
-      // 1. 合并所有几何
-      const merged = makePath();
-      const warnings = [];
-      for (const it of items) {
-        if (it.hidden) continue;
-        if (it.kind === 'import') {
-          const { path: p, warnings: w } = importVector(it.content || '', it.filename || '');
-          warnings.push(...w);
-          for (const s of p.subpaths) merged.subpaths.push(s);
-        } else if (it.path) {
-          for (const s of it.path.subpaths || []) merged.subpaths.push(s);
-        }
-      }
+      const { merged, warnings } = mergeItemsToPath(items);
       if (!merged.subpaths.length) return sendJson(res, 400, err('合并后没有有效路径', 'No valid path after merging'));
 
-      // 2. 施加每个对象的变换（前端已算好，这里用矩阵）
-      //    若前端传的是已变换坐标则忽略；统一约定传 path + matrix
-      for (const it of items) {
-        if (it.hidden || !it.path || !it.matrix) continue;
-        const m = it.matrix;
-        applyMatrixToPath(it.path, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f });
-      }
-
-      // 3. CAM：清理、方向、排序
-      const origin = body.origin || { x: 0, y: 0 };
+      // CAM：清理、方向、从当前机器原点就近排序
+      const origin = body.origin || getOriginCorner(preset, ax.originPosition);
       const compiled = compileToolpath(merged, preset, {
         direction: body.direction || config.direction,
         optimize: body.optimize !== undefined ? body.optimize : config.optimize,
         origin,
+        originPosition: ax.originPosition,
       });
       warnings.push(...compiled.warnings);
 
-      // 4. 生成指令
+      // 生成指令
       const speed = +(body.speed || config.defaultSpeed);
       const force = +(body.force || config.defaultForce);
       const result = compileToPlotterLanguage(compiled.path, preset, {
         speedMmPerSec: speed,
         force,
-        origin: body.origin || { x: 0, y: 0 },
-        // 🔴 必须把轴向配置传进去。
-        // 之前这里漏传，界面上的「坐标轴方向」下拉框对实际输出毫无作用——
-        // 改完看着没变化，很容易误判成「机器有问题」。
-        ...axisOptions(),
+        origin,
+        ...ax,
       });
 
       const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
@@ -659,12 +618,17 @@ const routes = {
         commandCount: result.commandCount,
         info: compiled.info,
         warnings,
-        preset: { id: preset.id, name: preset.name, width: preset.width, height: preset.height },
+        preset: {
+          id: preset.id,
+          name: preset.name,
+          width: preset.width,
+          height: preset.height,
+          originPosition: ax.originPosition,
+        },
         estimate: {
           ...time,
           totalSeconds: time.totalSeconds,
           transferSeconds: transferSec,
-          // 实际耗时取「刻绘」与「传输」的较大者——两者并行发生
           wallSeconds: Math.max(time.totalSeconds, transferSec),
         },
       });
@@ -675,12 +639,83 @@ const routes = {
   },
 
   /**
+   * 走框预览（范围巡边）：
+   * 在真正落刀刻绘之前，让刀头保持抬刀状态（PU）沿待刻图形的外接矩形走一圈，
+   * 让用户在真实机器和材料上直观确认刻字范围是否合适、是否超出材料边界。
+   * 若设备已连接且 runNow !== false，立即作为高优任务下发给刻字机执行。
+   */
+  'POST /api/frame': async (req, res) => {
+    try {
+      const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+      const preset = getPreset(body.machineId || config.machineId);
+      const ax = axisOptions(preset);
+      if (body.originPosition && ORIGIN_POSITIONS[body.originPosition]) {
+        ax.originPosition = body.originPosition;
+        ax.layoutRotate = ORIGIN_POSITIONS[body.originPosition].rotate;
+      }
+      const items = body.items || [];
+      if (!items.length) return sendJson(res, 400, err('画布为空，没有可走框预览的内容', 'Canvas is empty — nothing to frame'));
+
+      const { merged } = mergeItemsToPath(items);
+      if (!merged.subpaths.length) return sendJson(res, 400, err('没有有效图形路径', 'No valid geometry path'));
+
+      const origin = body.origin || getOriginCorner(preset, ax.originPosition);
+      const speed = +(body.speed || config.defaultSpeed || 40);
+      const built = buildFrameCommand(merged, preset, {
+        origin,
+        speedMmPerSec: speed,
+        ...ax,
+      });
+
+      let jobId = null;
+      const shouldSend = connected && body.runNow !== false;
+      if (shouldSend) {
+        if (!engine.busy && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
+          try {
+            await transport.write('IN;');
+          } catch (probeErr) {
+            connected = false;
+            broadcast('device:closed', {});
+            return sendJson(res, 400, err(
+              '机器不应答，无法执行走框预览：' + probeErr.message,
+              'Machine not responding, frame check blocked: ' + (probeErr.errorEn || probeErr.message)));
+          }
+        }
+        const baud = +(config.serial?.baud || preset.serialDefault.baud || 115200);
+        const wStr = built.bbox.w.toFixed(0);
+        const hStr = built.bbox.h.toFixed(0);
+        jobId = engine.enqueue({
+          name: `走框预览 · ${wStr}×${hStr}mm`,
+          text: built.text,
+          baud,
+          priority: true,
+          speed,
+          stepsPerInch: preset.stepsPerInch || 1000,
+          meta: { bytes: built.bytes, frame: true },
+        });
+        engine.run();
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        sent: shouldSend,
+        jobId,
+        gcode: built.text,
+        bytes: built.bytes,
+        commandCount: built.commandCount,
+        bbox: built.bbox,
+        originBBox: built.originBBox,
+        framePath: pathToClient(built.framePath),
+        notes: built.notes,
+      });
+    } catch (e) {
+      console.error('[POST /api/frame] 走框预览失败：', e);
+      sendJson(res, 400, err('走框预览失败：' + (e.message || '未知错误'), 'Frame check failed: ' + (e.message || 'Unknown error')));
+    }
+  },
+
+  /**
    * 手动控制：移动刀头、抬落刀、回原点、设原点、进纸出纸。
-   *
-   * 走任务队列而不是直接写串口，原因有三：
-   *  1. 手动操作常和正在跑的刻字任务冲突，排队能天然避开并发写串口
-   *  2. 界面能拿到进度与日志，操作结果可追溯
-   *  3. 急停对手动指令同样有效——这是安全底线，不能有绕过急停的路径
    */
   'POST /api/manual': async (req, res) => {
     if (!connected) return sendJson(res, 400, err('设备未连接', 'Device not connected'));
@@ -690,15 +725,12 @@ const routes = {
     const preset = getPreset(config.machineId);
     let built;
     try {
-      // 手动方向键必须与图形输出用同一套轴向设置，
-      // 否则会出现「画布上往右、方向键往左」的错位。
-      built = buildManualCommand({ ...preset, ...axisOptions() }, body);
+      built = buildManualCommand({ ...preset, ...axisOptions(preset) }, body);
     } catch (err) {
       return sendJson(res, 400, err('指令生成失败：' + err.message, 'Command build failed: ' + err.message));
     }
     if (!built.text) return sendJson(res, 400, err('未生成任何指令', 'No commands generated'));
 
-    // 每条手动指令都短小，直接插队但仍走引擎，保证限速与急停有效
     const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
     const id = engine.enqueue({
       name: `手动·${MANUAL_LABELS[body.action] || body.action}`,
@@ -717,10 +749,6 @@ const routes = {
     if (!body.gcode) return sendJson(res, 400, err('没有指令内容', 'No command content'));
     const preset = getPreset(config.machineId);
 
-    // 任务前试探（仅引擎空闲时；忙时跳过，避免与在跑任务交错写字节）。
-    // 力宇是单工机器，无法用「查询应答」判断死活，唯一信号是写入是否畅通：
-    // 写不进 = 机器 USB 层停摆，此刻输出必然「假完成」，直接拒绝并给出对策。
-    // （自远端 10-19 提交移植；本地紧凑流规范下探活指令不带换行符。）
     if (!engine.busy && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
       try {
         await transport.write('IN;');
@@ -744,7 +772,6 @@ const routes = {
       meta: { bytes: body.gcode.length, estimate: body.estimate },
     });
 
-    // 自动归档至历史任务
     if (body.archive && Array.isArray(body.archive.layers) && body.archive.layers.length > 0) {
       const arch = body.archive;
       const entry = {
@@ -784,41 +811,27 @@ const routes = {
     if (!q) return sendJson(res, 400, err('缺少 gcode 参数', 'Missing gcode parameter'));
     const preset = getPreset(config.machineId);
     const r = parseHpgl(q, { stepsPerInch: preset.stepsPerInch });
-    const b = new HpglBuilder(preset, axisOptions());
+    const b = new HpglBuilder(preset, { ...axisOptions(preset), origin: body.origin });
     mapPathPoints(r.path, (x, y) => b.toUser(x, y), b.isReflection);
     sendJson(res, 200, { path: pathToClient(r.path), stats: r.stats, warnings: r.warnings });
   },
 
   'GET /api/preview': async (req, res, url) => {
-    // 回显自检：把自己生成的 HPGL 读回来，验证解析器与生成器一致
     const q = url.searchParams.get('gcode');
     if (!q) return sendJson(res, 400, err('缺少 gcode 参数', 'Missing gcode parameter'));
     const preset = getPreset(config.machineId);
     const r = parseHpgl(q, { stepsPerInch: preset.stepsPerInch });
-    // 读回来的是**机器坐标**，必须逆变换回设计坐标才能画到画布上。
-    // 漏掉这一步：版面旋转 90° 时预览会横躺，与设计稿对不上，
-    // 而指令本身完全正确——属于「预览骗人」而不是「刻错」的错误，
-    // 会让人反复改设计去迁就一个其实没问题的预览。
-    const b = new HpglBuilder(preset, axisOptions());
+    const b = new HpglBuilder(preset, axisOptions(preset));
     mapPathPoints(r.path, (x, y) => b.toUser(x, y), b.isReflection);
     sendJson(res, 200, { path: pathToClient(r.path), stats: r.stats, warnings: r.warnings });
   },
 };
 
-/**
- * 构造一条双语错误响应体。
- *
- * 🔴 `error` 字段保持**中文**不动：它是这个 API 的既有契约，
- * 前端、curl、甚至别的设备都在读它。改成按请求头返回对应语言会让
- * 「同一个请求换个客户端就拿到不同文案」，排查时非常难对齐。
- * 所以中文留在 `error`，英文加挂在 `errorEn`，由前端自行挑选。
- */
 function err(zh, en) {
   return { error: zh, errorEn: en || zh };
 }
 
 function pathToClient(path) {
-  // 圆弧/椭圆在 JSON 里原样传输即可，前端用同一套渲染
   return JSON.parse(JSON.stringify(path));
 }
 
@@ -880,7 +893,6 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const key = `${req.method} ${url.pathname}`;
 
-  // 允许局域网跨域调用
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Filename, X-Token');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -909,7 +921,6 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head);
 });
 
-// 新客户端接入：推一次全量状态
 const origHandle = wss.handleUpgrade.bind(wss);
 wss.handleUpgrade = (req, socket, head) => {
   origHandle(req, socket, head);
@@ -931,8 +942,6 @@ server.listen(PORT, HOST, async () => {
   console.log('  手机连同一个 Wi-Fi，浏览器直接输上面的局域网地址即可');
   console.log('');
 
-  // 自动接回串口：服务重启 / 崩溃恢复后不该要求用户手动重连，
-  // 否则界面上的手动按钮全是灰的，看起来像「机器失灵」。
   if (config.serial?.path) {
     const ok = await tryReconnect();
     if (!ok) {
@@ -945,13 +954,6 @@ server.listen(PORT, HOST, async () => {
   }
 });
 
-/**
- * 退出前收尾。
- *
- * 不处理 SIGTERM 的话，systemd 重启时进程被直接杀掉，
- * 串口 fd 由内核关闭（尚可），但控制板可能还处在上一条指令的中间状态。
- * 抬一刀再退出，让机器处于确定的「抬刀」状态。
- */
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, async () => {
     stopReconnectLoop();

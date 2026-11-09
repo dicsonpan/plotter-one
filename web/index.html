@@ -113,6 +113,9 @@
         <button class="btn btn-sm" id="btnGroup" data-i18n="prop.group">编组</button>
         <button class="btn btn-sm" id="btnUngroup" data-i18n="prop.ungroup">解组</button>
       </div>
+      <div class="btn-grid" style="margin-top:7px">
+        <button class="btn btn-sm btn-primary" id="btnSnapOrigin" style="grid-column: span 2" data-i18n="prop.snapOrigin" data-i18n-attr="title:prop.snapOriginTitle,aria-label:prop.snapOriginTitle">🎯 贴靠当前原点 (留边10mm)</button>
+      </div>
     </div>
 
     <div class="sect">
@@ -133,12 +136,12 @@
       </div>
       <div class="row">
         <div class="field">
-          <label class="field-label" for="txtX" data-i18n="text.startX">起点 X</label>
-          <input type="number" id="txtX" value="40" step="1">
+          <label class="field-label" for="txtX" data-i18n="text.startX">距原点 X</label>
+          <input type="number" id="txtX" value="10" step="1">
         </div>
         <div class="field">
-          <label class="field-label" for="txtY" data-i18n="text.startY">起点 Y</label>
-          <input type="number" id="txtY" value="40" step="1">
+          <label class="field-label" for="txtY" data-i18n="text.startY">距原点 Y</label>
+          <input type="number" id="txtY" value="10" step="1">
         </div>
       </div>
       <button class="btn btn-primary btn-block" id="btnAddText" data-i18n="text.add">加入版面</button>
@@ -206,6 +209,15 @@
         <div class="field">
           <label class="field-label" for="machineSel" data-i18n="dev.machine">机器型号</label>
           <select id="machineSel"></select>
+        </div>
+        <div class="field">
+          <label class="field-label" for="originPosSel" data-i18n="dev.originPos">机器原点位置</label>
+          <select id="originPosSel">
+            <option value="bottom-right" data-i18n="origin.bottomRight">右下（刀头在右 · 向左进刀）</option>
+            <option value="bottom-left" data-i18n="origin.bottomLeft">左下（刀头在左 · 向右进刀）</option>
+            <option value="top-right" data-i18n="origin.topRight">右上（刀头在右上 · 向左下进刀）</option>
+            <option value="top-left" data-i18n="origin.topLeft">左上（刀头在左上 · 向右下进刀）</option>
+          </select>
         </div>
         <div class="field">
           <label class="field-label" for="connType" data-i18n="dev.connType">连接方式</label>
@@ -343,10 +355,11 @@
 
     <div class="sect">
       <h3 class="sect-title" data-i18n="sect.output">输出</h3>
-      <div class="btn-grid" style="margin-bottom:9px">
+      <div class="btn-grid" style="margin-bottom:8px">
         <button class="btn" id="btnPreview" data-i18n="btn.preview">预览刀路</button>
         <button class="btn" id="btnCompile" data-i18n="btn.compile">生成指令</button>
       </div>
+      <button class="btn btn-primary btn-block" id="btnFrame" style="margin-bottom:8px" data-i18n="btn.frame" data-i18n-attr="title:btn.frameTitle,aria-label:btn.frameTitle">⬚ 走框预览（巡边确认范围）</button>
       <button class="btn btn-ok btn-lg btn-block" id="btnSend" disabled data-i18n="btn.send">开始刻绘</button>
       <div id="jobPanel" style="margin-top:12px; display:none">
         <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>

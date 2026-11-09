@@ -69,7 +69,61 @@
  *   LB text;  标签输出（本服务一般不用，文本在上位机转路径更可控）
  */
 
-import { DEG, normAngle, currentPoint, mapPathPoints } from '../geom/path.js';
+import { DEG, normAngle, currentPoint, mapPathPoints, pathBBox, makePath, makeSubpath, addLine } from '../geom/path.js';
+
+// ---------------------------------------------------------------------------
+// 机器原点方位定义
+// ---------------------------------------------------------------------------
+
+/**
+ * 不同刻字机/平板机的物理原点（0,0）方位枚举。
+ *
+ * - 滚筒式刻字机（力宇 SC 系列、皮卡、图云等）：操作者正对机器时，刀头小车开机归位在右手边（前右侧），
+ *   即画布的「右下角 (bottom-right)」，切割时刀头向左走、滚筒向前进纸。
+ * - 平板式 / 4 轴雕刻机或部分异形机：原点可在「左下 (bottom-left)」「右上 (top-right)」「左上 (top-left)」。
+ */
+export const ORIGIN_POSITIONS = {
+  'bottom-right': {
+    id: 'bottom-right',
+    name: '右下（刀头在右 · 向左进刀）',
+    nameEn: 'Bottom-Right (head right · cuts left)',
+    rotate: 90,
+  },
+  'bottom-left': {
+    id: 'bottom-left',
+    name: '左下（刀头在左 · 向右进刀）',
+    nameEn: 'Bottom-Left (head left · cuts right)',
+    rotate: 0,
+  },
+  'top-right': {
+    id: 'top-right',
+    name: '右上（刀头在右上 · 向左下进刀）',
+    nameEn: 'Top-Right (head top-right)',
+    rotate: 180,
+  },
+  'top-left': {
+    id: 'top-left',
+    name: '左上（刀头在左上 · 向右下进刀）',
+    nameEn: 'Top-Left (head top-left)',
+    rotate: 270,
+  },
+};
+
+/**
+ * 根据机器幅面与原点方位（originPosition），返回该原点在画布坐标系（左下为 0,0，X 向右，Y 向上）下的角点坐标。
+ */
+export function getOriginCorner(preset, originPosition) {
+  const pos = originPosition || preset?.originPosition || 'bottom-right';
+  const W = preset?.width || 600;
+  const H = preset?.height || 710;
+  switch (pos) {
+    case 'bottom-right': return { x: W, y: 0 };
+    case 'top-right':    return { x: W, y: H };
+    case 'top-left':     return { x: 0, y: H };
+    case 'bottom-left':
+    default:             return { x: 0, y: 0 };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 机器预设
@@ -98,48 +152,21 @@ export const MACHINE_PRESETS = {
     width: 600, height: 710,
     stepsPerInch: 1000,
     dialect: 'hpgl',
-    // 实测（2026-10-04，用户上机确认）：这台机器的机械原点在**用户的右手边**。
-    //
-    // 「正对机器时右手边」= 站在机器前看，原点在右侧。
-    // 也就是说**刀头（龙门）**前进的方向是向左，与画布的 X 方向相反。
-    //
-    // 🔴 镜像只在**上位机**做（toMachine 里 x → span - x），
-    //    绝不能靠发 SC23622,0,... 让固件自己镜像——固件不支持，
-    //    会算出负缩放系数，回原点时 Y 轴飞转、X 轴狂奔。
-    //    这里的 axisX/axisY 只影响「发什么坐标」，不影响「怎么跟机器说话」。
-    // ⚠️ 交换轴之后 axisX/axisY 的物理含义变了，不能沿用交换前的取值。
-    //
-    // 交换前：机器X = 刀头（龙门），所以「原点在右手边」→ axisX = -1。
-    // 交换后：机器Y = 刀头，机器X = 走纸。同一个物理事实
-    // （刀头归位在右手边）现在要落在**机器Y** 上 → axisY = -1。
-    // 把 -1 留在 axisX 上会让走纸方向反掉、刀头方向仍然错。
-    //
-    // 走纸轴（机器X）的方向无法从「原点在右手边」推出来（那是刀头的性质），
-    // 先按正向设，由校准向导的第二步确认。
+    originPosition: 'bottom-right',
     // 实测（2026-10-04 / 2026-10-05，用户上机确认）：
-    // 力宇刻字机标准轴向：
-    // - 机器 X 轴（HP-GL 第一参数）：刀头（龙门左右导轨，幅面宽度 600mm）
-    // - 机器 Y 轴（HP-GL 第二参数）：走纸滚筒（材料进退，进纸方向 710mm）
-    // 默认 X 轴向左进刀（向材料内部）、Y 轴向内进纸，均从用户对刀原点 (0,0) 开始正向递增。
-    // 不开启 swapAxes，避免轴向混乱导致 Y 轴无响应、X 轴走反。
+    // 力宇刻字机物理原点在正对机器的右下角（右手边）：
+    // - 机器 X 轴（HP-GL 第一参数）：走纸滚筒（材料前后进退，710mm）
+    // - 机器 Y 轴（HP-GL 第二参数）：刀头龙门（从右向左横向移动，600mm）
+    // 配合 layoutRotate: 90，画布右下角 (width, 0) 精确映射为机器物理原点 (0, 0)。
     axisX: 1,
     axisY: 1,
     swapAxes: false,
-    // 🔴 版面朝向：2026-10-05 实机确认，刻字时整版会**逆时针歪 90°**，
-    // 方向本身正确（不镜像），纯粹是版面躺倒了。补偿值 = 顺时针 90°。
-    //
-    // 物理原因：机器的走纸轴（710mm）与刀头轴（600mm）在固件里是反的，
-    // 而用户是站在机器正前方按「左右 / 里外」描述版面的——
-    // 两个参考系差一次 90° 旋转，净效果就是整版转倒。
-    //
-    // ⚠️ 这个值与 axisX/axisY/swapAxes 无关，别用那三项来修版面朝向——
-    // 那三项只管「每根轴往哪边是正」，动它们会把方向也搞坏。
     layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 10, max: 500, default: 250, unit: 'g' },
-    note: 'AU 版海外规格表标称刻绘 600mm / 进纸 710mm。默认 X 轴为刀头（左右）、Y 轴为走纸滚筒（前后）。',
-    noteEn: 'AU export spec lists 600mm plot width / 710mm feed. Default X = gantry (left-right), Y = media roller (in-out).',
+    note: 'AU 版海外规格表标称刻绘 600mm / 进纸 710mm。默认原点在右下角（右手边对刀）。',
+    noteEn: 'AU export spec lists 600mm plot width / 710mm feed. Default origin at bottom-right.',
   },
   'liyue-sc631e': {
     id: 'liyue-sc631e',
@@ -148,11 +175,16 @@ export const MACHINE_PRESETS = {
     width: 630, height: 710,
     stepsPerInch: 1000,
     dialect: 'hpgl',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '最大刻绘宽度 630mm，进纸宽度 710mm。仅在确认机身标称 630mm 时使用。',
-    noteEn: 'Max plot width 630mm, feed width 710mm. Use only after confirming the nameplate rating.',
+    note: '最大刻绘宽度 630mm，进纸宽度 710mm，默认原点在右下角。仅在确认机身标称 630mm 时使用。',
+    noteEn: 'Max plot width 630mm, feed width 710mm, bottom-right origin. Use only after confirming nameplate rating.',
   },
   'liyue-sc630': {
     id: 'liyue-sc630',
@@ -161,11 +193,16 @@ export const MACHINE_PRESETS = {
     width: 630, height: 710,
     stepsPerInch: 1000,
     dialect: 'hpgl',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '最大刻绘宽度 630mm，进纸宽度 710mm',
-    noteEn: 'Max plot width 630mm, feed width 710mm',
+    note: '最大刻绘宽度 630mm，进纸宽度 710mm，默认原点在右下角',
+    noteEn: 'Max plot width 630mm, feed width 710mm, bottom-right origin',
   },
   'liyue-sc801': {
     id: 'liyue-sc801',
@@ -174,11 +211,16 @@ export const MACHINE_PRESETS = {
     width: 800, height: 880,
     stepsPerInch: 1000,
     dialect: 'hpgl',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '最大刻绘宽度 800mm，进纸宽度 880mm',
-    noteEn: 'Max plot width 800mm, feed width 880mm',
+    note: '最大刻绘宽度 800mm，进纸宽度 880mm，默认原点在右下角',
+    noteEn: 'Max plot width 800mm, feed width 880mm, bottom-right origin',
   },
   'liyue-sc1261': {
     id: 'liyue-sc1261',
@@ -187,11 +229,16 @@ export const MACHINE_PRESETS = {
     width: 1260, height: 1340,
     stepsPerInch: 1000,
     dialect: 'hpgl',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '最大刻绘宽度 1260mm，进纸宽度 1340mm',
-    noteEn: 'Max plot width 1260mm, feed width 1340mm',
+    note: '最大刻绘宽度 1260mm，进纸宽度 1340mm，默认原点在右下角',
+    noteEn: 'Max plot width 1260mm, feed width 1340mm, bottom-right origin',
   },
   'generic-hpgl-1016': {
     id: 'generic-hpgl-1016',
@@ -200,28 +247,19 @@ export const MACHINE_PRESETS = {
     width: 630, height: 710,
     stepsPerInch: 1016,
     dialect: 'hpgl',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '标准 HPGL 分辨率，进口机与部分国产板卡',
-    noteEn: 'Standard HPGL resolution; imported machines and some domestic boards',
+    note: '标准 HPGL 分辨率，进口机与部分国产板卡，默认原点在右下角',
+    noteEn: 'Standard HPGL resolution; imported machines and some domestic boards, bottom-right origin',
   },
   /**
    * 通用 1016 机（600mm 刻绘宽）—— 金利来新机，2026-10-28 按文泰实机设置匹配。
-   *
-   * 🔴 stepsPerInch = 1016 的判据来自**原厂在用的文泰配置**：
-   *   文泰「刻绘机设置 → 幅面和原点」里水平/纵向分辨率均为 1016。
-   *   行业通例：**力宇系（国产）出厂默认 1000**，即 0.0254mm/step；
-   *   **1016（40 步/mm）是进口机与皮卡 / 精卡 / 酷刻 / 图云一类国产机的取值**。
-   *   所以这台**不是力宇** —— 沿用 liyue-* 预设会引入 1.6% 的系统缩放误差
-   *   （600mm 幅面末端偏离约 9.6mm，图形整体偏小）。
-   *
-   * ⚠️ 方向参数一律给**中性值**：axisX/axisY/swapAxes/layoutRotate 是
-   *   **具体某台机器的机械属性**，换机后旧的实测值全部失效。
-   *   这台机器还没做过方向标定，必须先跑一遍实机校准再刻正式件。
-   *
-   * ⚠️ 方言待确认：文泰里若选的是「支持 DMPL 指令刻字机」则应为 DMPL。
-   *   先按 HPGL 走（项目 HPGL 链路更成熟），现场确认后切 dialect。
    */
   'generic-1016-600': {
     id: 'generic-1016-600',
@@ -230,15 +268,16 @@ export const MACHINE_PRESETS = {
     width: 600, height: 710,
     stepsPerInch: 1016,
     dialect: 'hpgl',
+    originPosition: 'bottom-right',
     axisX: 1,
     axisY: 1,
     swapAxes: false,
-    layoutRotate: 0,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '文泰实测 1016 步/英寸（非力宇的 1000）。刻绘宽 600mm，进纸 710mm 待标定。方向为中性值，需实机校准。',
-    noteEn: 'ArtCut resolution 1016 steps/inch (not Liyu 1000). 600mm plot width, 710mm feed TBD. Neutral axis values - calibrate on machine.',
+    note: '文泰实测 1016 步/英寸（非力宇的 1000）。刻绘宽 600mm，进纸 710mm，默认右下角原点。',
+    noteEn: 'ArtCut resolution 1016 steps/inch (not Liyu 1000). 600mm plot width, 710mm feed, bottom-right origin.',
   },
   'liyue-4axis': {
     id: 'liyue-4axis',
@@ -247,11 +286,16 @@ export const MACHINE_PRESETS = {
     width: 800, height: 880,
     stepsPerInch: 4060,
     dialect: 'hpgl3d',
+    originPosition: 'bottom-left',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 0,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: true },
     maxSpeed: 980, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 300, unit: 'g' },
-    note: '4060 线/英寸，2D 抬落刀指令 PU/PD 带 Z 分量，支持力度指令',
-    noteEn: '4060 lines/inch, PU/PD carry a Z component, supports force commands',
+    note: '4060 线/英寸，平板 3D 机型默认左下角原点，PU/PD 带 Z 分量，支持力度指令',
+    noteEn: '4060 lines/inch, 3D flatbed default bottom-left origin, PU/PD carry Z component, supports force commands',
   },
   'generic-dmpl': {
     id: 'generic-dmpl',
@@ -260,11 +304,16 @@ export const MACHINE_PRESETS = {
     width: 630, height: 710,
     stepsPerInch: 1016,
     dialect: 'dmpl',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
     serialDefault: { baud: 115200, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
     maxSpeed: 800, minSpeed: 12.5,
     force: { min: 70, max: 500, default: 250, unit: 'g' },
-    note: '金谷田 / 赛博等国产通用 DMPL 语言刻字机',
-    noteEn: 'Domestic DMPL engravers such as JinguTian / Saibo',
+    note: '金谷田 / 赛博等国产通用 DMPL 语言刻字机，默认右下角原点',
+    noteEn: 'Domestic DMPL engravers such as JinguTian / Saibo, bottom-right origin',
   },
 };
 
@@ -311,6 +360,7 @@ export class HpglBuilder {
     this.preset = preset;
     this.spi = preset.stepsPerInch;
     this.originMode = options.originMode || 'user'; // 'user' = 按材料坐标
+    this.originPosition = options.originPosition || preset.originPosition || 'bottom-right';
     // 轴向：+1 常规, -1 反向。由 preset 提供默认值，用户可在界面覆盖。
     // 不可假定——原点位置与轴向是机器硬件属性，见文件头与 toMachine 的说明。
     this.axisX = options.axisX !== undefined ? options.axisX
@@ -323,9 +373,22 @@ export class HpglBuilder {
                     : !!preset.swapAxes;
     // 版面整体朝向。与 swapAxes（镜像）正交：swapAxes 管「图形是否镜像」，
     // layoutRotate 管「整块版面转多少度」。见文件头的说明。
-    // 只接受 0/90/180/270——任意角度会让 machineSpan 的推导失效。
-    this.layoutRotate = normalizeRotate(
-      options.layoutRotate !== undefined ? options.layoutRotate : preset.layoutRotate);
+    // 若显式传入 options.layoutRotate 则优先；若传入了 options.originPosition，则由原点位置推导旋转角；
+    // 否则回退到 preset.layoutRotate 或 preset.originPosition 对应的旋转角。
+    let rawRotate;
+    if (options.layoutRotate !== undefined) {
+      rawRotate = options.layoutRotate;
+    } else if (options.originPosition && ORIGIN_POSITIONS[options.originPosition]) {
+      rawRotate = ORIGIN_POSITIONS[options.originPosition].rotate;
+    } else if (preset.layoutRotate !== undefined) {
+      rawRotate = preset.layoutRotate;
+    } else if (preset.originPosition && ORIGIN_POSITIONS[preset.originPosition]) {
+      rawRotate = ORIGIN_POSITIONS[preset.originPosition].rotate;
+    } else {
+      rawRotate = 0;
+    }
+    this.layoutRotate = normalizeRotate(rawRotate);
+    this.origin = options.origin || null;
     this.dialect = preset.dialect || 'hpgl';
     this.cmds = [];
     this.pos = { x: 0, y: 0 };
@@ -341,6 +404,31 @@ export class HpglBuilder {
     // 文泰闭合过切补偿（datacllt.dll SetCutterCloseAddDist / FUN_1001b2ac）：
     // 闭合子路径切回起点后，顺着起始段继续多切 overcutMm（默认 0.3mm），防止起收刀处留连皮
     this.overcutMm = options.overcutMm !== undefined ? Number(options.overcutMm) : 0.3;
+  }
+
+  /**
+   * 机器物理 (0,0) 在画布坐标系下对应的机械原点坐标：
+   *   - bottom-right (layoutRotate=90):  (width, 0)
+   *   - bottom-left  (layoutRotate=0):   (0, 0)
+   *   - top-right    (layoutRotate=180): (width, height)
+   *   - top-left     (layoutRotate=270): (0, height)
+   */
+  get mechOrigin() {
+    return this._rawToUser(0, 0);
+  }
+
+  /**
+   * 用户自定义工作原点相对于机械原点（mechOrigin）的画布坐标偏移量。
+   * 当未传 origin、传了 {x:0,y:0} 默认占位、或 origin 恰好等于 mechOrigin 时，偏移为 (0,0)。
+   */
+  _originShift(originOverride) {
+    const orig = originOverride !== undefined ? originOverride : this.origin;
+    if (!orig || (orig.x === 0 && orig.y === 0)) return { x: 0, y: 0 };
+    const mech = this.mechOrigin;
+    const dx = orig.x - mech.x;
+    const dy = orig.y - mech.y;
+    if (Math.abs(dx) <= 1e-6 && Math.abs(dy) <= 1e-6) return { x: 0, y: 0 };
+    return { x: dx, y: dy };
   }
 
   // -------------------------------------------------------------------------
@@ -388,21 +476,8 @@ export class HpglBuilder {
   /**
    * 绝对坐标变换。
    *
-   * 用户坐标约定：原点在材料**左下角**，X 向右，Y 向上（与画布一致）。
-   * 机器坐标由 SC 正序定义，机器固件只认「x 增大 = 机器 x 增大」。
-   *
-   * 三步，顺序不能换：
-   *   1. **layoutRotate**：把设计稿按机器的材料框朝向摆正。
-   *      这是「版面层面的旋转」，与下面两步的性质不同——
-   *      它决定工件落在材料上的朝向，不决定某根轴的正方向。
-   *   2. swapAxes：换轴。用户 (x,y) → 机器 (y,x)。
-   *      换轴只是重新分配「哪根轴」，不涉及方向，所以放在旋转之后。
-   *   3. axisX/axisY：再按各轴方向做镜像（宽度按**该轴自己的跨度**取，
-   *      换轴后 X 轴要减去的是 710 而不是 600——这是容易写错的地方）。
-   *
-   * 关键点：**SC 始终正序**。固件永远只看到一个正常的坐标系，
-   * 方向填错的后果仅限于「图形镜像」，而不会像反向 SC 那样
-   * 让固件算出负缩放、进而回原点时飞车。
+   * 用户坐标约定：画布左下角为 (0,0)，X 向右，Y 向上。
+   * 经过 layoutRotate 变换后，对应机器原点方位（如右下角 (W,0)）自动映射为机器物理 (0,0)。
    */
   toMachine(x, y) {
     const r = this.rotateUser(x, y);
@@ -419,16 +494,6 @@ export class HpglBuilder {
 
   /**
    * 相对位移变换。
-   *
-   * 与 toMachine 的区别：位移只有方向，没有位置，所以**不**做
-   * 「绕画布尺寸翻转」那部分偏移，只做旋转的线性部分 + 换轴 + 翻符号。
-   * 手动方向键、PR 增量走刀都必须走这里——
-   * 早先的手动 jog 误用了绝对 moveTo，在镜像机器上会变成「朝原点狂冲」。
-   *
-   * ⚠️ 版面旋转**必须**在这里体现：方向键的语义是「画布上往右」，
-   * 而画布上的右在旋转后的机器坐标里是另一个方向。
-   * 漏掉这一步的表现是「图形转对了、方向键却还是老方向」——
-   * 机器动起来是安全的，但手动定位会与图形对不上，很难立刻联想到是旋转漏了。
    */
   toMachineDelta(dx, dy) {
     let mdx = dx, mdy = dy;
@@ -447,13 +512,6 @@ export class HpglBuilder {
 
   /**
    * 当前变换是否为反射（会翻转圆弧绕向）。
-   *
-   * 行列式：每次轴交换或单轴反向都是一次反射（det = -1）。
-   * 偶数次反射 = 旋转（det = +1，绕向不变）；奇数次 = 反射（绕向翻转）。
-   *
-   * 🔴 `layoutRotate` 不参与判定：90/180/270 都是纯旋转（det = +1），
-   * 绕向不变。把它算进去会让所有圆弧的扫掠角被取反，
-   * 表现为「圆和直线都对、唯独圆弧刻反了方向」。
    */
   get isReflection() {
     let n = 0;
@@ -475,14 +533,6 @@ export class HpglBuilder {
     return this;
   }
 
-  /**
-   * 将缓存中的连续坐标合并为单条 PA 指令下发。
-   *
-   * 提速核心：在 9600 串口物理带宽下，每对坐标原先独立占一行（`PA x,y;\n`），
-   * 重复的 `PA` 与分号换行带来约 30% 的协议字符冗余。
-   * 合并为 `PA x1,y1,x2,y2...;` 后，体积下降 20%~30%，行数减少 90%+，
-   * 既大幅降低串口传输耗时，又让下位机固件在单条 PA 内部平滑运动规划。
-   */
   _flushCoords() {
     if (this._coordBatch && this._coordBatch.length > 0) {
       const coords = this._coordBatch.join(',');
@@ -495,25 +545,14 @@ export class HpglBuilder {
   }
 
   /**
-   * `toMachine` 的逆变换：机器坐标 → 用户（设计）坐标。
-   *
-   * 存在的唯一理由是**预览**：`/api/preview` 把生成的 HPGL 读回来得到的是
-   * 机器坐标，若直接画到画布上，版面旋转 90° 时预览会**横着躺**，
-   * 与设计稿对不上——用户看到的预览就不再是「所见即所刻」。
-   *
-   * 逆变换必须严格按 toMachine 的**逆序**逐步反演：
-   *   1. 先反 axisX/axisY 镜像（用各轴自己的跨度）
-   *   2. 再反 swapAxes
-   *   3. 最后反 layoutRotate
-   * 顺序反了就会在旋转 + 镜像同时存在时算出错误坐标，且不报错。
+   * 不含工作原点偏移的基础逆变换：机器坐标 → 画布坐标。
    */
-  toUser(mx, my) {
+  _rawToUser(mx, my) {
     const sx = this.machineSpanX;
     const sy = this.machineSpanY;
     let ux = this.axisX >= 0 ? mx : (sx - mx);
     let uy = this.axisY >= 0 ? my : (sy - my);
     if (this.swapAxes) { const t = ux; ux = uy; uy = t; }
-    // 反解 rotateUser：正向 (x,y)→(y,W-x) 的逆就是 (x,y)→(W-y,x)
     const W = this.preset.width, H = this.preset.height;
     switch (this.layoutRotate) {
       case 90:  return { x: W - uy, y: ux };
@@ -521,6 +560,19 @@ export class HpglBuilder {
       case 270: return { x: uy, y: H - ux };
       default:  return { x: ux, y: uy };
     }
+  }
+
+  /**
+   * `toMachine` 的逆变换：机器坐标 → 用户（设计）坐标。
+   * 若设置了自定义工作原点（this.origin），一并还原该偏移，确保 `/api/preview` 与画布图形完全重合。
+   */
+  toUser(mx, my) {
+    const base = this._rawToUser(mx, my);
+    const shift = this._originShift();
+    return {
+      x: base.x + shift.x,
+      y: base.y + shift.y,
+    };
   }
 
   /**
@@ -583,8 +635,6 @@ export class HpglBuilder {
 
   /**
    * 抬刀空移到绝对坐标 (x, y)：使用文泰标准 `PU x,y;` 格式。
-   * 力宇等国产刻字机固件把 `PA;` 仅作为模态切换指令，直接发 `PA x,y;` 会被部分固件忽略，
-   * 必须用带坐标的 `PU x,y;` 执行空移定位。
    */
   moveTo(x, y) {
     this._flushCoords();
@@ -619,10 +669,6 @@ export class HpglBuilder {
 
   /**
    * 圆弧：默认按 0.02mm 弦高离散为标准 `PD x,y;` 折线。
-   *
-   * 2D 刻字机固件普遍不支持 `AA` / `CI` 圆弧插补指令（收到会拒动或静默忽略），
-   * 在用户坐标系下离散成折线再走 `lineTo()` 不仅 100% 兼容所有刻字机固件，
-   * 而且天然继承 `toMachine()` 的旋转与镜像变换。
    */
   arcTo(cx, cy, r, a0, a1) {
     if (!this.useNativeArc) {
@@ -780,11 +826,6 @@ export class HpglBuilder {
 
   /**
    * 回到对刀原点 (0,0)。
-   *
-   * 🔴 严禁默认发送 `!PG;`：
-   *   `!PG;` 是机械限位搜索动作（仅 X 轴有开关，滚筒 Y 轴无开关），
-   *   发 `!PG;` 会抛弃对刀原点去撞右端限位，或被部分固件直接忽略。
-   *   回原点统一用 `PU0,0;` 抬刀返回用户对刀原点。
    */
   home() {
     this._flushCoords();
@@ -802,14 +843,17 @@ export class HpglBuilder {
   /**
    * 生成完整任务指令。
    *
-   * 🔴 原点保护与指令合规原则：
-   *   1. 任务开头**绝不发送 !PG; 机械归位**（保护用户在机器面板设置的对刀原点）；
-   *   2. 初始化采用文泰标准 `IN; PA; SP1; PU0,0;`，不发非标的 `LT;`、`SC` 或无坐标的孤立 `PU;`；
-   *   3. 空移统一采用 `PU x,y;`，切割统一采用 `PD x,y;`，圆弧统一离散为 `PD x,y;`；
-   *   4. 收尾统一抬刀返回对刀原点 `PU0,0;`，不发 `SP0;` 或 `!PG;`。
+   * 🔴 原点保护与坐标偏移算法：
+   *   1. 任务开头绝不默认发送 !PG; 机械归位（保护用户在机器面板设置的对刀原点）；
+   *   2. 初始化采用文泰标准 `IN; PA; SP1; PU0,0;`；
+   *   3. 当传入自定义工作原点 options.origin 时，偏移量必须相对于机械原点 `this.mechOrigin`
+   *      计算（即 `shift = origin - mechOrigin`），而不是相对于画布左下角 `(0,0)`！
+   *      这样当图形位于 `origin` 处时，平移后恰好落在 `mechOrigin`，经 `toMachine` 映射为 `(0,0)`，
+   *      彻底消除右下角原点机型上错误的 Y 轴大幅空走。
    */
   build(path, options = {}) {
-    const origin = options.origin || { x: 0, y: 0 };
+    if (options.origin !== undefined) this.origin = options.origin;
+    const shift = this._originShift(options.origin);
 
     // 1. 默认绝不发 !PG;（仅当显式传入 homeFirst === true 时才发）
     if (options.homeFirst === true) {
@@ -818,16 +862,16 @@ export class HpglBuilder {
     }
 
     // 2. 初始化与设置（文泰标准：IN; PA; SP1; PU0,0;）
-    this.setupCoords(origin);
+    this.setupCoords(options.origin);
     if (options.emitSpeed === true || this.dialect === 'hpgl3d' || this.dialect === 'dmpl') {
       this.setSpeed(options.speedMmPerSec || 30);
     }
     if (options.force) this.setForce(options.force);
     this.penSelectOn();
 
-    // 3. 图形本体：若有自定义工作原点，平移到工作原点相对坐标
-    const workPath = (origin && (origin.x || origin.y))
-      ? mapPathPoints(path, (x, y) => ({ x: x - origin.x, y: y - origin.y }))
+    // 3. 图形本体：若有相对于机械原点的自定义工作原点偏移，平移到对应位置
+    const workPath = (shift.x !== 0 || shift.y !== 0)
+      ? mapPathPoints(path, (x, y) => ({ x: x - shift.x, y: y - shift.y }))
       : path;
 
     for (const sub of workPath.subpaths) {
@@ -852,6 +896,105 @@ export class HpglBuilder {
       lines: this.cmds.length,
     };
   }
+}
+
+/**
+ * 生成「走框预览」（边框范围巡边）指令：
+ * 全程保持**抬刀状态（PU）**，从距离当前原点最近的包围盒角点出发，
+ * 沿待刻图形的外接矩形四条边空走一圈，最后回到对刀原点 `PU0,0;`，绝不落刀（不含任何 PD）。
+ * 让用户在真正下刀前直观看到机器在真实材料上的刻绘范围。
+ */
+export function buildFrameCommand(path, preset, options = {}) {
+  const bbox = pathBBox(path);
+  if (!Number.isFinite(bbox.minX) || (bbox.w <= 0 && bbox.h <= 0)) {
+    throw new Error('图形为空，无法生成走框预览');
+  }
+
+  const builder = new HpglBuilder(preset, options);
+  const shift = builder._originShift(options.origin);
+  const mech = builder.mechOrigin;
+  const effOrigin = { x: mech.x + shift.x, y: mech.y + shift.y };
+  const pos = builder.originPosition;
+  const isRight = pos === 'bottom-right' || pos === 'top-right';
+  const isTop = pos === 'top-right' || pos === 'top-left';
+
+  // 从离原点最近的角点开始，顺次走完外接矩形四个顶点并闭合回起点
+  const nearX = isRight ? bbox.maxX : bbox.minX;
+  const farX  = isRight ? bbox.minX : bbox.maxX;
+  const nearY = isTop   ? bbox.maxY : bbox.minY;
+  const farY  = isTop   ? bbox.minY : bbox.maxY;
+
+  const corners = [
+    { x: nearX, y: nearY },
+    { x: farX,  y: nearY },
+    { x: farX,  y: farY  },
+    { x: nearX, y: farY  },
+    { x: nearX, y: nearY },
+  ];
+
+  // 构造前端动画与预览可用的闭合矩形路径（画布坐标）
+  const framePath = makePath();
+  const sub = makeSubpath(corners[0].x, corners[0].y);
+  for (let i = 1; i < corners.length; i++) {
+    addLine(sub, corners[i].x, corners[i].y);
+  }
+  sub.closed = true;
+  framePath.subpaths.push(sub);
+
+  // 生成纯抬刀（PU）走框指令：绝不落刀
+  builder.emit('IN;');
+  if (builder.dialect === 'dmpl') {
+    builder.emit(';:');
+    builder.emit('IN;');
+  }
+  builder.emit('PA;');
+  builder.emit('SP1;');
+  builder.forcePenUp();
+  if (options.emitSpeed === true || builder.dialect === 'hpgl3d' || builder.dialect === 'dmpl') {
+    builder.setSpeed(options.speedMmPerSec || 40);
+  }
+
+  for (const pt of corners) {
+    builder.moveTo(pt.x - shift.x, pt.y - shift.y);
+  }
+  builder.home();
+
+  let text = builder.cmds.join('\n') + '\n';
+  if (preset.dialect === 'dmpl') {
+    text = hpglToDmpl(text);
+  }
+
+  // 计算相对于当前原点的距离范围，方便界面直观展示给用户
+  const offsetX = Math.max(0, isRight ? (effOrigin.x - bbox.maxX) : (bbox.minX - effOrigin.x));
+  const offsetY = Math.max(0, isTop   ? (effOrigin.y - bbox.maxY) : (bbox.minY - effOrigin.y));
+  const originBBox = {
+    offsetX,
+    offsetY,
+    reachX: offsetX + bbox.w,
+    reachY: offsetY + bbox.h,
+    w: bbox.w,
+    h: bbox.h,
+  };
+
+  const wStr = bbox.w.toFixed(1);
+  const hStr = bbox.h.toFixed(1);
+  const rx0 = offsetX.toFixed(1), rx1 = originBBox.reachX.toFixed(1);
+  const ry0 = offsetY.toFixed(1), ry1 = originBBox.reachY.toFixed(1);
+
+  return {
+    text,
+    bytes: text.length,
+    commandCount: builder.cmds.length,
+    bbox,
+    originBBox,
+    framePath,
+    notes: [
+      {
+        zh: `走框预览：外框尺寸 ${wStr}×${hStr}mm（距原点 X:${rx0}~${rx1}mm, Y:${ry0}~${ry1}mm），全程抬刀空走`,
+        en: `Frame check: ${wStr}×${hStr}mm (from origin X:${rx0}~${rx1}mm, Y:${ry0}~${ry1}mm), blade up`,
+      },
+    ],
+  };
 }
 
 /** DMPL 方言：把 HPGL 指令翻译成 DMPL 语法 */
@@ -912,9 +1055,6 @@ export function estimateHpglMotion(text, options = {}) {
 
 /**
  * 逐行（每行一条或多条 ';' 指令）的物理耗时（毫秒）。
- *
- * 这是节奏化下发的时基：jobEngine 用它把「下发」与「机器执行」对齐。
- * 与 estimateHpglMotion 共用 createMotionWalker，避免两份换算逻辑漂移。
  */
 export function estimateLineMotionMs(lines, options = {}) {
   const w = createMotionWalker(options);
@@ -931,13 +1071,6 @@ function splitCommands(text) {
 
 /**
  * 运动学遍历器：逐条喂入指令，**逐条**返回物理耗时（毫秒）。
- *
- * 🔴 为什么需要从「一次性总估算」升级到「逐条估算」（2026-10-19 实测驱动）：
- * 力宇的 USB 口是 GD32 CDC ACM，数据以 USB 速度灌进去（不是真实波特率），
- * 上位机一次性把上万条指令倒进机器后自己打完勾，机器却还在慢慢刻——
- * 表现为「日志显示完成、机器还在原地」。
- * 只有知道**每条指令要花多少时间**，上位机才能按机器的节奏喂数据，
- * 让「下发」与「执行」保持同步（见 jobEngine 的节奏化流式下发）。
  */
 function createMotionWalker(options = {}) {
   const stepsPerInch = options.stepsPerInch || 1000;
@@ -983,7 +1116,6 @@ function createMotionWalker(options = {}) {
       homingCount++;
       curX = 0; curY = 0;
       penDown = false;
-      // 机械归位没有完成信号，驻留时间计入本条指令的耗时
       return homingDwellMs;
     }
     const vsM = raw.match(/^(?:VS|V)(\d+)/);
@@ -1028,7 +1160,7 @@ function createMotionWalker(options = {}) {
       }
       return 0;
     }
-    return 0; // IN / SP / LT 等非运动指令：不产生物理位移
+    return 0;
   };
 
   return {
@@ -1051,4 +1183,3 @@ function createMotionWalker(options = {}) {
     },
   };
 }
-

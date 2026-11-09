@@ -1,8 +1,9 @@
-# Engraving Machine Web Console
+# Engraving Machine Web Console (SparkPlotter / plotter-one)
+
+**[中文](README.zh.md)** | English
 
 Move Windows-only engraving output software (Ucancam / UcanSign, 文泰刻绘) into a browser.
-One board plugged in next to the machine; any device on the LAN opens it in a browser —
-Windows, Mac, iPad, Android phone, even a bare thin client with nothing installed.
+One low-power board plugged in next to the machine; any device on the LAN opens it in a browser — Windows, Mac, iPad, Android phone, even a bare thin client with nothing installed.
 
 ```
                  same LAN
@@ -21,24 +22,21 @@ Windows, Mac, iPad, Android phone, even a bare thin client with nothing installe
             engraving machine
 ```
 
-**[中文](README.zh.md)**
-
 ---
 
 ## Why
 
-| | Ucancam / UcanSign / 文泰 | This |
+| | Ucancam / UcanSign / 文泰 | This (SparkPlotter) |
 |---|---|---|
-| Platform | Windows only | Any device, including phones |
-| Install | Once per machine | Just open a browser |
-| Serial driver | Must install drivers | Direct `/dev/ttyACM0`, no driver |
-| Offline output | Needs a USB stick | Sent directly |
-| Dependencies | Commercial software | **Zero runtime deps** (Node standard library only) |
+| Platform | Windows only | Any device (PC, Mac, phone, tablet browser) |
+| Install | Once per machine | Zero install, zero frontend build |
+| Serial driver | Must install drivers | Direct `/dev/ttyACM0` or `/dev/ttyUSB0`, driverless |
+| Origin model | Fixed or opaque | **4-Corner Machine Origin (`originPosition`) + Auto Snap-to-Origin** |
+| Area verification | Blind cutting risks running off material | **Built-in "⬚ Frame Check" traces bounds with blade up before cutting** |
+| Offline output | Needs a USB stick | Direct LAN streaming + 1-click job history re-cut |
+| Dependencies | Commercial software | **Zero runtime deps** (Node.js standard library only) |
 
-Zero dependencies is deliberate: the serial port uses `stty` + file descriptors rather
-than `serialport` (which ships C++ extensions that either lack ARM64 prebuilds or require
-a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 implementation.
-**No `npm install` is needed on the board — deploying means copying files.**
+Zero dependencies is deliberate: the serial port uses `stty` + file descriptors rather than `serialport` (which ships C++ extensions that either lack ARM64 prebuilds or require a cross-compiler). HTTP is `node:http`; WebSocket is a minimal RFC6455 implementation. **No `npm install` is needed on the board — deploying means copying files.**
 
 ---
 
@@ -49,10 +47,10 @@ a cross-compiler). HTTP is `node:http`; the WebSocket is a minimal RFC6455 imple
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# self-test (270 checks: geometry / protocol / state machine / axes / i18n — no machine needed)
+# self-test (286 checks: geometry / protocol / state machine / 4-corner origin / Y-travel fix / frame check / i18n)
 npm run selftest
 
-# i18n audit (verify every string has both zh and en)
+# i18n audit (verify all 364 strings have both zh and en)
 node tools/i18n-check.js
 
 # start
@@ -61,571 +59,110 @@ npm start
 
 Open `http://localhost:8080`.
 
-To run it on a board next to the engraver, see **[Deployment](#deployment)** below — it is one command
-(`sudo bash deploy/install.sh --port 8080`). 8080 is only the default; a board install will often
-bind **port 80** instead so you can reach it as bare `http://<board-ip>/` (that needs
-`AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit — see `docs/`).
+To run it on a board next to the engraver, see **[Deployment](#deployment)** below — it is one command (`sudo bash deploy/install.sh --port 8080`). 8080 is only the default; a board install will often bind **port 80** instead so you can reach it as bare `http://<board-ip>/` (that needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit — see `docs/`).
 
 For how to design artwork, see [docs/设计工作流.md](docs/设计工作流.md).
+
+---
+
+## Core Architecture: Machine Origin Positions, Coordinate Mapping & Frame Check
+
+### 1. Machine Origin Position (`originPosition`)
+
+Different vinyl cutters and flatbed engravers place their physical `(0, 0)` origin at different corners of the working area:
+- **Roll-fed vinyl cutters (Liyue SC series, Generic 1016, Pcut, Jinka, domestic DMPL boards)**: Standing in front of the machine, the cutting carriage parks at the **front-right (`bottom-right`)** corner. During cutting, the carriage moves left across the media width while the roller feeds material in and out.
+- **Flatbed / 4-axis engravers or custom machines**: The origin may be at **`bottom-left`**, **`top-right`**, or **`top-left`**.
+
+Every machine preset in `MACHINE_PRESETS` (`server/machine/hpgl.js`) includes an `originPosition` property paired with `layoutRotate`:
+
+| `originPosition` | Physical Meaning | Canvas Mechanical Origin (`mechOrigin`) | `layoutRotate` |
+|---|---|---|---|
+| **`bottom-right`** | Head at front-right, cuts left & feeds inward (default for roll-fed cutters) | `(width, 0)` | `90°` |
+| **`bottom-left`** | Head at front-left, cuts right & feeds inward (default for 4-axis/flatbed) | `(0, 0)` | `0°` |
+| **`top-right`** | Head at back-right | `(width, height)` | `180°` |
+| **`top-left`** | Head at back-left | `(0, height)` | `270°` |
+
+You can view or switch the active origin position anytime under **Device → ⚙ Settings → Origin position**. The canvas automatically moves the `Machine 0,0` marker, red `Origin (0.0, 0.0)` datum axes (pointing inward into the material), and blue `Knife` crosshair to the corresponding corner.
+
+### 2. Eliminating Pre-Cut Y-Axis Travel (Three-Layer Fix)
+
+On a `bottom-right` roll-fed cutter (`layoutRotate = 90°`), canvas coordinates `(x, y)` (where `(0, 0)` is Bottom-Left, `x` runs `0..W` left-to-right, `y` runs `0..H` bottom-to-top) map to physical machine coordinates `(mx, my)` via:
+
+$$\text{mx} = y, \quad \text{my} = W - x$$
+
+This means **Canvas Bottom-Right `(W, 0)` maps to Machine `(0, 0)`**, whereas **Canvas Bottom-Left `(0, 0)` maps to `my = W`** (e.g. `600mm = 23,622 steps` on a 600mm cutter!).
+
+Previously, imported files and text were placed near Canvas Bottom-Left `(10, 10)`, forcing the Y-axis to travel 560–590mm across the entire width before cutting. This is now solved across three layers:
+
+1. **Automatic Origin-Relative Placement & Snap-to-Origin (`snapLayersToOrigin`)**:
+   - Imported SVG/DXF/PLT files, Quick Text, and Shapes are automatically placed **10mm inside the active origin corner** (e.g., `maxX = W - 10, minY = 10` for `bottom-right`, resulting in just `10mm × 10mm` of initial travel).
+   - The `X / Y` inputs in the Properties panel display and control the item's distance from the active origin, accompanied by a one-click **"🎯 Snap to Origin (10mm margin)"** button.
+2. **Mechanical-Origin-Relative Work Origin Shift (`HpglBuilder._originShift`)**:
+   - When a custom work origin (`userOrigin`) is set via "Set Origin", `HpglBuilder.build()` computes the shift relative to `mechOrigin = toUser(0, 0)` (`shift = origin - mechOrigin`) rather than `(0, 0)`, ensuring a point at `userOrigin` always maps strictly to `PU0,0;`.
+3. **Origin-Aware CAM Ordering & Closed-Loop Start Vertex Rotation (`rotateClosedSubpathsToNearest`)**:
+   - `optimizeOrder` starts from the active origin corner (`(W, 0)` for `bottom-right`) rather than `(0, 0)`.
+   - For closed polygon loops (such as `<rect>` borders whose default first vertex is `(minX, minY)` on the far left), `rotateClosedSubpathsToNearest()` cyclically shifts the starting vertex to the corner **nearest to the active origin** (preserving winding direction and perimeter), eliminating unnecessary cross-shape rapid travel.
+
+### 3. "⬚ Frame Check (Trace Bounds)" (`POST /api/frame` & `buildFrameCommand`)
+
+Before starting an actual cut, click **"⬚ Frame Check (Trace Bounds)"** in the Output section:
+- **100% Blade-Up Bounding Box Trace**: Emits `IN; PA; SP1; PU;` and traces the 4 corners of the artwork's outer bounding box using `PU x,y;` starting from the corner nearest to the origin, then returns to `PU0,0;`. It **never emits a single `PD` command**, so the blade remains safely lifted the entire time.
+- **Physical + Canvas Visual Feedback**:
+  - When connected to the plotter, it immediately runs as a priority job so you can watch the blade tip trace the exact cutting rectangle on the physical material.
+  - Simultaneously, the canvas highlights the dashed green framing rectangle with exact dimensions and origin offset range (e.g., `Frame Range 100.0×80.0mm (X:10~110, Y:10~90)`) and animates the toolhead trace.
 
 ---
 
 ## Deployment
 
 Run this service on a small board (RK3399-class, ARM64) that sits next to the engraver.
-It asks for almost nothing: a Linux box with Node.js 18+, plus a USB-to-RS-232 cable.
+It asks for almost nothing: a Linux box with Node.js 18+, plus a USB cable or USB-to-RS-232 cable.
 There is **no `npm install` and no build step** — deploying means copying files.
 
 ### What you need
 
 - A board running Linux (Armbian / Debian / Ubuntu). ARM64 or x86 both work; an RK3399 is the sweet spot at 3-5W idle.
-- A **USB-to-RS-232** cable (±5V signal level).
-  ⚠️ It must be RS-232, **not** USB-TTL (3.3V). The wrong level can damage the engraver's control board.
-  Common chips: CH340, PL2303, FTDI, CP210x.
+- A **USB cable** (for direct USB CDC-ACM `/dev/ttyACM0`) or **USB-to-RS-232** cable (±5V signal level, CH340 / PL2303 / FTDI / CP210x).
 - The engraver powered on and linked to the board with that cable.
 - Any phone / PC / tablet on the same LAN to open the web UI.
 
 ### Step 1 — Get the board on the network
 
-Flash Armbian (or your distro) onto the board's eMMC/SD card, boot it, and connect it to your
-network over Ethernet or Wi-Fi. Find its IP address (check your router, or run `hostname -I`
-on the board). We'll call it `<board-ip>` below.
+Flash Armbian (or your distro) onto the board's eMMC/SD card, boot it, and connect it to your network over Ethernet or Wi-Fi. Find its IP address (`hostname -I`).
 
 ### Step 2 — Install Node.js 18+
-
-Log into the board over SSH and check:
 
 ```bash
 node -v     # must print v18.x or newer
 ```
 
-If it prints nothing or an old version, install it:
-
-```bash
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
-sudo apt-get install -y nodejs
-node -v     # should now be v20.x
-```
-
-The installer in Step 4 also installs Node for you if it is missing, so this step is optional —
-but doing it explicitly means fewer surprises.
-
-### Step 3 — Copy the project onto the board
-
-On the board:
+### Step 3 — Copy the project & run the installer
 
 ```bash
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
-```
-
-(Or copy the folder over with `scp` from your computer — either works, because there is no build.)
-
-### Step 4 — Run the installer
-
-```bash
 sudo bash deploy/install.sh --port 8080
 ```
 
-One command does everything:
+### Step 4 — Open the console & run a Frame Check
 
-1. Installs Node.js 18+ if missing.
-2. Copies the project to `/opt/plotter-one`.
-3. Creates a dedicated `plotter` system user and adds it to the `dialout` group (serial-port access).
-4. Installs a systemd service that starts on boot and auto-restarts if it crashes.
-5. Installs udev rules so the serial port is readable/writable.
-6. Opens the firewall port.
-7. Sets up mDNS so you can reach it as `hostname.local` instead of memorising an IP.
-
-### Step 5 — Open the console in a browser
-
-On any device in the same LAN, open:
-
-```
-http://<board-ip>:8080
-```
-
-If mDNS works on your network, `http://armbian.local:8080` also works. You should see the console.
-
-### Step 6 — Connect the engraver
-
-1. Plug the USB-RS-232 cable into the board and the engraver.
-2. In the UI's **Device** section, pick the serial port — usually `/dev/ttyUSB0` or `/dev/ttyACM0`.
-3. The service auto-connects on boot and retries every 3 seconds, so you normally don't need to click anything.
-4. Verify it is live:
-
-   ```bash
-   curl -s http://localhost:8080/api/state | grep -o '"connected":[a-z]*'
-   # → "connected":true
-   ```
-
-#### How to find the serial port
-
-After plugging in the cable:
-
-```bash
-dmesg | tail -20              # did the kernel see it as ttyUSB0 / ttyACM0?
-ls -l /dev/ttyUSB* /dev/ttyACM*
-# check the chip vendor
-udevadm info -a -n /dev/ttyUSB0 | grep -E 'idVendor|idProduct'
-```
-
-Pick whatever appears in the dropdown in the UI.
-
-#### Serial parameters (Liyue machines)
-
-| Parameter | Value |
-|-----------|-------|
-| Baud rate | 115200 (default, supports 9600–230400) |
-| Data bits | 8 |
-| Stop bits | 1 |
-| Parity    | none |
-| Flow ctrl | none (try RTS/CTS if transfer is unstable) |
-
-These are the UI defaults.
-
-#### If the device won't connect
-
-```bash
-# 1. Permission problem (most common)
-ls -l /dev/ttyUSB0
-# should be crw-rw---- 1 root dialout ...
-sudo usermod -aG dialout plotter
-sudo systemctl restart plotter-one
-
-# 2. ModemManager is grabbing the port (common on Ubuntu/Debian)
-sudo systemctl stop ModemManager
-sudo systemctl disable ModemManager
-
-# 3. Another program is holding the port
-sudo fuser -v /dev/ttyUSB0
-
-# 4. Test the port by hand
-sudo apt install minicom
-sudo minicom -b 9600 -D /dev/ttyUSB0   # press Enter, see if it echoes
-```
-
-#### RS-232 cable notes
-
-- **Length**: beyond ~10-15 m data starts dropping. If the engraver is far, extend the USB side or use an RS-232 repeater.
-- **Crossover vs straight**: RS-232 is crossover (DTE-DCE). If unsure, try swapping TX/RX once.
-- **Ground**: must be common; a floating ground causes garbage or lost data.
-- **Shielding**: use a shielded cable to reduce motor interference.
-
-### Step 7 — Your first cut (do this safely)
-
-1. **Dry run first**: with no material on the bed, build a small 50mm square and send it; watch the tool-path direction.
-2. Axis direction and layout rotation are already confirmed on real hardware and locked into the machine presets — don't change them in daily use (wrong values mirror or topple the whole design).
-3. Only load material after the direction looks correct.
-
-### Making the LAN friendlier
-
-**Fixed IP** — edit `/etc/network/interfaces`:
-
-```
-auto eth0
-iface eth0 inet static
-    address 192.168.1.100
-    netmask 255.255.255.0
-    gateway 192.168.1.1
-```
-
-**mDNS (no IP to remember)** — the installer already sets up avahi, so `http://armbian.local:8080`
-works. On a phone, an mDNS browser (Bonjour on iOS, a similar tool on Android) resolves it.
-
-**Add to home screen** — open the console in the phone browser → Share → "Add to Home Screen".
-It then opens full-screen from the desktop icon, like a native app.
-
-### Daily operations
-
-```bash
-systemctl status plotter-one      # is it running?
-systemctl restart plotter-one     # restart after a config change
-journalctl -u plotter-one -f      # follow the logs
-```
-
-Config lives at `/opt/plotter-one/data/config.json`; restart the service after editing it.
-
-### Upgrade
-
-```bash
-cd plotter-one
-git pull
-sudo systemctl stop plotter-one
-sudo rsync -av --exclude node_modules --exclude data/ ./ /opt/plotter-one/
-sudo systemctl start plotter-one
-```
-
-### Uninstall
-
-```bash
-sudo bash deploy/uninstall.sh          # keep your config
-sudo bash deploy/uninstall.sh --purge   # remove everything
-```
+Open `http://<board-ip>:8080` in any browser on the LAN, import or add a test shape, and click **"⬚ Frame Check (Trace Bounds)"** to verify the physical area on your machine before cutting.
 
 ---
 
 ## Supported machines
 
-Liyue SC series (SC631-AU / SC631E / SC801 / SC1261) and other HP-GL compatible engravers.
-
-| Model | Preset bed | Notes |
-|---|---|---|
-| **Liyue SC631-AU** | 600 × 710 mm | Conservative default, see "⚠️ Bed width" below |
-| Liyue SC631E | 630 × 710 mm | Use only after confirming a 630mm nameplate |
-| Liyue SC801 / SC801E | 800 × 880 mm | |
-| Liyue SC1261 / SC1261E | 1260 × 1340 mm | |
-| Generic HPGL | 630 × 710 mm | 1016 units/inch |
-| Liyue 4-axis / servo (3D) | 800 × 880 mm | |
-
-**Resolution**: Liyue specs 0.0254mm/step, i.e. 1000 steps/inch. This service converts
-precisely to integer machine pulses via `toPlotterUnits()` and emits native HP-GL coordinates.
-
-> ⚠️ **Never send `SC` (scale) to a roll-feed engraver.** The roll has no fixed physical
-> Y limit ($P2_y = 0$); sending `SC` makes the firmware compute a Y scale factor of zero,
-> which kills the feed axis entirely and corrupts X motion as well.
-
-### ⚠️ Why the bed width is 600 and not 630
-
-Vendors list the SC631-AU "max plot width" as 600, 615, or 630 mm depending on the source.
-This project **defaults to the smallest value, 600mm**: a too-small bed only constrains
-layout, a too-large one sends the tool off the material into the machine — or breaks the blade.
-
-If your nameplate confirms 630mm, just switch to the SC631E preset in the UI.
-
-### ⚠️ Axis directions and the origin datum
-
-**The engraver is based on the origin the operator sets on the material:**
-1. The operator nudges the tip to a material corner with the panel's direction keys.
-2. They press the panel's **Origin** button; that physical position becomes local $(0, 0)$.
-3. Jobs start from $(0, 0)$ and cut forward. A job **never sends `!PG;` mechanical homing
-   at the start** — that would destroy the operator's datum and slam into the rail limit.
-
-Standard axis assignment:
-- **X (first HP-GL parameter)**: gantry (left-right across the 600mm bed)
-- **Y (second parameter)**: media roller (material feed, 710mm of travel)
-
-These are **not adjustable from the UI**. They are machine hardware properties confirmed on
-a real SC631-AU and pinned in `machine/hpgl.js`. See "Verified hardware facts" below.
-
----
-
-## Verified hardware facts
-
-The axis logic in this project was **iteratively debugged on a real SC631-AU**.
-
-| Item | Measured |
-|---|---|
-| Motor assignment | Standard: gantry rail = `X`, media roller = `Y` |
-| Step resolution | 1000 steps/inch (0.0254mm/step) |
-| Serial port | `/dev/ttyACM0`, 115200 8N1, no flow control |
-| Origin datum | Panel **Origin** button is $(0,0)$; no `!PG;` at job start |
-| **Layout orientation** | **The whole design comes out rotated 90° CCW** (directions correct, not mirrored — purely toppled) |
-
-The corresponding configuration:
-
-```
-swapAxes     = false    ← do not swap axes
-axisX        =  1       ← gantry positive
-axisY        =  1       ← media roller positive
-layoutRotate = 90       ← compensates layout orientation (90° clockwise)
-```
-
-#### What `layoutRotate` is, and why it is a separate parameter
-
-**Real-machine finding, 2026-10-05**: with "SparkMinds" laid out horizontally on the canvas,
-the engraved output came out **rotated 90° counter-clockwise** — the directions were correct
-(no mirroring), the whole layout was simply lying on its side. The compensation is therefore
-**90° clockwise**.
-
-Physical cause: the machine's feed axis (710mm) and gantry axis (600mm) are transposed in
-the firmware, while the operator describes the layout standing in front of the machine in
-terms of "left/right" and "in/out". The two reference frames differ by one 90° rotation, and
-the net effect is that the whole layout lies down.
-
-> 🔴 **It is a completely different thing from `swapAxes` — do not tune one for the other**
->
-> | Parameter | Controls | Symptom when wrong |
-> |---|---|---|
-> | `swapAxes` | Whether the graphic is **mirrored** | Left-right flipped (obvious at a glance) |
-> | `axisX/axisY` | Which way is **positive** on each axis | Single-axis mirror |
-> | `layoutRotate` | How far the **whole layout is rotated** | Layout toppled 90°/180° |
->
-> Historically, treating the first two as "layout orientation" was the root cause of
-> repeated misdiagnosis in this project. The three dimensions are orthogonal and combine
-> freely; rotation only accepts multiples of 90° (normalised at the entry point, so 37°
-> collapses to 0°).
-
-### Confirmed firmware behaviours
-
-These were all learned the hard way; recorded here so nobody repeats the experiments.
-
-| Behaviour | Explanation |
-|---|---|
-| **The firmware never answers** | `OI;` / `OA;` / `IN;` all come back empty. The machine is a **pure simplex receiver** — it consumes data and says nothing. Any design that waits for an acknowledgement or a version string will hang forever (measured on a GD32F30x CDC firmware, `GD32F30X-3.0.0-*` serial number) |
-| **`IN;` must be sent first** | After cold start the firmware is uninitialised and **silently ignores all motion commands** without `IN;`. Serial writes succeed and the job shows "complete", but the machine does not move — indistinguishable from a dead serial port |
-| **Never send `SC`** | On a roll-feed machine `SC` zeroes the Y scale factor (no physical $P2_y$) and kills the feed axis. Reverse `SC` (`Xmin > Xmax`) is worse: a negative scale factor sends the machine into a runaway. This project never emits `SC` at all — coordinates are converted to integer machine pulses on the host |
-| **Never send `!PG;`** | Mechanical homing searches the **X** limit switch, and the roll-feed Y axis has no limit switch at all. Some firmwares ignore it (button looks broken); those that honour it discard the operator's datum and slam the rail. Home / End return to the user origin with a relative `PR dx,dy;` + `IP0,0;` instead |
-| **Avoid `SP0;`** | On some firmwares selecting pen 0 drops the machine offline and it then refuses to move at all. Stop / End only ever send `PU;` |
-| **Long command lines get swallowed** | The reference CDC demo's OUT buffer is 64 bytes. Multi-coordinate lines spanning several USB packets risk reassembly corruption — the classic "data was received, machine never moved, power-cycle required" symptom |
-| **Manual operations must lift the pen unconditionally** | The software's notion of pen state can diverge from the machine's (after an aborted job or a reconnect). Safety operations send `PA;` + `PU;` + `PR0,0;` regardless of what the software thinks |
-
-### Safety design
-
-Deliberately biased towards "wait longer rather than crash":
-
-- **No mechanical homing, ever**: `!PG;` is not emitted at job start, not by the Home button,
-  not at End. Homing destroys the operator's datum and drives into the rail limit switch.
-  Home / End walk back to the recorded origin with a relative `PR` instead.
-- **Rate limiting + e-stop**: all manual actions go through the job queue and never bypass
-  rate limiting; e-stop sends only `PU;` and **no motion command at all**
-- **No `SC` at all**: rather than keeping it ascending, the host converts to integer machine
-  pulses itself, so a wrong direction setting can at worst mirror the graphic — it can never
-  drive the firmware into a negative scale
-- **200mm cap per manual move**, so a slip of the hand cannot run away
-- **Relative moves for diagnostics**: 5mm, pen up, out and back — safe even when not homed
-- **Pen lifted on exit**: a service restart or crash does not leave the head pressing on
-  the control board
-
-### Serial auto-reconnect
-
-The service **reconnects the serial port automatically** on startup and retries every 3
-seconds, so a USB re-plug that changes the device node (`ttyACM0` → `ttyACM1`) recovers on
-its own.
-
-> Without this layer, every service restart left the machine "disconnected" and greyed out
-> every manual button — which reads as a broken machine. That is the single most
-> misdiagnosed failure mode in this project.
-
----
-
-## Features
-
-### 🪄 Image Vectorization & AI Smoothing (Zero-dependency Web Engine)
-
-**Why & Key Benefits:**
-- **No Heavy Third-Party Software Needed**: Forget fiddling with manual trace dialogs and plugins across Illustrator, CorelDRAW, or Inkscape. Upload, vectorize, calibrate to bed, and plot straight from your browser.
-- **Engineered to Vanquish AI Diffusion Artifacts**: Images from Midjourney, Stable Diffusion, and DALL-E suffer from high-frequency micro-texture grain, anti-aliased staircasing, and scattered floating specks. Naive vectorizers generate tens of thousands of tiny jittery loops that cause intense pen-lift chatter (pen-up thrashing) or tear through thin paper. Our pipeline applies **bilateral edge-preserving filtering + connected component island area thresholding (Turdsize)** to eradicate noise at the root.
-- **True Centerline / Skeleton Tracing**: Pen plotters and drawing machines draw with ballpoint pens, gel pens, or markers. Our integrated Zhang-Suen thinning algorithm extracts **true 1px single-stroke skeleton centerlines**, eradicating the common pitfall of outlining thin lines into hollow double loops. Features topological spur pruning to snip off diffusion whisker branches.
-- **Mechanical Smoothing & Decimation**: Built-in RDP path decimation and Chaikin curve subdivision smooth harsh corners into fluid arcs, keeping stepper motors gliding smoothly without abrupt deceleration jolts.
-
-**How to Use:**
-1. **Open Workspace**: Click **"🪄 Vectorize Image (AI Denoise)…"** in the left import sidebar.
-2. **Load Image**: Drag & drop or pick any PNG / JPG / WebP image, or click **"Load AI lineart sample"** for an instant hands-on preview.
-3. **Configure Denoising & Mode**:
-   - **Presets**: Pick `[AI Denoise (Recommended)]`, `[Light]`, or `[Heavy]`.
-   - **Mode Selection**:
-     - **Centerline (Single Stroke)**: Ideal for sketches, lineart, and single-stroke pen plotting. Includes adjustable spur pruning to trim micro-whiskers.
-     - **Outline (Contour)**: Traces outer boundaries for solid silhouettes, stamps, text, and logos.
-   - **Raster Tuning**: Adjust bilateral filter radius, island filter threshold (px²), and binary threshold (with auto Otsu detection and black/white inversion).
-   - **Vector Post-processing**: Tune RDP simplification epsilon, Chaikin curve smoothing iterations, and micro-path threshold.
-4. **Interactive Multi-View Compare**: Toggle between "Vector Paths", "Denoised Binary", "Overlay", and "Original Bitmap" views with real-time path count, node count, and latency stats.
-5. **One-Click Import or Export**:
-   - Click **"📥 Import to Canvas"**: Automatically translates, scales to fit your current machine bed, and creates a ready-to-plot layer.
-   - Click **"Download SVG"**: Exports clean, standalone SVG vector paths to your local machine.
-
-### Import and edit
-
-- **Import DXF / SVG / HP-GL**, or paste HP-GL commands directly
-- **Full SVG Primitives & Matrix Cascade**: Full support for `<path>`, `<circle>`, `<rect>`, `<ellipse>`, `<line>`, `<polyline>`, and `<polygon>`, along with nested `<g>` group handling and matrix transform cascades. Fixes missing circle and rectangle geometries when importing multi-element SVGs.
-- **Group & Ungroup**:
-  - Complex multi-element vector imports are organized as groups by default to keep the layer tree neat.
-  - Supports one-click Ungroup for selected layers to split them into independent editable vector paths.
-  - Supports multi-selection (Shift / Cmd click) and one-click Grouping.
-  - While grouped, translation, scaling, and rotation transformations recursively synchronize all child geometries, ensuring children preserve their relative positions upon ungrouping.
-- **Direct canvas editing**: drag to move, drag a corner to scale, drag the top handle to rotate (Shift locks ratio / snaps to 15°)
-- **Dynamic Work Origin & Knife Crosshair**:
-  - **Live Knife Position Tracking**: Real-time crosshair (⌖) and coordinate display on canvas and control panel tracking the physical blade tip position.
-  - **Custom Work Origin (Set Origin / Reset Origin)**: Jog the blade to any target starting position and click "Set Origin" to establish a local working coordinate frame with prominent red origin dot and axis markers; easily reset back to machine zero.
-  - **Relative Origin CAM Compilation**: CAM toolpath generation automatically offsets coordinates relative to the active work origin, guaranteeing absolute cutting alignment with canvas layouts.
-- **Precise numeric control**: X / Y / width / height / angle, with aspect lock, six-way alignment, flip, duplicate
-- **Quick text**: a built-in single-stroke font (Stroker) designed for engraving — ordinary fonts turned into outlines blob together on 3mm acrylic, single-stroke letters stay legible
-- **Two-tier Geometry Optimization & De-speckle**:
-  - **CAM Process Simplification (RDP & Collinear Reduction)**: Adaptive Douglas-Peucker simplification with 0.02mm physical tolerance (smaller than the machine's 0.0254mm step pulse and blade kerf). Compresses over-sampled polylines and vector tracing paths by 70%–95% (e.g. from 295k commands down to 94k), drastically slashing physical transfer time and cutting wait.
-  - **Import-level De-speckle (1.0mm threshold)**: Automatically filters isolated tiny stray artifacts/floating islands from bitmap tracing ($Max(W, H) < 1.0\text{mm}$, perimeter $< 4.0\text{mm}$), preventing the blade from cutting messy speckles and ruining adhesive vinyl.
-  - **Ultra-conservative 0.005mm Pre-simplification**: Merges exact collinear segments and sub-micron jitter at import time, keeping canvas zoom/pan and layer ungrouping completely lag-free.
-- **Instruction layer: ArtCut/文泰-compatible HP-GL output**:
-  Emits the command set these firmwares actually implement — `IN; PA; SP1; PU0,0;` header,
-  pen-up travel as `PU x,y;`, cutting as `PD x,y;`. No `SC`, no `LT;`, and no speed (`VS`)
-  for 2D dialects (it is emitted only for 3-axis / servo presets). Arcs are discretised into
-  `PD` polylines (0.02mm chord height) because 2D engraving firmwares do not implement
-  `AA`/`CI` interpolation — this is exactly what 文泰/ArtCut drivers do.
-  Multi-coordinate batching (`PD x1,y1,x2,y2,…`) is available but **off by default**
-  (`maxBatchPairs = 1`): it saves 20–30% of bytes, but a long line spanning several 64-byte
-  USB packets is the one thing that reliably makes a GD32 firmware stop executing.
-- **Closed-loop overcut compensation** (文泰 `SetCutterCloseAddDist` behaviour): closed
-  subpaths cut `overcutMm` (default 0.3mm) past the start point along the first segment,
-  so the start/end of a closed shape does not stay connected by a paper-thin bridge
-- **Mac Keyboard Polish & Focus Management**: Full support for Mac `Delete`, `Backspace`, `Cmd+Backspace` deletion and `Cmd+A` select-all; autofocus management transfers keyboard focus seamlessly from input fields back to the stage canvas, working reliably even under IME composition.
-- **Full-screen Loading Mask**: Modal semi-opaque spinner during vector import and CAM compilation with user interaction lock to prevent duplicate actions.
-- 6 material presets (ivory board / PVC foam / acrylic / vinyl / KT board + foil / thin paper), each with its own speed and force
-
-### Device Connection and Manual Control
-
-A pad mirroring the basic operations of Ucancam / 文泰:
-
-- **Minimalist Collapsible Device Card**: Designed for transparent operation by default, showing only current status and machine name, with advanced serial port parameters collapsible on demand.
-- **True Connection Health Check & Auto Reconnect**:
-  - 1.5s periodic health heartbeat and proactive disconnection handling on read/write errors. Turning off or unplugging the engraver immediately sets the UI status to disconnected, eliminating misleading "connected" indicators.
-  - Silent background auto-detection and self-healing reconnection upon power-on or USB re-plug.
-- **Direction pad** (▲◀●▶▼), step 0.1 / 1 / 5 / 10 / 25 / 50 mm
-  - press-and-hold to move continuously, Shift to reverse; arrow keys work on desktop
-- **Pen up / pen down / home / set origin / reset origin / feed / eject / pen-up-and-home**
-- 200mm cap per move, so a slip of the hand cannot run away
-- **Home / End walk back, they do not home**: both return to the operator's origin with a
-  relative `PR dx,dy;` and re-anchor with `IP0,0;`. Neither ever issues `!PG;` or `SP0;`
-
-### Output link hardening (learned on real hardware)
-
-Commercial Liyue / GD32 firmwares are **simplex** — they consume data and never answer.
-That one fact drove four decisions:
-
-| Behaviour | What the service does |
-|---|---|
-| **The machine never replies** | On connect, and before each job when the engine is idle, the host writes a probe (`IN;`). If the write goes through but nothing comes back, the link is flagged **one-way** (`deviceInfo.silent`) and the device card says so. A version-string handshake is impossible on this firmware |
-| **A stalled USB layer** | Every write runs under a **5s watchdog**. A write that never completes disconnects the port and raises a bilingual "machine stopped receiving" error instead of hanging forever |
-| **Bursting floods the controller** | Jobs are **poured into the onboard cache first, then tracked by simulation** (aligned with 文泰 `usbfiletrans.dll`): phase one (caching) blasts the whole job as 512-byte chunks of newline-free `;`-separated HP-GL, phase two (cutting) tracks physical progress with the kinematic model. The earlier per-line pacing (look-ahead window, 60ms tick) was abandoned after a real-machine finding: sleeping on motion time mid-stream left the machine stalled at the start point (2026-10-19) |
-| **Long lines get mangled** | No emitted line exceeds **64 bytes** (one USB full-speed packet). Over-long `PD` runs are split into semantically equivalent shorter ones, and coordinates are **never** re-serialised from numbers (that would rewrite them in exponential notation) |
-
-Two consequences worth internalising:
-
-- **On a one-way machine, "complete" means "transmission finished and the simulated timer ran
-  out."** The log says exactly that and asks for visual confirmation. It is not a machine
-  acknowledgement — no such thing exists on this firmware.
-- **If the firmware's application layer hangs, the USB pump keeps accepting writes.** The host
-  cannot detect that in principle. Watch the panel's ONLINE lamp instead: flashing means data
-  reached the application layer but is not executing; dark means data is not getting through.
-
-### Output Control & Job History
-
-- **SparkMinds Branding**: Browser tab favicon with the geometric cube icon, and top navigation bar integrated with the horizontal "SparkMinds 创智实验室" brand logo.
-- **Job History & Parameter Archive**: All cut jobs automatically archived (or saved as templates) with complete layer geometries, user origin, machine preset, material, cut speed, force, and direction; supports one-click recall & edit, re-cutting, and card-based vector thumbnail previews.
-- **Kinematic Virtual Pacing**: Because commercial plotter firmwares operate as open-loop, simplex receivers without bi-directional status reporting, the platform features a kinematic motion model that simulates physical cutting and rapid travel speeds, pen up/down latencies, and homing dwell time. This decouples **buffer transfer progress** from **physical execution progress**, providing true real-time cutting progress and remaining time countdowns. The model is shared by the estimate and the feeder, so a job's ETA tracks physical execution rather than "bytes handed to the driver" — see [Output link hardening](#output-link-hardening-learned-on-real-hardware).
-- **Job queue with dual-stage progress**: Live display of onboard buffer load alongside physical cutting percentage and countdown
-- Pause / resume / stop / e-stop
-- Live toolpath preview and cutting path length metrics during output
-
----
-
-## Resource usage
-
-Measured on an **RK3399 / Armbian (4GB RAM + 15GB eMMC)** — real numbers, not estimates.
-
-### Disk
-
-| Item | Measured |
-|---|---|
-| Total deployment | **400 KB** |
-| ├ `server/` | 232 KB |
-| ├ `web/` | 152 KB |
-| ├ `data/` (config) | 8 KB |
-| └ `package.json` | 4 KB |
-| Dependencies | **0** (no npm deps, no `npm install`) |
-
-400KB is a direct consequence of the "copy and run" design: no `serialport` (C++ extensions),
-serial via `stty` + file descriptors, HTTP via `node:http`, hand-rolled minimal WebSocket.
-
-`data/config.json` grows slowly as settings are saved, but it only holds config — order of
-magnitude, kilobytes.
-
-### Memory
-
-| State | Measured RSS |
-|---|---|
-| Idle resident | **~43 MB** |
-| Single job peak | Scales with artwork complexity, see below |
-
-43MB is mostly the Node runtime itself (V8 heap + internals), **not this project's data**.
-
-Per-job overhead depends on complexity. Measured (5000 segments, 76KB of commands):
-
-```
-command text          75 KB
-lines array overhead  ~450 KB   ← one string per line; JS string objects carry overhead
-```
-
-**Optimisation already in place**: job history keeps 50 entries. The early implementation
-retained the full `text` + `lines` for each, which meant tens of MB resident, growing
-monotonically over days. History entries now drop the heavy fields and keep only
-name/status/progress/byte count; the UI is unaffected.
-
-### CPU
-
-| State | Measured |
-|---|---|
-| Idle | **< 1%** (load average ~0.05) |
-| Outputting | ~1-3% |
-
-**The CPU was never the bottleneck — the mechanics are.** Note that on a USB-CDC link
-(`/dev/ttyACM0`) the configured baud rate is not a real throughput limit: a line can be
-written in under a millisecond, so a naive implementation can push tens of kilobytes into the
-machine in seconds — far faster than it can cut.
-
-> That is why `jobEngine` **pours the whole job into the onboard cache first** (512-byte
-> chunks, newline-free), then tracks physical cutting with the kinematic model. The goal is
-> not to save CPU, it is to keep the machine fed from its own buffer instead of stalling it
-> mid-stream, and to keep progress honest.
-
-### Temperature and stability
-
-Measured CPU temperature **45°C** idle. The RK3399 is passively cooled, so this is very safe.
-The service runs with `Restart=always`; measured `NRestarts=0` over extended operation.
-
-### In one sentence
-
-An RK3399 needs 400KB of disk, 43MB of RAM and <1% CPU to run this.
-**The bottleneck is 100% the engraving mechanics**, not this service.
-
----
-
-## Accuracy
-
-The self-test includes an HPGL compile-then-reparse round-trip consistency check:
-
-| Metric | Measured | Meaning |
-|---|---|---|
-| Length error | 0.0115% | ≈ 0.08mm across an 800mm bed |
-| Bounding box error | 0.0003% | |
-
-Against Liyue's quoted 0.127mm repeatability, **the command generation error is an order of
-magnitude below the machine's own precision** — the mechanics are the limit, not the software.
-
----
-
-## Internationalisation
-
-The UI ships in Chinese and English. Switch with the `中 / EN` button in the top bar, or let
-it follow the browser language on first visit. The choice is remembered in `localStorage`.
-
-How it is put together:
-
-| Source | Mechanism |
-|---|---|
-| Static HTML | `data-i18n="key"`, plus `data-i18n-attr="placeholder:key,title:key"` for attributes |
-| Dynamic JS | `t('key', { vars })` |
-| Server messages | Both languages are sent; the client picks (`{zh, en}` for warnings, `{note, noteEn}` for metadata) |
-
-Three deliberate design decisions:
-
-1. **No i18n library.** The front end is native ES modules with zero build. A library that
-   needs `npm install` would break the "copy files to deploy" property.
-2. **A missing key renders as the key itself**, not as blank. A blank looks like a broken UI;
-   `some.missing.key` is visible at a glance. Silently failing is the dangerous mode.
-3. **Existing API fields keep their Chinese meaning.** `error` still holds Chinese and `en`
-   is added alongside as `errorEn`; `pushLog(line, en)` still records Chinese in `line`.
-   Changing the meaning of an established field would blank out any older cached client.
-
-```bash
-node tools/i18n-check.js
-```
-
-This audits that every key exists in both languages, that placeholders match on both sides,
-that HTML and JS reference only real keys, and that no untranslated Chinese string remains
-in user-facing code. The risky failure mode it guards against is a key that was never
-translated: the UI quietly keeps Chinese while every other check stays green.
-
-The self-test also asserts that every machine preset, material preset, CAM warning and
-manual-control note carries both languages.
+| Preset ID | Model | Preset bed | Resolution (steps/in) | Default `originPosition` | Notes |
+|---|---|---|---|---|---|
+| **`liyue-sc631-au`** | **Liyue SC631-AU** | 600 × 710 mm | 1000 | `bottom-right` | Conservative default |
+| `liyue-sc631e` | Liyue SC631E / SC631-AU (630mm) | 630 × 710 mm | 1000 | `bottom-right` | Use after confirming 630mm nameplate |
+| `liyue-sc630` | Liyue SC630 / SC631E | 630 × 710 mm | 1000 | `bottom-right` | Standard 630mm width |
+| `liyue-sc801` | Liyue SC801 / SC801E | 800 × 880 mm | 1000 | `bottom-right` | 800mm plot width |
+| `liyue-sc1261` | Liyue SC1261 / SC1261E | 1260 × 1340 mm | 1000 | `bottom-right` | 1260mm plot width |
+| `generic-1016-600` | Generic 1016 (600mm) | 600 × 710 mm | 1016 | `bottom-right` | 1016 steps/inch (40 steps/mm) |
+| `generic-hpgl-1016` | Generic HPGL engraver | 630 × 710 mm | 1016 | `bottom-right` | Standard HPGL resolution |
+| `generic-dmpl` | Generic DMPL cutter | 630 × 710 mm | 1016 | `bottom-right` | Domestic DMPL boards |
+| `liyue-4axis` | Liyue 4-axis / servo (3D) | 800 × 880 mm | 4060 | `bottom-left` | 3D flatbed, supports `FS` force |
 
 ---
 
@@ -634,42 +171,42 @@ manual-control note carries both languages.
 ```
 plotter-one/
 ├── server/
-│   ├── index.js              HTTP routes + WebSocket
-│   ├── selftest.js           270 self-checks
-│   ├── geom/path.js          geometry kernel (paths / matrices / transforms)
+│   ├── index.js              HTTP routes + WebSocket + POST /api/frame
+│   ├── selftest.js           286 end-to-end self-checks (no hardware required)
+│   ├── geom/path.js          geometry kernel (paths / matrices / RDP / de-speckle / ordering)
 │   ├── cam/
-│   │   ├── toolpath.js       toolpath generation (arcs preserved, not flattened)
+│   │   ├── toolpath.js       toolpath engine (origin-aware ordering + closed-loop vertex rotation)
 │   │   └── textToPath.js     single-stroke font → paths
 │   ├── machine/
-│   │   ├── hpgl.js           HP-GL generation + machine presets
-│   │   ├── transport.js      serial / TCP / virtual plotter
-│   │   ├── jobEngine.js      job queue + rate limiting
+│   │   ├── hpgl.js           HP-GL / DMPL builder + 4-corner origin + frame check + presets
+│   │   ├── transport.js      serial / TCP / virtual plotter (with 5s write watchdog)
+│   │   ├── jobEngine.js      job queue + chunked streaming + kinematic progress tracking
 │   │   ├── manual.js         manual control commands
 │   │   └── calibrate.js      safe micro-move helper (diagnostics)
 │   ├── import/               DXF / SVG / HPGL parsers
-│   └── api/httpKit.js        HTTP helpers + WebSocket implementation
-├── web/                      front end (native ES modules, no build)
-│   ├── js/i18n.js            bilingual dictionary + switcher
+│   └── api/httpKit.js        HTTP helpers + minimal RFC6455 WebSocket implementation
+├── web/                      front end (native ES modules, zero build)
+│   ├── index.html            main UI
+│   ├── css/app.css           stylesheet
+│   ├── js/app.js             main logic (origin-relative coords, auto-snap, frame check)
+│   ├── js/render.js          Canvas renderer (dynamic origin corner, knife crosshair, frame box)
 │   ├── js/transform.js       geometry transforms
-│   ├── js/render.js          canvas rendering
-│   └── geom.js               geometry kernel copy (synced from server)
-├── tools/i18n-check.js       i18n audit
+│   ├── js/vectorizer.js      built-in AI-denoise bitmap vectorizer
+│   ├── js/i18n.js            bilingual dictionary (364 keys) + language switcher
+│   └── geom.js               geometry kernel copy (synced from server/geom/path.js)
+├── tools/i18n-check.js       i18n audit script
 ├── deploy/                   install / uninstall / sync scripts
 └── docs/
     └── 设计工作流.md
 ```
-
-`web/geom.js` is a copy of `server/geom/path.js`, kept in sync by `deploy/sync-geom.sh`.
-**Sharing one geometry kernel is mandatory** — otherwise you get "on screen here, engraved
-over there".
 
 ---
 
 ## Development
 
 ```bash
-npm run selftest         # 270 self-checks, no machine required
-node tools/i18n-check.js # i18n audit
+npm run selftest         # 286 self-checks, no machine required
+node tools/i18n-check.js # i18n audit (364 keys)
 npm start                # default port 8080
 npm start -- --port 9000
 ```
@@ -679,15 +216,6 @@ npm start -- --port 9000
 ```bash
 ./deploy/sync-geom.sh
 ```
-
-Self-test coverage: geometry invariants, HPGL round-trip consistency (compile → reparse),
-job engine state machine, mirrored-axis generation, machine bed sizes, serial write paths,
-paced streaming and the 64-byte line cap, one-way vs. two-way link semantics, the write
-watchdog, and bilingual messages.
-
-Every one of these runs without a machine attached, which is the point: the failure modes that
-matter on this hardware (silently ignored commands, swallowed long lines, fake "complete")
-cannot be reproduced on demand, so they are pinned as assertions instead.
 
 ---
 

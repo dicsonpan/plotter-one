@@ -14,7 +14,7 @@ import {
   flattenPath, optimizeOrder, setDirection, signedArea, pruneDegenerate, countElements,
   subpathLength, simplifyPath, simplifySubpath, rdpSimplifyPoints, filterSpeckles,
 } from './geom/path.js';
-import { MACHINE_PRESETS, MATERIAL_PRESETS, HpglBuilder, compileToPlotterLanguage, hpglToDmpl, estimateHpglMotion } from './machine/hpgl.js';
+import { MACHINE_PRESETS, MATERIAL_PRESETS, ORIGIN_POSITIONS, getOriginCorner, buildFrameCommand, HpglBuilder, compileToPlotterLanguage, hpglToDmpl, estimateHpglMotion } from './machine/hpgl.js';
 import { buildCalibrationStep } from './machine/calibrate.js';
 import { buildManualCommand } from './machine/manual.js';
 import { readFileSync } from 'node:fs';
@@ -85,8 +85,6 @@ section('几何内核');
   check('统一为逆时针后面积为正', signedArea(wrap2) > 0, `面积 ${signedArea(wrap2)}`);
 
   // 反向不变量：长度、包围盒、图元数都必须守恒，且圆弧不能被离散。
-  // 「反向把圆弧离散掉」是实测踩到的坑——9600 波特下指令量会暴涨好几秒，
-  // 而且离散误差会让「刻短了」。
   const shapeMakers = {
     整圆: () => circleToPath(300, 300, 25),
     椭圆: () => ellipseToPath(300, 300, 30, 18),
@@ -202,13 +200,13 @@ section('HPGL 生成与往返');
 // ---------------------------------------------------------------------------
 section('分辨率正确性（力宇 1000 vs HPGL 标准 1016）');
 {
-  // 100mm 的线段，从 (0,0) 到 (100,0)，看空移 PU 与落刀 PD 目标值
+  // 100mm 的线段，从 (0,0) 到 (100,0)，固定 layoutRotate:0 隔离验证 1D 脉冲步数换算
   const probe = (preset) => {
     const p = makePath();
     const s = makeSubpath(0, 0);
     addLine(s, 100, 0);
     p.subpaths.push(s);
-    const built = new HpglBuilder(preset).build(p, { speedMmPerSec: 30 });
+    const built = new HpglBuilder(preset, { layoutRotate: 0 }).build(p, { speedMmPerSec: 30 });
     const all = [...built.text.matchAll(/(?:PU|PD)(-?\d+),(-?\d+);/g)].map((m) => +m[1]);
     return { all, built };
   };
@@ -301,28 +299,23 @@ EOF`;
   const r = parseDxf(dxf);
   check('DXF 解析出 4 个子路径', r.path.subpaths.length === 4, `实际 ${r.path.subpaths.length}`);
   const types = countElements(r.path);
-  // LINE(1线) + ARC(1弧) + CIRCLE(1弧) + 闭合LWPOLYLINE(3条显式线，闭合边隐含) = 4线 2弧
   check('DXF 图元统计正确', types.lines === 4 && types.arcs === 2, JSON.stringify(types));
-  // 整圆周长应还原为 2πr
   const circ = r.path.subpaths[1];
   check('DXF 整圆周长正确', near(subpathLength(circ), 2 * Math.PI * 25, 1e-6), `实际 ${subpathLength(circ).toFixed(2)}`);
 
   const svg = '<svg><path d="M10 10 L100 10 L100 100 Z"/></svg>';
   const rs = parseSvgPath(svg.match(/d="([^"]+)"/)[1]);
   check('SVG 三角解析出 1 条闭合路径', rs.subpaths.length === 1 && rs.subpaths[0].closed);
-  // 90 + 90 + √(90²+90²) = 307.28
   const expectLen = 180 + Math.hypot(90, 90);
   check('SVG 长度正确', near(pathLength(rs), expectLen, 0.01),
     `实际 ${pathLength(rs).toFixed(2)}，期望 ${expectLen.toFixed(2)}`);
 
-  // 相对命令必须与绝对命令等价（Y 翻转最容易在这里出错）
   const rel = parseSvgPath('m10 10 l90 0 l0 90 z');
   check('相对命令与绝对等价', near(pathLength(rel), expectLen, 0.01), `实际 ${pathLength(rel).toFixed(2)}`);
 
   const cubic = parseSvgPath('M0 0 C 10 0, 10 10, 0 10');
   check('SVG 三次贝塞尔可解析', pathLength(cubic) > 15, `长度 ${pathLength(cubic).toFixed(2)}`);
 
-  // SVG 导入过滤微小噪点杂质（阈值 1mm）
   const svgWithSpeckle = `
     <svg width="200" height="200" viewBox="0 0 200 200">
       <!-- 正常大矩形 (50x50mm) -->
@@ -336,14 +329,13 @@ EOF`;
   check('SVG 导入生成滤除提示警告且中英双语',
     parsedSvg.warnings.some((w) => w.zh.includes('小于 1mm') && w.en.includes('< 1mm')));
 
-  // filterSpeckles 直接测试：0.8mm 小闭合环被剔除，10mm 细长线条放行
   const testPath = makePath();
   const tinySub = makeSubpath(0, 0);
   addLine(tinySub, 0.8, 0); addLine(tinySub, 0.8, 0.8); addLine(tinySub, 0, 0.8); addLine(tinySub, 0, 0);
   tinySub.closed = true;
   testPath.subpaths.push(tinySub);
   const longSub = makeSubpath(10, 10);
-  addLine(longSub, 20, 10); // 10mm 细长线
+  addLine(longSub, 20, 10);
   testPath.subpaths.push(longSub);
 
   const filterRes = filterSpeckles(testPath, 1.0);
@@ -367,9 +359,6 @@ section('CAM 与输出');
   // 负坐标必须报警
   const neg = circleToPath(-50, 100, 20);
   const c3 = compileToolpath(neg, preset, {});
-  // 警告是 {zh, en} 对象（前端按语言挑），所以要分别验两种语言都有内容。
-  // 之前这里写的是 w.includes(...) —— 警告改成对象后直接 TypeError，
-  // 说明这条断言确实在守着「警告的形态」，不是摆设。
   check('负坐标被拦截（中英文都在）',
     c3.warnings.some((w) => w && w.zh && w.zh.includes('负坐标') && w.en && w.en.includes('negative')),
     JSON.stringify(c3.warnings));
@@ -381,7 +370,6 @@ section('CAM 与输出');
 // ---------------------------------------------------------------------------
 section('CAM 几何层抽稀优化（RDP 与共线合并）');
 {
-  // 1. 共线直线抽稀：100 个连续点落在直线上，必须合并为 2 个点（起点与终点）
   const colPts = [];
   for (let i = 0; i <= 100; i++) {
     colPts.push({ x: i * 1.5, y: i * 2.0 });
@@ -395,7 +383,6 @@ section('CAM 几何层抽稀优化（RDP 与共线合并）');
   check('共线密集折线压缩为 2 点（1 条线段）', colSub.elems.length === 1, `实际图元数 ${colSub.elems.length}`);
   check('共线折线终点坐标守恒', near(colSub.elems[0].x2, 150, 1e-3) && near(colSub.elems[0].y2, 200, 1e-3));
 
-  // 2. 密集高频曲线抽稀：1000 个密集正弦点，容差 0.02mm
   const sinePts = [];
   for (let i = 0; i <= 1000; i++) {
     const x = i * 0.1;
@@ -406,7 +393,6 @@ section('CAM 几何层抽稀优化（RDP 与共线合并）');
   check('密集高频曲线压缩率超过 60%', sineSimplified.length < 400, `原始 1001 点，抽稀后 ${sineSimplified.length} 点`);
   check('曲线抽稀起点终点守恒', near(sineSimplified[0].x, 0, 1e-3) && near(sineSimplified[sineSimplified.length - 1].x, 100, 1e-3));
 
-  // 3. 闭合多边形抽稀保持闭环
   const circlePts = [];
   const R = 30;
   for (let i = 0; i <= 360; i++) {
@@ -425,11 +411,10 @@ section('CAM 几何层抽稀优化（RDP 与共线合并）');
   const last = polyCircle.elems[polyCircle.elems.length - 1];
   check('闭合离散圆抽稀后首尾闭合', near(first.x1, last.x2, 1e-3) && near(first.y1, last.y2, 1e-3));
 
-  // 4. 混合图元（直线 + 原生圆弧）：圆弧不受影响
   const mixedSub = makeSubpath(0, 0);
-  for (let i = 1; i <= 20; i++) addLine(mixedSub, i, 0); // 20段共线直线
-  addArc(mixedSub, 20, 10, 10, -Math.PI / 2, Math.PI / 2); // 1段圆弧
-  for (let i = 1; i <= 20; i++) addLine(mixedSub, 20 - i, 20); // 20段共线直线
+  for (let i = 1; i <= 20; i++) addLine(mixedSub, i, 0);
+  addArc(mixedSub, 20, 10, 10, -Math.PI / 2, Math.PI / 2);
+  for (let i = 1; i <= 20; i++) addLine(mixedSub, 20 - i, 20);
   const mixedPath = makePath();
   mixedPath.subpaths.push(mixedSub);
 
@@ -438,10 +423,9 @@ section('CAM 几何层抽稀优化（RDP 与共线合并）');
   check('混合图元中原生圆弧保留且数量不变', arcElems.length === 1);
   check('混合图元中两段共线直线各自压缩为单条线段', mixedSub.elems.length === 3, `实际总图元数 ${mixedSub.elems.length}`);
 
-  // 5. compileToolpath 自动触发几何层抽稀
   const densePath = makePath();
   const denseSub = makeSubpath(0, 0);
-  for (let i = 1; i <= 200; i++) addLine(denseSub, i * 0.5, (i % 2 === 0 ? 0.005 : 0)); // 200段微米级抖动线
+  for (let i = 1; i <= 200; i++) addLine(denseSub, i * 0.5, (i % 2 === 0 ? 0.005 : 0));
   densePath.subpaths.push(denseSub);
   const compiled = compileToolpath(densePath, MACHINE_PRESETS['liyue-sc631-au'], { tolerance: 0.02 });
   check('compileToolpath 输出刀路自动应用几何抽稀', compiled.path.subpaths[0].elems.length < 5,
@@ -452,7 +436,6 @@ section('CAM 几何层抽稀优化（RDP 与共线合并）');
 section('指令层连续坐标流合并（HP-GL 批量坐标提速 20%~30%）');
 {
   const preset = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
-  // 构造 60 个非共线连接点（折线）
   const poly = makePath();
   const ps = makeSubpath(0, 0);
   for (let i = 1; i <= 60; i++) {
@@ -460,27 +443,22 @@ section('指令层连续坐标流合并（HP-GL 批量坐标提速 20%~30%）');
   }
   poly.subpaths.push(ps);
 
-  // 1. 默认单点模式（每对坐标独立占一行 PD x,y;，maxBatchPairs: 1）
   const unmerged = compileToPlotterLanguage(poly, preset, { maxBatchPairs: 1, speedMmPerSec: 30 });
-  // 2. 显式连续流合并模式（maxBatchPairs: 30）
   const merged = compileToPlotterLanguage(poly, preset, { maxBatchPairs: 30, speedMmPerSec: 30 });
 
   check('合并模式生成有效指令', merged.text.length > 0);
   const mergedPdLines = merged.text.split('\n').filter((l) => /^PD-?\d+,-?\d+,/.test(l));
   check('显式开启批量模式时落刀切割坐标合并为批量 PD 指令', mergedPdLines.length > 0);
 
-  // 验证压缩率：字符数减少 20%~30%
   const byteReduction = (unmerged.bytes - merged.bytes) / unmerged.bytes;
   check('指令层体积压缩率达 20%~30%（实测提速基准）', byteReduction >= 0.20 && byteReduction <= 0.35,
     `未合并 ${unmerged.bytes}B vs 合并后 ${merged.bytes}B，压缩 ${(byteReduction * 100).toFixed(1)}%`);
 
-  // 验证行数压缩：60 个点在合并后大幅缩减
   const unmergedLines = unmerged.text.split('\n').filter((l) => /^PD-?\d/.test(l)).length;
   const mergedLines = merged.text.split('\n').filter((l) => /^PD-?\d/.test(l)).length;
   check('PD 指令行数压缩率超过 80%', (unmergedLines - mergedLines) / unmergedLines >= 0.80,
     `PD 行数 ${unmergedLines} → ${mergedLines}`);
 
-  // 验证往返几何精度：回读路径长度与原路径在量化容差内一致
   const back = parseHpgl(merged.text, { stepsPerInch: preset.stepsPerInch });
   const origLen = pathLength(poly);
   const backLen = pathLength(back.path);
@@ -492,7 +470,6 @@ section('指令层连续坐标流合并（HP-GL 批量坐标提速 20%~30%）');
   check('连续坐标流合并后包围盒守恒', Math.abs(obb.w - bbb.w) < 0.5 && Math.abs(obb.h - bbb.h) < 0.5,
     `原始 ${obb.w.toFixed(1)}×${obb.h.toFixed(1)} vs 回读 ${bbb.w.toFixed(1)}×${bbb.h.toFixed(1)}`);
 
-  // 混合图元（直线流 + 圆弧 + 直线流）：验证圆弧离散后与直线流无缝衔接且长度守恒
   const mixed = makePath();
   const ms = makeSubpath(0, 0);
   for (let i = 1; i <= 20; i++) addLine(ms, i, 0);
@@ -505,7 +482,6 @@ section('指令层连续坐标流合并（HP-GL 批量坐标提速 20%~30%）');
     mixedBack.path.subpaths.length === 1
     && Math.abs(pathLength(mixed) - pathLength(mixedBack.path)) / pathLength(mixed) < 0.005);
 
-  // DMPL 转换验证：PD 多坐标流正确翻译为 D;A 多坐标流
   const dmplText = hpglToDmpl(merged.text);
   check('DMPL 正确映射批量坐标为 A 指令', /^D;A-?\d+,-?\d+,/m.test(dmplText));
 }
@@ -526,7 +502,6 @@ section('文字转路径');
   const rot0 = textToPath({ text: 'ABC', sizeMm: 20, x: 0, y: 0 });
   const bb = pathBBox(rot);
   const bb0 = pathBBox(rot0);
-  // 旋转 90° 后：原字高(20) 变成宽度，原字宽(66.7) 变成高度
   check('旋转 90° 后宽高互换', near(bb.w, bb0.h, 0.1) && near(bb.h, bb0.w, 0.1),
     `旋转前 ${bb0.w.toFixed(1)}×${bb0.h.toFixed(1)} → 旋转后 ${bb.w.toFixed(1)}×${bb.h.toFixed(1)}`);
 }
@@ -552,21 +527,12 @@ section('力宇 SC631-AU 机型（用户实际机型）');
   check('贴边图形(最大边界正好 600mm)放行', cEdge.warnings.length === 0, JSON.stringify(cEdge.warnings));
   check('超出 600mm 的图形被拦截', cOver.warnings.length > 0, '未报警');
 
-  // 630 预设仍可用，供铭牌确认后切换
   const e = MACHINE_PRESETS['liyue-sc631e'];
   check('630mm 版预设保留（供铭牌确认后切换）', e && e.width === 630, `实际 ${e?.width}`);
 }
 
 section('串口写入路径（曾经从未被测到）');
 {
-  // 背景：SerialTransport.write 里曾写成
-  //   const { write } = await import('node:fs/promises')
-  // 但 node:fs/promises 没有 write 导出（只有 open），解构出 undefined，
-  // 调用即报 "write is not a function"。
-  // 连接是成功的，所以表现成「显示已连接、一开始刻就失败」，很像连接问题，
-  // 而自检只测了虚拟机的 write，真实串口路径从来没被覆盖过。
-  //
-  // 这里用伪装的 fd 对象验证「写入走的是 this.fd.write」这一约定。
   const written = [];
   const fakeFd = {
     write: async (buf, offset, length) => {
@@ -584,7 +550,6 @@ section('串口写入路径（曾经从未被测到）');
   check('分块偏移参数正确', written[0] && written[0].offset === 0 && written[0].length === 4,
     JSON.stringify({ offset: written[0]?.offset, length: written[0]?.length }));
 
-  // 未连接时应报明确错误，而不是 write is not a function
   const t2 = new SerialTransport({ path: '/dev/null' });
   let errMsg = '';
   try { await t2.write('X'); } catch (e) { errMsg = e.message; }
@@ -593,18 +558,9 @@ section('串口写入路径（曾经从未被测到）');
 
 section('坐标轴方向与不发 SC 安全性');
 {
-  // 🔴 本节只测「轴方向」，所以必须把 layoutRotate 钉死为 0。
-  // 力宇预设现在带 layoutRotate:90（实机确认版面要转 90°），
-  // 不钉死的话下面每条断言都会因为多了一次 90° 旋转而失效——
-  // 而失效的方式是「悄悄算出不同的数」，不是报错。
-  // 这是本项目反复踩的坑：断言没锁住维度，改了无关功能就一片红。
   const au = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
   const seg = { subpaths: [{ start: { x: 0, y: 0 }, elems: [{ type: 'line', x1: 0, y1: 0, x2: 100, y2: 0 }], closed: false }] };
 
-  /**
-   * 🔴 核心安全断言：绝不能在卷筒刻字机上发 SC 指令。
-   * HP-GL 的 SC 会把卷筒纸轴的缩放除零归零，导致 Y 轴无响应。
-   */
   for (const [label, opts] of [
     ['常规', { axisX: 1, axisY: 1 }],
     ['X 反向', { axisX: -1, axisY: 1 }],
@@ -615,7 +571,6 @@ section('坐标轴方向与不发 SC 安全性');
     check(`${label}轴向下不含 SC 指令（防止滚筒 Y 轴失灵）`, !/\bSC-?\d+/.test(text));
   }
 
-  // 方向差异必须体现在**坐标**上，而不是 SC 上
   const bNormal = new HpglBuilder(au, { axisX: 1, swapAxes: false });
   const bFlip = new HpglBuilder(au, { axisX: -1, swapAxes: false });
   check('X 反向与常规设置指令头一致',
@@ -631,29 +586,17 @@ section('坐标轴方向与不发 SC 安全性');
     bFlip.toMachineDelta(5, 0).dx === -5 && bNormal.toMachineDelta(5, 0).dx === 5,
     JSON.stringify({ flip: bFlip.toMachineDelta(5, 0), normal: bNormal.toMachineDelta(5, 0) }));
 
-  // 关键安全项：回原点必须回到用户对刀原点 (0,0)，严禁默认发送 !PG 撞右端机械限位
   const h = new HpglBuilder(au, { axisX: -1 });
   h.setupCoords({ x: 0, y: 0 }); h.home();
   check('回原点用 PU0,0;（回对刀原点）且绝不发 !PG',
     h.cmds.includes('PU0,0;') && !h.cmds.some((c) => c.includes('!PG')),
     h.cmds.join(' '));
 
-  // 手动「回原点」不带 SC 且不发 !PG，支持按 dx/dy 相对退回或 PU0,0; 归位
   const mh = buildManualCommand(au, { action: 'home', dx: -10, dy: -5 });
   check('手动回原点不含 SC 与 !PG，且通过 PR 退回对刀原点',
     !/\bSC/.test(mh.text) && !mh.text.includes('!PG') && /PR-?\d+,-?\d+;/.test(mh.text),
     mh.text.replace(/\n/g, ' ').trim());
 
-  /**
-   * 🔴 回归测试：漏发 IN; 会让整台机器**所有按钮失灵**（2026-10-04 实机）。
-   *
-   * 力宇固件冷启动后处于未初始化状态，没有 `IN;` 就静默忽略所有运动指令——
-   * 串口写入成功、任务显示「完成」，但机器纹丝不动，
-   * 表现和「串口坏了」一模一样。
-   * 修坐标轴时曾把 IN; 当成「多余的状态重置」删掉，直接导致全机失灵，
-   * 而且下面那条「不含 IN」的断言还把它当成了正确行为。
-   * 这组断言就是为了防止它再被当成冗余删掉。
-   */
   for (const [label, act] of [
     ['回原点', { action: 'home' }],
     ['方向键移动', { action: 'move', dx: 5, dy: 0 }],
@@ -672,9 +615,6 @@ section('坐标轴方向与不发 SC 安全性');
   check('校准指令也必须含 IN;（同样会全机失灵）',
     /(^|\n)IN;/.test(calIn), calIn.replace(/\n/g, ' ').trim());
 
-  // 手动 jog 必须是相对移动，且收尾不能把刀头拽回原点。
-  // 用 swapAxes:false 的机型副本，让断言聚焦「相对 vs 绝对」这一个维度；
-  // 交换轴下的增量换轴由「轴交换」一节负责。
   const auNoSwap = { ...au, swapAxes: false, axisX: 1, axisY: 1 };
   const mv = buildManualCommand(auNoSwap, { action: 'move', dx: 5, dy: 0 });
   check('手动 jog 用 PR 相对移动（非 PA 绝对跳变）',
@@ -684,13 +624,11 @@ section('坐标轴方向与不发 SC 安全性');
     mv.text.includes('PA;') && !mv.text.includes('PA0,0'),
     mv.text.replace(/\n/g, ' ').trim());
 
-  // 落刀试压必须是相对 2mm：原来是绝对 lineTo(2,0)，落刀状态下会划穿材料
   const pd = buildManualCommand(auNoSwap, { action: 'pendown' });
   check('落刀试压为相对 2mm，不做绝对移动',
     /PD;/.test(pd.text) && /PR-?79,0;/.test(pd.text) && !/PA-?\d+,-?\d+;/.test(pd.text),
     pd.text.replace(/\n/g, ' ').trim());
 
-  // 校准指令必须小步、抬刀、纯相对（同样锁定不交换，隔离维度）
   const cal = buildCalibrationStep(auNoSwap, { dir: 'x+', axisX: 1, axisY: 1 });
   check('校准指令全程抬刀（不含 PD）', !cal.includes('PD'), cal.replace(/\n/g, ' ').slice(0, 70));
   check('校准走完能回到起点（往返增量互相抵消）',
@@ -708,13 +646,8 @@ section('坐标轴方向与不发 SC 安全性');
 
 section('镜像下的几何往返（反射会翻转圆弧绕向）');
 {
-  // 锁定 layoutRotate:0：本节只测「方向」对几何的影响。
-  // 换轴与版面旋转另有一节，不锁的话断言就不成立了。
   const au = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
-  // 锁定不交换：本节只测「方向」对几何的影响，交换轴另有一节。
-  // 不锁的话预设的 swapAxes:true 会把包围盒也旋转，断言就不成立了。
   const auMirror = { ...au, swapAxes: false };
-  // 四种轴向组合下，编译再解析回几何都必须无损
   for (const [ax, ay] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
     const p = circleToPath(300, 300, 25);
     const built = compileToPlotterLanguage(p, auMirror, { axisX: ax, axisY: ay });
@@ -727,7 +660,6 @@ section('镜像下的几何往返（反射会翻转圆弧绕向）');
       near(bb.w, 50, 0.5) && near(bb.h, 50, 0.5), `${bb.w.toFixed(1)}×${bb.h.toFixed(1)}`);
   }
 
-  // 直线在镜像下应落到对称位置（x → width - x），且长度不变
   const mk = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 300); p.subpaths.push(s); return p; };
   const backFlip = parseHpgl(
     compileToPlotterLanguage(mk(), auMirror, { axisX: -1, axisY: 1 }).text,
@@ -741,9 +673,7 @@ section('镜像下的几何往返（反射会翻转圆弧绕向）');
 
 section('轴交换（支持 X/Y 交换配置）');
 {
-  // 同样锁定 layoutRotate:0——本节测的是「换轴」，与版面旋转正交。
   const au = { ...MACHINE_PRESETS['liyue-sc631-au'], layoutRotate: 0 };
-  // machineSpanX/Y 是各轴物理跨度的来源
   const bSwap = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: true });
   const bNo = new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: false });
   check('未交换时 machineSpanX 为幅面宽 600', bNo.machineSpanX === au.width);
@@ -751,7 +681,6 @@ section('轴交换（支持 X/Y 交换配置）');
   check('machineSpanX 随交换改变', bSwap.machineSpanX === au.height && bNo.machineSpanX === au.width,
     `${bSwap.machineSpanX} vs ${bNo.machineSpanX}`);
 
-  // 交换：用户 (x,y) → 机器 (y,x)
   check('交换后用户 (100,200) 映射到机器 (200,100)',
     bSwap.toMachine(100, 200).x === 200 && bSwap.toMachine(100, 200).y === 100,
     JSON.stringify(bSwap.toMachine(100, 200)));
@@ -759,18 +688,15 @@ section('轴交换（支持 X/Y 交换配置）');
     bNo.toMachine(100, 200).x === 100 && bNo.toMachine(100, 200).y === 200,
     JSON.stringify(bNo.toMachine(100, 200)));
 
-  // 增量也要换轴：用户「往右 5mm」在交换后应变成机器 Y 方向
   check('交换后往右的增量落在机器 Y 上',
     bSwap.toMachineDelta(5, 0).dx === 0 && bSwap.toMachineDelta(5, 0).dy === 5,
     JSON.stringify(bSwap.toMachineDelta(5, 0)));
 
-  // 反射判定：交换(1次) + 单轴反向(1次) = 2 次 = 旋转，绕向不变
   check('交换 + 单轴反向 = 旋转（isReflection=false）',
     new HpglBuilder(au, { axisX: -1, axisY: 1, swapAxes: true }).isReflection === false);
   check('仅交换 = 反射（isReflection=true）',
     new HpglBuilder(au, { axisX: 1, axisY: 1, swapAxes: true }).isReflection === true);
 
-  // 几何往返：交换不改变长度，只旋转包围盒
   const mkLine = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 300); p.subpaths.push(s); return p; };
   for (const sw of [false, true]) {
     const t = compileToPlotterLanguage(mkLine(), { ...au, axisX: 1, axisY: 1, swapAxes: sw }).text;
@@ -785,7 +711,6 @@ section('轴交换（支持 X/Y 交换配置）');
       `${bb.w.toFixed(1)}×${bb.h.toFixed(1)}`);
   }
 
-  // 整圆在交换下往返无损
   for (const sw of [false, true]) {
     const c = circleToPath(300, 300, 25);
     const t = compileToPlotterLanguage(c, { ...au, axisX: 1, axisY: 1, swapAxes: sw }).text;
@@ -797,7 +722,6 @@ section('轴交换（支持 X/Y 交换配置）');
     check(`交换=${sw} 时整圆直径不变`, near(bb.w, 50, 0.5) && near(bb.h, 50, 0.5), `${bb.w.toFixed(1)}×${bb.h.toFixed(1)}`);
   }
 
-  // 校准指令在交换下也必须只动一根轴，且走 5mm
   const calSwap = buildCalibrationStep(au, { dir: 'x+', axisX: 1, axisY: 1, swapAxes: true });
   const prs = [...calSwap.matchAll(/PR(-?\d+),(-?\d+);/g)].map((m) => [+m[1], +m[2]]);
   check('交换后校准仍走 5mm 且只动一根轴',
@@ -808,41 +732,26 @@ section('轴交换（支持 X/Y 交换配置）');
 
 section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时针 90°）');
 {
-  const W = 600, H = 710;   // 画布 600×710（幅面宽 × 进纸长）
+  const W = 600, H = 710;
   const base = { width: W, height: H, stepsPerInch: 1000, dialect: 'hpgl' };
 
-  /**
-   * 🔴 这组断言锁的是 2026-10-05 实机结论：
-   * 「SparkMinds」横排刻出来整版逆时针歪 90°，方向正确（不镜像）。
-   * 补偿 = 顺时针 90°。
-   *
-   * 判据用**一条水平线**：
-   * 顺时针 90° 后，原来的水平线必须变成**垂直线**。
-   * 如果哪天改回成镜像（swapAxes）而不是旋转，这条约 400×0 的线
-   * 仍然会变成垂直的——所以额外断言了方向（见下），
-   * 两者合起来才能唯一确定是「顺时针 90°」而不是「任意 90°」。
-   */
   const b90 = new HpglBuilder({ ...base, layoutRotate: 90 }, { axisX: 1, axisY: 1, swapAxes: false });
 
-  // 画布左下角 (0,0) 经顺时针 90° 后应落到新框的左下角
   check('旋转 90°：原点映射到 (0, 画布宽)', (() => {
     const p = b90.toMachine(0, 0);
     return p.x === 0 && p.y === W;
   })(), JSON.stringify(b90.toMachine(0, 0)));
 
-  // 画布右下角 (W,0) → 新框左下 (0,0)：原「下边」变成新「左边」
   check('旋转 90°：原右下角映射到 (0,0)', (() => {
     const p = b90.toMachine(W, 0);
     return p.x === 0 && p.y === 0;
   })(), JSON.stringify(b90.toMachine(W, 0)));
 
-  // 原左边 (0,y) → 新上边 (y, W)：原 x=0 那条边变成新 y=W 那条边
   check('旋转 90°：原左边变成新上边', (() => {
     const p = b90.toMachine(0, 100);
     return p.x === 100 && p.y === W;
   })(), JSON.stringify(b90.toMachine(0, 100)));
 
-  // 关键判据：水平线 → 垂直线
   const hLine = () => { const p = makePath(); const s = makeSubpath(0, 0); addLine(s, 400, 0); p.subpaths.push(s); return p; };
   const back90 = parseHpgl(
     compileToPlotterLanguage(hLine(), { ...base, layoutRotate: 90 },
@@ -855,21 +764,13 @@ section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时�
   check('旋转 90°：线长守恒（400mm）', Math.abs(pathLength(back90) - 400) < 0.5,
     `${pathLength(back90).toFixed(2)}mm`);
 
-  // 「顺时针」而非「逆时针」：原左下角必须去新框的**左上**。
-  // 顺时针：原左边 → 新上边，故 (0,0) 在新框 y=W（顶部）。
-  // 逆时针则会让 (0,0) 落到 y=0（底部）——这一条把方向钉死。
   check('旋转 90° 方向为顺时针（原左下 → 新左上）', b90.toMachine(0, 0).y === W);
-
-  // 旋转是 det=+1 的纯旋转，**不翻转圆弧绕向**
   check('旋转不计入反射（isReflection 仍为 false）', b90.isReflection === false);
-  // 90° 旋转不改变 det，所以「旋转 + 换轴」= 一次反射（不是两次相乘）
   check('旋转 + 换轴 仍为反射（旋转不抵反射）',
     new HpglBuilder({ ...base, layoutRotate: 90 }, { swapAxes: true }).isReflection === true);
-  // 真正抵掉反射的是「换轴 + 单轴反向」两次 det=-1
   check('换轴 + 单轴反向 = 旋转（两次反射相抵）',
     new HpglBuilder(base, { axisX: -1, axisY: 1, swapAxes: true }).isReflection === false);
 
-  // 圆弧在旋转下往返无损（绕向不变，长度守恒）
   const cRot = circleToPath(300, 300, 25);
   const cBack = parseHpgl(
     compileToPlotterLanguage(cRot, { ...base, layoutRotate: 90 },
@@ -879,7 +780,6 @@ section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时�
     Math.abs(pathLength(cBack) - pathLength(cRot)) / pathLength(cRot) < 0.01,
     `${((pathLength(cBack) - pathLength(cRot)) / pathLength(cRot) * 100).toFixed(3)}%`);
 
-  // 相对位移必须与绝对坐标同向：画布「往右 5mm」在旋转后是机器 Y 方向
   const d = b90.toMachineDelta(5, 0);
   check('旋转 90°：画布往右 → 机器 Y 负向（与绝对变换自洽）', d.dx === 0 && d.dy === -5,
     JSON.stringify(d));
@@ -888,24 +788,19 @@ section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时�
     (dAbs.x - dAbs0.x) === d.dx && (dAbs.y - dAbs0.y) === d.dy,
     `Δ=${JSON.stringify({ dx: dAbs.x - dAbs0.x, dy: dAbs.y - dAbs0.y })} vs ${JSON.stringify(d)}`);
 
-  // 跨度：旋转 90° 后 X/Y 角色对调，机器 X 应拿到 710（进纸长）
   check('旋转 90° 后 machineSpanX 为进纸长 710', b90.machineSpanX === H, `${b90.machineSpanX}`);
   check('旋转 90° 后 machineSpanY 为幅面宽 600', b90.machineSpanY === W, `${b90.machineSpanY}`);
   check('旋转 0 时跨度不换', new HpglBuilder(base, { layoutRotate: 0 }).machineSpanX === W);
 
-  // 旋转 + 换轴相互抵消（异或）：跨度应回到不换
   const bBoth = new HpglBuilder({ ...base, layoutRotate: 90 }, { swapAxes: true });
   check('旋转 90° + 换轴相互抵消（跨度回到 600）', bBoth.machineSpanX === W, `${bBoth.machineSpanX}`);
 
-  // 归一化：非 90° 倍数被收敛，不允许悄悄生效
   check('旋转角归一化到 90 的倍数（37° → 0）',
     new HpglBuilder({ ...base, layoutRotate: 37 }).layoutRotate === 0);
   check('旋转角归一化支持负值与超圈（-90 → 270）',
     new HpglBuilder({ ...base, layoutRotate: -90 }).layoutRotate === 270);
   check('旋转 450° → 90', new HpglBuilder({ ...base, layoutRotate: 450 }).layoutRotate === 90);
 
-  // 逆变换必须严格可逆——预览靠它把机器坐标还原回设计坐标。
-  // 不可逆的表现是「预览横躺」，而不是报错，所以必须显式断言。
   for (const rot of [0, 90, 180, 270]) {
     const b = new HpglBuilder({ ...base, layoutRotate: rot }, { axisX: 1, axisY: 1, swapAxes: false });
     let ok = true, bad = '';
@@ -919,7 +814,6 @@ section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时�
     check(`旋转 ${rot}°：toUser 是 toMachine 的严格逆变换`, ok, bad);
   }
 
-  // 逆变换在「旋转 + 镜像」同时存在时也必须成立（顺序反了就会算错且不报错）
   {
     const b = new HpglBuilder({ ...base, layoutRotate: 90 }, { axisX: -1, axisY: 1, swapAxes: true });
     let ok = true, bad = '';
@@ -933,27 +827,105 @@ section('版面旋转 90°（实机：整版逆时针歪 90°，补偿为顺时�
     check('旋转+镜像+换轴：逆变换仍严格可逆', ok, bad);
   }
 
-  // 实机预设必须带着这个补偿值，否则改了代码也不生效
   check('力宇 SC631-AU 预设有 layoutRotate:90（实机确认）',
     MACHINE_PRESETS['liyue-sc631-au'].layoutRotate === 90,
     `${MACHINE_PRESETS['liyue-sc631-au'].layoutRotate}`);
 }
 
+section('机器原点位置（originPosition）与消除刻字前 Y 轴大幅空走');
+{
+  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  check('所有机型均声明了 originPosition 字段',
+    Object.values(MACHINE_PRESETS).every((p) => !!p.originPosition && !!ORIGIN_POSITIONS[p.originPosition]));
+  check('力宇 SC 系列滚筒机默认原点位置为 bottom-right（右下角）',
+    au.originPosition === 'bottom-right' && MACHINE_PRESETS['liyue-sc630'].originPosition === 'bottom-right');
+  check('右下角原点对应的画布机械原点为 (600, 0)',
+    getOriginCorner(au, 'bottom-right').x === 600 && getOriginCorner(au, 'bottom-right').y === 0);
+
+  // 验证一个贴靠在右下角原点内侧 10mm 处的 100×50mm 矩形（画布 x: 490..590, y: 10..60）
+  // 刻字前首条空移指令 PU 仅走 (10mm, 10mm) = (394, 394) 步，彻底消除过去走 590mm (23228 步) 的问题
+  const rectNearRightBottom = makePath();
+  const rs = makeSubpath(590, 10);
+  addLine(rs, 490, 10);
+  addLine(rs, 490, 60);
+  addLine(rs, 590, 60);
+  rs.closed = true;
+  rectNearRightBottom.subpaths.push(rs);
+
+  const compiled = compileToolpath(rectNearRightBottom, au, {
+    origin: { x: 600, y: 0 },
+    originPosition: 'bottom-right',
+  });
+  const built = compileToPlotterLanguage(compiled.path, au, {
+    origin: { x: 600, y: 0 },
+    originPosition: 'bottom-right',
+  });
+  const puMoves = [...built.text.matchAll(/PU(-?\d+),(-?\d+);/g)].map((m) => ({ x: +m[1], y: +m[2] }));
+  // 第 0 条是初始化 PU0,0;，第 1 条是起刀定位 PU394,394;（10mm = 394 步）
+  check('右下角原点旁图形起刀空移仅 10mm（394步），彻底消除 Y 轴大幅空走',
+    puMoves.length >= 2 && near(puMoves[1].x, 394, 2) && near(puMoves[1].y, 394, 2),
+    JSON.stringify(puMoves.slice(0, 3)));
+
+  // 验证自定义工作原点（例如用户在画布 (500, 20) 处按下「设原点」）：
+  // 紧贴自定义原点 (490, 30) 的点（距新原点左 10mm、上 10mm）在机器坐标下同样应为 (10mm, 10mm) = (394, 394) 步！
+  const customRect = makePath();
+  const cs = makeSubpath(490, 30);
+  addLine(cs, 440, 30);
+  addLine(cs, 440, 60);
+  addLine(cs, 490, 60);
+  cs.closed = true;
+  customRect.subpaths.push(cs);
+  const builtCustom = compileToPlotterLanguage(customRect, au, {
+    origin: { x: 500, y: 20 },
+    originPosition: 'bottom-right',
+  });
+  const puCustom = [...builtCustom.text.matchAll(/PU(-?\d+),(-?\d+);/g)].map((m) => ({ x: +m[1], y: +m[2] }));
+  check('自定义工作原点偏移相对机械原点计算，起刀距离精准为 10mm（394步）',
+    puCustom.length >= 2 && near(puCustom[1].x, 394, 2) && near(puCustom[1].y, 394, 2),
+    JSON.stringify(puCustom.slice(0, 3)));
+}
+
+section('走框预览（buildFrameCommand 范围巡边）');
+{
+  const au = MACHINE_PRESETS['liyue-sc631-au'];
+  const rect = makePath();
+  const s = makeSubpath(490, 10);
+  addLine(s, 590, 10);
+  addLine(s, 590, 90);
+  addLine(s, 490, 90);
+  s.closed = true;
+  rect.subpaths.push(s);
+
+  const frame = buildFrameCommand(rect, au, {
+    origin: { x: 600, y: 0 },
+    originPosition: 'bottom-right',
+  });
+  check('走框预览生成有效指令', frame.text.length > 0 && frame.commandCount >= 8);
+  check('走框预览全程抬刀（严禁包含任何 PD 落刀指令）', !/\bPD/.test(frame.text), frame.text);
+  check('走框预览包含 IN; 初始化与收尾回原点 PU0,0;',
+    /(^|\n)IN;/.test(frame.text) && /PU0,0;\s*$/.test(frame.text));
+  check('走框预览准确计算外框尺寸 100×80mm 与距原点偏移 10mm',
+    near(frame.bbox.w, 100, 1e-6) && near(frame.bbox.h, 80, 1e-6)
+    && near(frame.originBBox.offsetX, 10, 1e-6) && near(frame.originBBox.offsetY, 10, 1e-6),
+    JSON.stringify(frame.originBBox));
+  check('走框预览首点从距右下角原点最近的角点 (10mm, 10mm = 394, 394步) 出发',
+    /PU394,394;/.test(frame.text), frame.text.replace(/\n/g, ' '));
+  check('走框预览返回双语提示说明',
+    frame.notes.every((n) => n && n.zh && n.en && !/[一-鿿]/.test(n.en)),
+    JSON.stringify(frame.notes));
+}
+
 section('服务端双语（每条面向用户的文案都要有中英两份）');
 {
-  /**
-   * 🔴 这组断言防的是「英文界面里悄悄夹着中文」。
-   *
-   * 那类问题最阴险的地方在于：所有其他检查都是绿的——
-   * 语法对、服务起得来、按钮能点、刻字正常。
-   * 只有真机操作者才会看到「界面上有句话是中文的」。
-   * 所以凡是会走到界面上的文案，都必须有英文，且不能是空串。
-   */
   const preset = MACHINE_PRESETS['liyue-sc631-au'];
 
   // 机型预设
   for (const [id, p] of Object.entries(MACHINE_PRESETS)) {
     check(`机型 ${id} 有英文名`, !!p.nameEn && !/[一-鿿]/.test(p.nameEn), p.nameEn || '(缺失)');
+  }
+  // 原点位置预设
+  for (const [id, o] of Object.entries(ORIGIN_POSITIONS)) {
+    check(`原点方位 ${id} 有英文名`, !!o.nameEn && !/[一-鿿]/.test(o.nameEn), o.nameEn || '(缺失)');
   }
   // 材料预设
   for (const m of MATERIAL_PRESETS) {
@@ -995,16 +967,11 @@ section('服务端双语（每条面向用户的文案都要有中英两份）')
     !!tp.meta.note && !!tp.meta.noteEn && !/[一-鿿]/.test(tp.meta.noteEn),
     `${tp.meta.note} / ${tp.meta.noteEn}`);
   const tpBad = textToPath({ text: '中A', sizeMm: 20 });
-  // ⚠️ 这里刻意**不**断言「英文里没有中文」：
-  // 缺字提示必须点名是哪几个字，而那个字本身就是中文（如「中」）。
-  // 译文里出现这个字是正确行为，不是漏翻译。
-  // 真正要守的是：英文句子本身完整、且点名了缺字。
   check('缺字提示有英文且点名了缺字',
     !!tpBad.meta.noteEn && /outside the built-in stroke font/.test(tpBad.meta.noteEn)
     && tpBad.meta.unsupported.length > 0,
     `${tpBad.meta.unsupported.join('')} / ${tpBad.meta.noteEn}`);
 
-  // 任务日志：pushLog(line, en) 两份都要落库，且 line 仍是中文（兼容既有前端）
   const vt = new VirtualPlotter({ width: 600, stepsPerInch: 1000 });
   await vt.connect();
   const eng2 = new JobEngine(vt);
@@ -1021,20 +988,6 @@ section('安全操作必须无条件下发（不能因「软件以为已经抬�
 {
   const au = MACHINE_PRESETS['liyue-sc631-au'];
 
-  /**
-   * 🔴 回归：抬刀 / 回原点 / 抬刀回位曾经「点了没反应」。
-   *
-   * 根因：`penUp()` 只在 `penDown === true` 时才发 `PU;`，
-   * 这是给生成任务省字节用的优化。但手动按钮场景下，
-   * 软件对刀状态的认知来自「本次任务有没有下发过 PD」，
-   * 而机器真实状态可能已经不同：
-   *   - 上一次任务中途被停止 / 急停
-   *   - 串口断线重连（软件状态清零，机器还压着）
-   *   - 换过控制板
-   * 此时按「抬刀」一条指令都不发 → 按钮点了没反应，刀还压着材料。
-   *
-   * 抬刀是**安全**操作，多发一个字节的成本可以忽略；不发指令的风险不行。
-   */
   check('penUp() 在未落刀时确实不发光刀指令（省字节优化的原意）',
     !new HpglBuilder(au, {}).penUp().cmds.includes('PU;'), '应为空');
   check('forcePenUp() 永远发光刀指令',
@@ -1055,7 +1008,6 @@ section('安全操作必须无条件下发（不能因「软件以为已经抬�
       missing.length === 0, missing.length ? `缺少 ${missing.join(',')}` : t.replace(/\n/g, ' ').trim());
   }
 
-  // 落刀试压必须「先抬 → 落 → 试 → 抬」，收尾的抬刀不能省
   const pd = buildManualCommand(au, { action: 'pendown' }).text.trim().split('\n').map((l) => l.trim());
   check('落刀试压顺序为 抬→落→走→抬',
     pd.indexOf('PD;') > pd.indexOf('PU;')
@@ -1065,11 +1017,6 @@ section('安全操作必须无条件下发（不能因「软件以为已经抬�
 
 section('串口自动重连（服务重启后机器不能「失联」）');
 {
-  /**
-   * 服务每次重启都会释放串口，界面上的手动按钮随之全部置灰，
-   * 表现为「点什么都不反应」——用户会以为机器坏了。
-   * 配置里已经记了串口路径，具备自动重连条件，所以必须自动接回。
-   */
   const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
   check('存在自动重连逻辑 tryReconnect', /function tryReconnect/.test(src));
   check('启动时尝试自动连接', /await tryReconnect\(\)/.test(src));
@@ -1089,22 +1036,13 @@ section('任务历史不留全量指令（防内存只涨不降）');
   const vt = new VirtualPlotter({});
   await vt.connect();
   const eng = new JobEngine(vt);
-  // 一条体积像样的任务：几百行。
-  // 用高波特让任务在测试窗口内跑完——按真实 9600 波特要等十几秒，
-  // 自检不该为了验证一个字段而 sleeps 十几秒。
   const gcode = new Array(400).fill('PU100,100;').join('\n') + '\n';
   eng.enqueue({ name: '大任务', text: gcode, baud: 960000 });
   eng.run();
-  // 等任务真正进历史（而不是只看 progress 事件）
   for (let i = 0; i < 60 && eng.history.length === 0; i++) {
     await new Promise((r) => setTimeout(r, 50));
   }
 
-  /**
-   * 历史保留 50 条。若每条都留着 text + lines，
-   * 几百行的任务累积起来就是几十 MB 常驻——服务跑几天内存只涨不降。
-   * 界面只需要名字/状态/进度/字节数，指令全文没有展示价值。
-   */
   const h = eng.history[0];
   check('历史条目不保留指令全文 text', h && h.text === undefined,
     h && Object.keys(h).join(','));
@@ -1113,7 +1051,6 @@ section('任务历史不留全量指令（防内存只涨不降）');
   check('历史仍保留展示所需字段',
     h && typeof h.name === 'string' && typeof h.bytes === 'number' && typeof h.totalLines === 'number',
     h && JSON.stringify({ name: h.name, bytes: h.bytes, totalLines: h.totalLines }));
-  // list() 曾读 j.lines.length / j.text.length，剥字段后必须不抛错
   let listOk = true;
   try { eng.list(); } catch (e) { listOk = false; }
   check('list() 在历史已剥字段后不报错', listOk);
@@ -1136,12 +1073,6 @@ section('任务原点保护与安全');
   const lines = built.text.split('\n').map((l) => l.trim()).filter(Boolean);
   const iFirstMove = lines.findIndex((l) => /^PU-?\d/.test(l));
 
-  /**
-   * 🔴 关键原点保护断言：默认刻绘开头绝不能发 !PG; 机械归位。
-   *
-   * 刻字机是以操作者在材料上设定的对刀原点为基准的。
-   * 开头下发 !PG; 会让刀头横跨整机去撞限位开关，不仅冲掉用户原点，还会造成 X 轴远离原点狂奔。
-   */
   check('默认任务开头不发 !PG（保护用户对刀原点）',
     !lines[0].includes('!PG'), `实际首行「${lines[0]}」`);
   check('任务开头以 IN; 初始化',
@@ -1151,7 +1082,6 @@ section('任务原点保护与安全');
   check('落刀段使用标准 PD x,y; 切割指令',
     iFirstMove >= 0 && lines.slice(iFirstMove).some((l) => /^PD-?\d+,-?\d+;$/.test(l)), '应存在 PD x,y; 落刀段');
 
-  // homeFirst:true 供需要显式机械归位的场景
   const withHome = compileToPlotterLanguage(rect(), au, { homeFirst: true });
   check('homeFirst:true 可显式开启开头归位',
     withHome.text.startsWith('!PG;'), withHome.text.split('\n')[0]);
@@ -1159,12 +1089,9 @@ section('任务原点保护与安全');
   check('homeEnd:true 可显式开启收尾归位',
     withEndHome.text.trim().endsWith('!PG;'), withEndHome.text.slice(-20));
 
-  // 归位驻留：!PG 之后必须有真实等待，不能被 200ms 上限截断
   check('_sleep 支持非截断的长等待（归位驻留用）',
     (() => {
       const eng = new JobEngine(new NullTransport());
-      const t0 = Date.now();
-      // 只验证语义：capped:false 不应被压到 200ms
       return typeof eng._sleep(0, { capped: false }).then === 'function';
     })(), '');
 }
@@ -1174,7 +1101,6 @@ section('任务引擎');
   const vt = new VirtualPlotter({});
   await vt.connect();
   const eng = new JobEngine(vt);
-  // 用真实的 9600 波特：任务会持续足够久，暂停/继续才测得到
   const gcode = new Array(200).fill('PU100,100;').join('\n') + '\n';
   eng.enqueue({ name: '测试任务', text: gcode, baud: 9600 });
 
@@ -1238,7 +1164,6 @@ section('虚拟机响应');
 // ---------------------------------------------------------------------------
 section('运动学时序仿真与物理执行状态跟踪');
 {
-  // 1. estimateHpglMotion 基础估算
   const hpgl1 = 'IN;VS3;PU1000,1000;PD4937,1000;PU;';
   const m1 = estimateHpglMotion(hpgl1, { defaultSpeed: 30, stepsPerInch: 1000 });
   check('运动学估算：落刀切割长度准确(100mm)', near(m1.cutLengthMm, 100, 0.5), `${m1.cutLengthMm}mm`);
@@ -1246,13 +1171,11 @@ section('运动学时序仿真与物理执行状态跟踪');
   check('运动学估算：包含落刀抬刀时延', m1.latencySeconds > 0.05, `${m1.latencySeconds}s`);
   check('运动学估算：总物理耗时准确(约3.6s)', near(m1.totalSeconds, 3.64, 0.3), `${m1.totalSeconds}s`);
 
-  // 2. 批量坐标流与归位驻留估算
   const hpgl2 = 'IN;!PG;VS5;PU0,0;PD1000,0,2000,0,3000,0;PU;';
   const m2 = estimateHpglMotion(hpgl2, { defaultSpeed: 50, stepsPerInch: 1000 });
   check('运动学估算：支持批量坐标流 PA/PD 连续累加', near(m2.cutLengthMm, 76.2, 1), `${m2.cutLengthMm}mm`);
   check('运动学估算：归位 !PG 包含 3 秒驻留', m2.latencySeconds >= 3.0, `${m2.latencySeconds}s`);
 
-  // 3. 任务引擎双阶段追踪（caching -> cutting -> done）
   const vt = new VirtualPlotter({});
   await vt.connect();
   const eng = new JobEngine(vt);
@@ -1337,13 +1260,11 @@ section('历史任务归档与全参数持久化');
     '');
 }
 
-
 // ---------------------------------------------------------------------------
 section('节奏化流式下发与单行长度上限（2026-10-19 实机教训）');
 {
   const { prepareUnits } = await import('./machine/jobEngine.js');
 
-  // 1. 单行长度上限：GD32 CDC 的一个 USB 全速包 = 64 字节
   const longPa = 'PA' + Array.from({ length: 20 }, (_, k) => `${1000 + k * 137},${2000 + k * 91}`).join(',') + ';';
   check('超长 PA 行会被拆分（原行 > 64B）', longPa.length > 64, `${longPa.length}B`);
   const units = prepareUnits(['IN;', 'SP1;', longPa, 'PU;', 'PA0,0;'].join('\n'), 64);
@@ -1358,21 +1279,16 @@ section('节奏化流式下发与单行长度上限（2026-10-19 实机教训）
   check('短指令（IN;/PU;/SP1;）原样保留不被拆分',
     units.includes('IN;') && units.includes('PU;') && units.includes('SP1;'));
 
-  // 2. 单条坐标过长（拆不动）：原样下发，绝不静默丢弃
-  // 单对坐标本身就超过一包：无法再拆，必须原样保留（用 9/8 各 31 位，仍可被 Number 精确表示）
   const huge = 'PA' + '9'.repeat(31) + ',' + '8'.repeat(31) + ';';
   const u2 = prepareUnits(huge, 64);
   check('无法再拆分的长指令原样保留（不丢指令）', u2.length === 1 && u2[0] === huge);
 
-  // 3. 整批分块连续下发 + 物理刻绘跟踪（对齐文泰 usbfiletrans.dll FUN_10003120）：
-  // 第一阶段快速将全部指令发入机载缓存（不在首条 PU 后断流），第二阶段按运动学时长跟踪机器刻绘完成
   const vt = new VirtualPlotter({});
   await vt.connect();
   const writtenChunks = [];
   const origWrite = vt.write.bind(vt);
   vt.write = async (d) => { writtenChunks.push(String(d)); return origWrite(d); };
 
-  // 10 段 × 200mm，VS100 = 1000mm/s → 每段 0.2s，总计约 2s
   const lines = [];
   for (let k = 0; k < 10; k++) lines.push(`PD${k * 7874},0,${(k + 1) * 7874},0;`);
   const gcode = ['IN;', 'VS100;', ...lines, 'PU0,0;'].join('\n');
@@ -1394,12 +1310,10 @@ section('节奏化流式下发与单行长度上限（2026-10-19 实机教训）
 
   for (let i = 0; i < 80 && eng.busy; i++) await new Promise((r) => setTimeout(r, 50));
   const elapsed = Date.now() - t0;
-  const total = eng.history[0] ? eng.history[0].totalLines : 0;
   check('整批分块下发：任务最终正常完成', eng.current === null && eng.state === 'idle', eng.state);
   check('进度百分比单调不减', seen.length > 0 && seen.every((v, i) => i === 0 || v >= seen[i - 1]));
   check('物理刻绘跟踪：完成时刻贴合物理预估（2s 量级，误差 < 45%）',
     elapsed > 1200 && elapsed < 2900, `${elapsed}ms`);
-  void total;
   await vt.disconnect();
 }
 
@@ -1409,18 +1323,6 @@ check('空传输可用', typeof nt.write === 'function');
 // ---------------------------------------------------------------------------
 section('单工链路识别与写入看门狗（2026-10-19 实测加固）');
 {
-  /**
-   * 背景：力宇 SC 系列的 USB 口是 GD32 CDC ACM，实测 OI;/OA;/IN; 全部零回应
-   * ——纯单工。机器死机时（应用层挂死但 USB 泵活着）上位机无从探测；
-   * USB 层停摆时写入会无限阻塞。这两类故障此前都表现为「日志说完成、机器不动」。
-   *
-   * 加固后的契约：
-   *   1. transport.everRx === false → 任务日志必须明示「仿真推算、请目视确认」；
-   *   2. everRx !== false（双向机/虚拟机/空传输）→ 保持原「✔ 完成」语义；
-   *   3. SerialTransport.write 有看门狗：fd.write 卡死时抛双语错误而不是无限等待。
-   */
-
-  // 哑传输：模拟单工串口（写成功、永不回话）
   const silentStub = {
     open: true,
     everRx: false,
@@ -1440,7 +1342,6 @@ section('单工链路识别与写入看门狗（2026-10-19 实测加固）');
     silentLogs.some((l) => l.includes('仿真计时') && l.includes('目视确认')),
     silentLogs.filter((l) => l.includes('✔')).join(' | '));
 
-  // 虚拟机：双向链路（banner 应答），保持原语义
   const vt2 = new VirtualPlotter({});
   await vt2.connect();
   check('虚拟机 everRx 为 true（模拟双向链路）', vt2.everRx === true);
@@ -1457,7 +1358,6 @@ section('单工链路识别与写入看门狗（2026-10-19 实测加固）');
   check('双向任务不出现「单向链路」提示',
     !way2Logs.some((l) => l.includes('单向链路')), '');
 
-  // 写入看门狗：fd.write 永久卡死 → write() 必须在 writeTimeoutMs 内抛错
   const stalled = new SerialTransport({ path: '/dev/null', writeTimeoutMs: 120 });
   stalled.open = true;
   stalled.fd = {
@@ -1478,7 +1378,6 @@ section('单工链路识别与写入看门狗（2026-10-19 实测加固）');
   check('写入看门狗：耗时与设定超时一致（约 120ms，而非秒级）',
     elapsed >= 110 && elapsed < 1500, `${elapsed}ms`);
 
-  // 看门狗禁用分支（writeTimeoutMs = 0）不引入额外行为
   const noWatch = new SerialTransport({ path: '/dev/null', writeTimeoutMs: 0 });
   noWatch.open = true;
   noWatch.fd = {

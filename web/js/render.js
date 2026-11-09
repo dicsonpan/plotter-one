@@ -20,7 +20,8 @@ class Renderer {
       this.offsetX = 0;        // 画布左上角对应的模型坐标
       this.offsetY = 0;
 
-      this.preset = { width: 630, height: 710 };
+      this.preset = { width: 630, height: 710, originPosition: 'bottom-right' };
+      this.originPosition = 'bottom-right';
       this.showGrid = true;
       this.tool = 'select';
 
@@ -28,11 +29,12 @@ class Renderer {
       this.layers = [];
       this.selectedId = null;
       this.selectedIds = new Set();
-      this.userOrigin = { x: 0, y: 0 };
-      this.knifePos = { x: 0, y: 0 };
+      this.userOrigin = { x: 630, y: 0 };
+      this.knifePos = { x: 630, y: 0 };
 
-      // 动画
+      // 动画与走框高亮
       this.anim = null;        // { path, t, speed }
+      this.frameBox = null;    // { bbox, originBBox, until }
       this.travel = null;      // 快移预览线
 
       this.dirty = true;
@@ -44,12 +46,9 @@ class Renderer {
       const parent = this.canvas.parentElement;
       if (!parent) return;
       const rect = parent.getBoundingClientRect();
-      // 父容器可能还没布局完成（display:none 或宽高为 0）。
-      // 此时若把画布尺寸设成 0，getImageData 会读到全空，看起来像「什么都没画」。
       const w = Math.floor(rect.width);
       const h = Math.floor(rect.height);
       if (w <= 0 || h <= 0) {
-        // 尺寸无效时保持上一帧的状态，等下次 resize 再算
         return;
       }
       this.dpr = window.devicePixelRatio || 1;
@@ -67,13 +66,6 @@ class Renderer {
     get vhSafe() { return this.vh > 0 ? this.vh : 1; }
 
     // ---- 坐标转换 ----
-    // 模型 (mm, Y向上) → 屏幕 (px, Y向下)
-    //
-    // offsetX/offsetY 是「视口中心对应的模型坐标」，所以：
-    //   screen = 视口中心 + (模型点 - 视口中心) * scale
-    // X 轴：+（x 增大往右，与屏幕一致）
-    // Y 轴：模型向上、屏幕向下，所以取负——这一处符号反了就是左右镜像，
-    //      表现为文字变成 "SPAPXIWS"，而对称图形（方框、圆）看不出来。
     toScreen(x, y) {
       return {
         x: this.vwSafe / 2 + (x - this.offsetX) * this.scale,
@@ -114,19 +106,36 @@ class Renderer {
       this.dirty = true;
     }
 
-    setPreset(p) {
+    setPreset(p, originPos) {
       if (!p) return;
-      this.preset = { width: p.width, height: p.height };
+      const pos = originPos || p.originPosition || this.originPosition || 'bottom-right';
+      this.preset = { width: p.width, height: p.height, originPosition: pos };
+      this.originPosition = pos;
       this.dirty = true;
+    }
+
+    /** 当前机器的机械物理原点在画布坐标系下的位置 */
+    getMechOrigin() {
+      const pos = this.originPosition || 'bottom-right';
+      const W = this.preset.width || 600;
+      const H = this.preset.height || 710;
+      switch (pos) {
+        case 'bottom-right': return { x: W, y: 0 };
+        case 'top-right':    return { x: W, y: H };
+        case 'top-left':     return { x: 0, y: H };
+        case 'bottom-left':
+        default:             return { x: 0, y: 0 };
+      }
     }
 
     // ---- 绘制 ----
     _loop() {
       if (this.anim) this._stepAnim();
+      if (this.frameBox && performance.now() > this.frameBox.until && !this.anim) {
+        this.frameBox = null;
+        this.dirty = true;
+      }
       if (this.dirty) {
-        // requestAnimationFrame 回调里的异常不会冒泡到 window.onerror，
-        // 会被浏览器静默吞掉——表现为「画布一片空白且没有任何报错」，
-        // 极难排查。所以这里必须自己兜住并打日志。
         try {
           this._draw();
           this.dirty = false;
@@ -148,13 +157,14 @@ class Renderer {
       this._drawBed();
       if (this.showGrid) this._drawGrid();
       this._drawContent();
+      this._drawFrameBox();
       this._drawSelection();
       this._drawAnim();
 
       ctx.restore();
     }
 
-    /** 机器幅面（材料区） */
+    /** 机器幅面（材料区）与原点指示 */
     _drawBed() {
       const ctx = this.ctx;
       const a = this.toScreen(0, 0);
@@ -166,8 +176,6 @@ class Renderer {
       ctx.strokeStyle = '#c4cad3';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      // roundRect 是 Chrome 99+ 才有的，老浏览器会直接抛异常。
-      // 整个 _draw 都在 try 里，一旦抛错这一帧就白画——所以必须做能力检测。
       if (ctx.roundRect) {
         ctx.roundRect(x, y, w, h, 3);
       } else {
@@ -176,41 +184,62 @@ class Renderer {
       ctx.fill();
       ctx.stroke();
 
-      // 机械物理原点（左下角）
+      const pos = this.originPosition || 'bottom-right';
+      const isRight = pos === 'bottom-right' || pos === 'top-right';
+      const isTop   = pos === 'top-right' || pos === 'top-left';
+      const mech = this.getMechOrigin();
+      const sm = this.toScreen(mech.x, mech.y);
+
+      // 机械物理原点角点标注（根据机器原点位置动态落在右下/左下/右上/左上）
+      ctx.save();
       ctx.fillStyle = '#94a3b8';
       ctx.font = '10px ui-monospace, monospace';
-      ctx.fillText(t('canvas.mechOrigin'), x + 3, y + h - 5);
+      ctx.textAlign = isRight ? 'right' : 'left';
+      const mechLabelX = isRight ? (sm.x - 6) : (sm.x + 6);
+      const mechLabelY = isTop ? (sm.y + 13) : (sm.y - 6);
+      ctx.fillText(t('canvas.mechOrigin'), mechLabelX, mechLabelY);
       ctx.beginPath();
-      ctx.arc(x, y + h, 2.5, 0, Math.PI * 2);
+      ctx.arc(sm.x, sm.y, 2.5, 0, Math.PI * 2);
       ctx.fillStyle = '#94a3b8';
       ctx.fill();
+      ctx.restore();
 
-      // 用户工作原点（若设置了原点，在材料区动态定位）
-      const uo = this.userOrigin || { x: 0, y: 0 };
+      // 用户工作原点（默认在机械原点角点；轴箭头朝向材料内部）
+      const uo = this.userOrigin || mech;
       const so = this.toScreen(uo.x, uo.y);
+      const axisDirX = isRight ? -18 : 18;
+      const axisDirY = isTop ? 18 : -18;
 
-      // 绘制原点标记（红点 + 坐标轴线）
+      ctx.save();
       ctx.beginPath();
-      ctx.arc(so.x, so.y, 4, 0, Math.PI * 2);
+      ctx.arc(so.x, so.y, 4.5, 0, Math.PI * 2);
       ctx.fillStyle = '#e11d48';
       ctx.fill();
 
       ctx.strokeStyle = '#e11d48';
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1.8;
       ctx.beginPath();
-      ctx.moveTo(so.x, so.y); ctx.lineTo(so.x + 16, so.y);
-      ctx.moveTo(so.x, so.y); ctx.lineTo(so.x, so.y - 16);
+      ctx.moveTo(so.x, so.y); ctx.lineTo(so.x + axisDirX, so.y);
+      ctx.moveTo(so.x, so.y); ctx.lineTo(so.x, so.y + axisDirY);
       ctx.stroke();
 
-      // 原点文字标签
+      // 原点文字标签（显示相对于机械原点的偏移距离，在角点处即为 0.0, 0.0）
+      const relOx = Math.abs(uo.x - mech.x);
+      const relOy = Math.abs(uo.y - mech.y);
       ctx.fillStyle = '#e11d48';
       ctx.font = 'bold 11px ui-monospace, monospace';
-      const label = `${t('canvas.origin')} (${uo.x.toFixed(1)}, ${uo.y.toFixed(1)})`;
-      ctx.fillText(label, so.x + 6, so.y - 6);
+      ctx.textAlign = isRight ? 'right' : 'left';
+      const label = `${t('canvas.origin')} (${relOx.toFixed(1)}, ${relOy.toFixed(1)})`;
+      const origLabelX = isRight ? (so.x - 8) : (so.x + 8);
+      const origLabelY = isTop ? (so.y + 24) : (so.y - 18);
+      ctx.fillText(label, origLabelX, origLabelY);
+      ctx.restore();
 
       // 绘制刀头实时位置标记
       if (this.knifePos) {
         const kp = this.toScreen(this.knifePos.x, this.knifePos.y);
+        const relKx = isRight ? (mech.x - this.knifePos.x) : (this.knifePos.x - mech.x);
+        const relKy = isTop   ? (mech.y - this.knifePos.y) : (this.knifePos.y - mech.y);
         ctx.save();
         ctx.strokeStyle = '#0284c7';
         ctx.lineWidth = 1.5;
@@ -227,14 +256,51 @@ class Renderer {
 
         ctx.fillStyle = '#0284c7';
         ctx.font = '10px ui-monospace, monospace';
-        ctx.fillText(`${t('canvas.knife')} (${this.knifePos.x.toFixed(1)}, ${this.knifePos.y.toFixed(1)})`, kp.x + 9, kp.y + 12);
+        ctx.textAlign = isRight ? 'right' : 'left';
+        const kxText = isRight ? (kp.x - 10) : (kp.x + 10);
+        const kyText = kp.y + 14;
+        ctx.fillText(`${t('canvas.knife')} (${relKx.toFixed(1)}, ${relKy.toFixed(1)})`, kxText, kyText);
         ctx.restore();
       }
     }
 
+    /** 绘制「走框预览」范围矩形高亮框 */
+    _drawFrameBox() {
+      if (!this.frameBox || !this.frameBox.bbox) return;
+      const bb = this.frameBox.bbox;
+      const ob = this.frameBox.originBBox;
+      const ctx = this.ctx;
+      const a = this.toScreen(bb.minX, bb.maxY);
+      const b = this.toScreen(bb.maxX, bb.minY);
+      const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+      const w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(16, 185, 129, 0.08)';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#059669';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(x, y, w, h);
+      ctx.setLineDash([]);
+
+      // 顶部尺寸标签
+      const tag = ob
+        ? `${t('canvas.frameBox')} ${bb.w.toFixed(1)}×${bb.h.toFixed(1)}mm (X:${ob.offsetX.toFixed(0)}~${ob.reachX.toFixed(0)}, Y:${ob.offsetY.toFixed(0)}~${ob.reachY.toFixed(0)})`
+        : `${t('canvas.frameBox')} ${bb.w.toFixed(1)}×${bb.h.toFixed(1)}mm`;
+      ctx.font = 'bold 11px ui-monospace, monospace';
+      const tw = ctx.measureText(tag).width + 12;
+      const tx = Math.max(8, Math.min(this.vwSafe - tw - 8, x + w / 2 - tw / 2));
+      const ty = Math.max(22, y - 8);
+      ctx.fillStyle = '#059669';
+      ctx.fillRect(tx, ty - 15, tw, 19);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(tag, tx + 6, ty - 2);
+      ctx.restore();
+    }
+
     _drawGrid() {
       const ctx = this.ctx;
-      // 网格间距随缩放自适应，避免密到看不清
       const candidates = [1, 2, 5, 10, 20, 50, 100, 200];
       let step = candidates[candidates.length - 1];
       for (const c of candidates) {
@@ -300,13 +366,6 @@ class Renderer {
       this._lastDrawStats = { drawn, skipped, layers: this.layers.length, vw: this.vw, vh: this.vh, scale: this.scale, offsetX: this.offsetX, offsetY: this.offsetY };
     }
 
-    /**
-     * 选中框与控制点。
-     *
-     * 用 Inkscape / Illustrator 的习惯：实线选框 + 四角实心方块（缩放）
-     * + 顶部一个圆形（旋转）。手柄要足够大才好抓——画布缩放时手柄大小保持
-     * 屏幕像素恒定，不随图形缩放变小，否则放到很小时就没法操作了。
-     */
     _drawSelection() {
       const selected = this.layers.filter((l) => !l.hidden && (l.id === this.selectedId || (this.selectedIds && this.selectedIds.has(l.id))));
       if (!selected.length) return;
@@ -314,11 +373,10 @@ class Renderer {
       if (!bb) return;
 
       const ctx = this.ctx;
-      const a = this.toScreen(bb.minX, bb.maxY);   // 左下（屏幕）
-      const b = this.toScreen(bb.maxX, bb.minY);   // 右上
+      const a = this.toScreen(bb.minX, bb.maxY);
+      const b = this.toScreen(bb.maxX, bb.minY);
       const x = a.x, y = a.y, w = b.x - a.x, h = b.y - a.y;
 
-      // 选框：虚线，视觉上不与刀路混淆
       ctx.save();
       ctx.strokeStyle = '#2563eb';
       ctx.lineWidth = 1;
@@ -328,9 +386,8 @@ class Renderer {
 
       if (!this.handles) this.handles = [];
       this.handles = [];
-      const HS = 4.5;  // 手柄半边长（屏幕像素，恒定）
+      const HS = 4.5;
 
-      // 四角缩放手柄
       const corners = [
         ['nw', x, y], ['ne', x + w, y], ['se', x + w, y + h], ['sw', x, y + h],
       ];
@@ -343,7 +400,6 @@ class Renderer {
         this.handles.push({ id, kind: 'scale', x: cx, y: cy, cursor: id === 'nw' || id === 'se' ? 'nwse-resize' : 'nesw-resize' });
       }
 
-      // 顶部旋转手柄
       const rx = x + w / 2, ry = y - 22;
       ctx.beginPath();
       ctx.fillStyle = '#ffffff';
@@ -352,7 +408,6 @@ class Renderer {
       ctx.arc(rx, ry, HS, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
-      // 连线，说明旋转手柄归属
       ctx.beginPath();
       ctx.strokeStyle = 'rgba(37,99,235,0.5)';
       ctx.lineWidth = 1;
@@ -364,7 +419,6 @@ class Renderer {
       ctx.restore();
     }
 
-    /** 计算当前选中图层集合的整体包围盒 */
     computeSelectionBBox() {
       const selected = this.layers.filter((l) => !l.hidden && (l.id === this.selectedId || (this.selectedIds && this.selectedIds.has(l.id))));
       if (!selected.length) return null;
@@ -382,7 +436,6 @@ class Renderer {
       return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
     }
 
-    /** 计算图层包围盒（屏幕无关，模型坐标） */
     computeBBox(layer) {
       if (!layer) return null;
       let subs = layer.subpaths;
@@ -396,7 +449,6 @@ class Renderer {
       return bb;
     }
 
-    /** 命中控制点。返回 handle 或 null */
     hitHandle(sx, sy, tol = 7) {
       if (!this.handles) return null;
       for (const hd of this.handles) {
@@ -419,7 +471,6 @@ class Renderer {
       }
       if (sub.closed) ctx.closePath();
 
-      // 刀具实际走的是路径中心，用实线；选中时加外发光
       if (selected) {
         ctx.strokeStyle = 'rgba(37,99,235,0.18)';
         ctx.lineWidth = 7;
@@ -436,16 +487,13 @@ class Renderer {
       ctx.stroke();
     }
 
-    // ---- 刀路动画 ----
-    startAnim(path, speedMmPerSec = 40) {
-      // 预先离散成点串，按长度匀速推进，看起来就是真实刻绘速度
+    // ---- 刀路与走框动画 ----
+    startAnim(path, speedMmPerSec = 40, isFrame = false) {
       const segs = [];
       let total = 0;
       let prevPt = null;
       for (const sub of path.subpaths) {
         const pts = G.flattenSubpathOpen(sub, 0.08);
-        // 空子路径直接跳过：pts 不足 2 点时 pts[pts.length-1] 是 undefined，
-        // 后面算距离会得到 NaN，污染 total 与动画进度。
         if (pts.length < 2) { continue; }
         for (let i = 1; i < pts.length; i++) {
           const a = pts[i - 1], b = pts[i];
@@ -454,7 +502,6 @@ class Renderer {
           segs.push({ a, b, len: d, cum: total + d, cut: true });
           total += d;
         }
-        // 快移：抬刀到下一段起点（cut:false，动画里画成虚线）
         const last = pts[pts.length - 1];
         if (prevPt) {
           const d = Math.hypot(last.x - prevPt.x, last.y - prevPt.y);
@@ -465,8 +512,17 @@ class Renderer {
         }
         prevPt = last;
       }
-      this.anim = { segs, total, pos: 0, last: performance.now(), speed: speedMmPerSec, path };
+      this.anim = { segs, total, pos: 0, last: performance.now(), speed: speedMmPerSec, path, isFrame };
       this.dirty = true;
+    }
+
+    startFrameAnim(path, bbox, originBBox, speedMmPerSec = 25) {
+      this.frameBox = {
+        bbox,
+        originBBox,
+        until: performance.now() + 8000,
+      };
+      this.startAnim(path, speedMmPerSec, true);
     }
 
     _stepAnim() {
@@ -474,8 +530,8 @@ class Renderer {
       const now = performance.now();
       const dt = (now - a.last) / 1000;
       a.last = now;
-      // 加速 40 倍：否则 3 米长的活要盯 3 分钟，看不出走线对不对
-      a.pos = Math.min(a.total, a.pos + dt * a.speed * 40);
+      const mult = a.isFrame ? 12 : 40;
+      a.pos = Math.min(a.total, a.pos + dt * a.speed * mult);
       if (a.pos >= a.total) { this.anim = null; if (this.onAnimEnd) this.onAnimEnd(); }
       this.dirty = true;
     }
@@ -487,10 +543,9 @@ class Renderer {
       if (!a) return;
       const ctx = this.ctx;
 
-      // 已走过的部分
+      ctx.save();
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      let cur = null;
       let started = false;
       ctx.beginPath();
       for (const s of a.segs) {
@@ -499,30 +554,28 @@ class Renderer {
         const pb = this.toScreen(s.b.x, s.b.y);
         if (!started) { ctx.moveTo(pa.x, pa.y); started = true; }
         if (s.cut) {
-          ctx.strokeStyle = s.cut ? '#e11d48' : '#94a3b8';
-          ctx.lineWidth = 1.4;
+          ctx.strokeStyle = a.isFrame ? '#059669' : '#e11d48';
+          ctx.lineWidth = a.isFrame ? 2.2 : 1.4;
           ctx.lineTo(pb.x, pb.y);
           ctx.stroke();
           ctx.beginPath();
           ctx.moveTo(pb.x, pb.y);
         }
-        cur = pb;
       }
-      // 正在走的这一段
       const partial = this._pointAt(a, a.pos);
       if (partial) {
         const ps = this.toScreen(partial.x, partial.y);
-        ctx.fillStyle = '#2563eb';
+        ctx.fillStyle = a.isFrame ? '#059669' : '#2563eb';
         ctx.beginPath();
-        ctx.arc(ps.x, ps.y, 4, 0, Math.PI * 2);
+        ctx.arc(ps.x, ps.y, 4.5, 0, Math.PI * 2);
         ctx.fill();
-        ctx.strokeStyle = 'rgba(37,99,235,0.25)';
+        ctx.strokeStyle = a.isFrame ? 'rgba(5,150,105,0.28)' : 'rgba(37,99,235,0.25)';
         ctx.lineWidth = 8;
         ctx.beginPath();
-        ctx.arc(ps.x, ps.y, 7, 0, Math.PI * 2);
+        ctx.arc(ps.x, ps.y, 7.5, 0, Math.PI * 2);
         ctx.stroke();
       }
-      void cur;
+      ctx.restore();
     }
 
     _pointAt(a, dist) {

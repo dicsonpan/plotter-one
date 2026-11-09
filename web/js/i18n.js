@@ -158,6 +158,8 @@ const DICT = {
     'prop.del': '删除',
     'prop.group': '编组',
     'prop.ungroup': '解组',
+    'prop.snapOrigin': '🎯 贴靠当前原点 (留边10mm)',
+    'prop.snapOriginTitle': '将选中图形移动到当前原点内侧 10mm 处，消除空走行程',
     'prop.copySuffix': '{name} 副本',
     'prop.selectedCount': '已选择 {n} 个对象',
     'toast.undone': '已撤销',
@@ -167,6 +169,7 @@ const DICT = {
     'toast.deleted': '已删除 {n} 项',
     'toast.flippedH': '已水平镜像',
     'toast.flippedV': '已垂直镜像',
+    'toast.snappedOrigin': '已贴靠到当前原点（留边 10mm）',
 
     // ---- 快速文字
     'sect.text': '快速文字',
@@ -174,8 +177,8 @@ const DICT = {
     'text.placeholder': '输入要刻的字',
     'text.heightMm': '字高 mm',
     'text.rotate': '旋转 °',
-    'text.startX': '起点 X',
-    'text.startY': '起点 Y',
+    'text.startX': '距原点 X',
+    'text.startY': '距原点 Y',
     'text.add': '加入版面',
     'toast.emptyText': '请输入内容',
     'toast.added': '已加入',
@@ -209,6 +212,7 @@ const DICT = {
     'canvas.origin': '原点',
     'canvas.mechOrigin': '机械 0,0',
     'canvas.knife': '刀头',
+    'canvas.frameBox': '走框范围',
 
     // ---- 设备连接
     'sect.device': '设备连接',
@@ -223,6 +227,11 @@ const DICT = {
     'dev.connectedSub': '已自动连接 · 准备就绪',
     'dev.oneWay': '单向通信（无回执，进度为仿真推算）',
     'dev.machine': '机器型号',
+    'dev.originPos': '机器原点位置',
+    'origin.bottomRight': '右下（刀头在右 · 向左进刀）',
+    'origin.bottomLeft': '左下（刀头在左 · 向右进刀）',
+    'origin.topRight': '右上（刀头在右上 · 向左下进刀）',
+    'origin.topLeft': '左上（刀头在左上 · 向右下进刀）',
     'dev.connType': '连接方式',
     'dev.serial': 'USB / 串口（推荐）',
     'dev.tcp': '网口 TCP',
@@ -238,6 +247,7 @@ const DICT = {
     'toast.noDevice': '设备未连接',
     'toast.disconnected': '已断开',
     'toast.machineChanged': '已切换机型',
+    'toast.originPosChanged': '已切换机器原点位置',
     'toast.needPort': '请选择串口',
     'toast.connectOk': '已连接：{dev}',
     'toast.connectFail': '连接失败：{msg}',
@@ -298,6 +308,8 @@ const DICT = {
     'sect.output': '输出',
     'btn.preview': '预览刀路',
     'btn.compile': '生成指令',
+    'btn.frame': '⬚ 走框预览（巡边确认范围）',
+    'btn.frameTitle': '刀头抬起沿图形外框空走一圈，在真实机器上预览实际刻字范围（不落刀）',
     'btn.send': '开始刻绘',
     'btn.pause': '暂停',
     'btn.resume': '继续',
@@ -321,11 +333,16 @@ const DICT = {
     'toast.compileFail': '生成失败：{msg}',
     'toast.previewStart': '开始预览刀路',
     'toast.previewFail': '预览失败：{msg}',
+    'toast.frameSent': '正在走框巡边：{w}×{h}mm（全程抬刀）',
+    'toast.framePreviewOnly': '走框范围：{w}×{h}mm（连接设备后可在真机巡边）',
+    'toast.frameFail': '走框预览失败：{msg}',
     'toast.outputStarted': '已开始输出',
     'toast.outputFail': '输出失败：{msg}',
     'toast.bootFail': '初始化失败',
     'log.compileDone': '编译完成：{n} 条指令，{kb}KB，预计 {time}',
     'log.previewDone': '预览完成',
+    'log.frameSent': '已下发走框预览：{msg}',
+    'log.framePreviewOnly': '{msg}（当前未连接设备，仅在画布演示）',
     'log.outputStart': '开始输出到刻字机',
     'log.initFail': '初始化失败：{msg}',
     'confirm.multi': '当前版面有 {n} 项内容，确定要一起输出吗？',
@@ -539,6 +556,8 @@ const DICT = {
     'prop.del': 'Delete',
     'prop.group': 'Group',
     'prop.ungroup': 'Ungroup',
+    'prop.snapOrigin': '🎯 Snap to Origin (10mm margin)',
+    'prop.snapOriginTitle': 'Move selected items to 10mm inside the active origin to eliminate pre-cut travel',
     'prop.copySuffix': '{name} copy',
     'prop.selectedCount': '{n} items selected',
     'toast.undone': 'Undone',
@@ -548,6 +567,7 @@ const DICT = {
     'toast.deleted': 'Deleted {n} item(s)',
     'toast.flippedH': 'Mirrored horizontally',
     'toast.flippedV': 'Mirrored vertically',
+    'toast.snappedOrigin': 'Snapped to active origin (10mm margin)',
 
     // ---- Quick text
     'sect.text': 'Quick text',
@@ -555,8 +575,8 @@ const DICT = {
     'text.placeholder': 'Text to engrave',
     'text.heightMm': 'Height mm',
     'text.rotate': 'Rotate °',
-    'text.startX': 'Start X',
-    'text.startY': 'Start Y',
+    'text.startX': 'Origin X',
+    'text.startY': 'Origin Y',
     'text.add': 'Add to layout',
     'toast.emptyText': 'Enter some text',
     'toast.added': 'Added',
@@ -590,6 +610,7 @@ const DICT = {
     'canvas.origin': 'Origin',
     'canvas.mechOrigin': 'Machine 0,0',
     'canvas.knife': 'Knife',
+    'canvas.frameBox': 'Frame Range',
 
     // ---- Device connection
     'sect.device': 'Device',
@@ -604,6 +625,11 @@ const DICT = {
     'dev.connectedSub': 'Connected · Ready',
     'dev.oneWay': 'One-way link (no ack, progress is simulated)',
     'dev.machine': 'Machine model',
+    'dev.originPos': 'Origin position',
+    'origin.bottomRight': 'Bottom-Right (head right · cuts left)',
+    'origin.bottomLeft': 'Bottom-Left (head left · cuts right)',
+    'origin.topRight': 'Top-Right (head top-right)',
+    'origin.topLeft': 'Top-Left (head top-left)',
     'dev.connType': 'Connection',
     'dev.serial': 'USB / serial (recommended)',
     'dev.tcp': 'Ethernet TCP',
@@ -619,6 +645,7 @@ const DICT = {
     'toast.noDevice': 'Device not connected',
     'toast.disconnected': 'Disconnected',
     'toast.machineChanged': 'Machine model changed',
+    'toast.originPosChanged': 'Origin position updated',
     'toast.needPort': 'Select a serial port',
     'toast.connectOk': 'Connected: {dev}',
     'toast.connectFail': 'Connection failed: {msg}',
@@ -679,6 +706,8 @@ const DICT = {
     'sect.output': 'Output',
     'btn.preview': 'Preview path',
     'btn.compile': 'Build commands',
+    'btn.frame': '⬚ Frame Check (Trace Bounds)',
+    'btn.frameTitle': 'Trace the bounding box with the blade up to preview the exact cutting area on the material',
     'btn.send': 'Start engraving',
     'btn.pause': 'Pause',
     'btn.resume': 'Resume',
@@ -702,11 +731,16 @@ const DICT = {
     'toast.compileFail': 'Build failed: {msg}',
     'toast.previewStart': 'Previewing toolpath',
     'toast.previewFail': 'Preview failed: {msg}',
+    'toast.frameSent': 'Framing bounds: {w}×{h}mm (blade up)',
+    'toast.framePreviewOnly': 'Frame bounds: {w}×{h}mm (connect device to trace on machine)',
+    'toast.frameFail': 'Frame check failed: {msg}',
     'toast.outputStarted': 'Output started',
     'toast.outputFail': 'Output failed: {msg}',
     'toast.bootFail': 'Init failed',
     'log.compileDone': 'Built {n} commands, {kb}KB, est. {time}',
     'log.previewDone': 'Preview complete',
+    'log.frameSent': 'Frame check sent: {msg}',
+    'log.framePreviewOnly': '{msg} (device not connected, previewing on canvas)',
     'log.outputStart': 'Sending to engraver',
     'log.initFail': 'Init failed: {msg}',
     'confirm.multi': 'Layout has {n} items. Output them together?',
@@ -795,16 +829,10 @@ const DICT = {
  * @returns {string}
  */
 export function t(key, vars) {
-  // 兜底顺序：当前语言 → 中文 → key 本身。
-  // 返回 key 本身是刻意的：漏翻译会显示成 "some.key"，一眼可见，
-  // 而静默显示空白会被当成「界面坏了」，排查成本高得多。
   let s = DICT[current]?.[key] ?? DICT.zh[key] ?? key;
   if (vars) {
     s = s.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined ? vars[k] : m));
   }
-  // {{host}} 在这里统一替换，而不是散落在各处。
-  // 静态文案（HTML 里的 data-i18n）和动态文案（JS 里的 t()）都走这一条路径，
-  // 否则静态那份会露出未替换的占位符 —— 表现为界面上直接显示「{{host}}」。
   if (s.includes('{{host}}')) {
     const loc = (typeof location !== 'undefined' && location) || {};
     s = s.replace('{{host}}', `<b>http://${loc.hostname || 'localhost'}:${loc.port || 80}</b>`);
@@ -823,15 +851,6 @@ export const LANGS = [
   { id: 'en', label: 'English' },
 ];
 
-/**
- * 切换语言：刷新 DOM 静态文案、重跑一次状态拉取、重绘画布。
- *
- * ⚠️ 必须触发这三件事，缺一个就会出现「半边界面还是旧语言」：
- *   1. applyI18n —— HTML 里的静态文案
- *   2. 回调 —— 那些由 JS 写进去的文案（状态栏、统计、图层列表…）
- *   3. 重绘 —— 画布上的尺寸标注等
- * 只做 1 的话，切换后按钮变了但统计数字还是中文，非常迷惑。
- */
 const listeners = new Set();
 
 /** 注册语言切换回调（由 app.js 用来刷新动态文案） */
@@ -841,11 +860,9 @@ export function onLangChange(fn) {
 }
 
 function applyI18n(root = document) {
-  // 元素文本：<span data-i18n="key">旧文本</span>
   for (const el of root.querySelectorAll('[data-i18n]')) {
     el.textContent = t(el.dataset.i18n);
   }
-  // 属性：<input data-i18n-attr="placeholder:key1,title:key2">
   for (const el of root.querySelectorAll('[data-i18n-attr]')) {
     for (const pair of el.dataset.i18nAttr.split(',')) {
       const i = pair.indexOf(':');
@@ -855,7 +872,6 @@ function applyI18n(root = document) {
       if (attr && key) el.setAttribute(attr, t(key));
     }
   }
-  // 文档标题单独处理：它是 <title> 不是属性
   const ttl = root.querySelector('title[data-i18n]');
   if (ttl) document.title = t(ttl.dataset.i18n);
 }
@@ -886,9 +902,6 @@ export function initLang() {
   let saved = null;
   try { saved = localStorage.getItem(STORAGE_KEY); } catch { /* 忽略 */ }
   if (saved !== 'zh' && saved !== 'en') {
-    // 用户没手动选过时，按系统/浏览器语言自动选。
-    // 用 navigator.languages（用户完整的偏好排序）而不是只看主语言，
-    // 这样「系统语言是英语」一定能命中英文；中文偏好排在前面才落中文。
     const prefs = (navigator.languages && navigator.languages.length)
       ? navigator.languages
       : [navigator.language || 'zh-CN'];
