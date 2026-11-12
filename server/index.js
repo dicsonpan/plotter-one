@@ -21,6 +21,7 @@ import { SerialTransport, TcpTransport, VirtualPlotter, NullTransport, createTra
 import { JobEngine, JobState } from './machine/jobEngine.js';
 import { MACHINE_PRESETS, MATERIAL_PRESETS, ORIGIN_POSITIONS, getOriginCorner, compileToPlotterLanguage, buildFrameCommand, HpglBuilder } from './machine/hpgl.js';
 import { buildManualCommand } from './machine/manual.js';
+import { getDialect } from './machine/dialects.js';
 import { compileToolpath, analyze, estimateTime, Direction } from './cam/toolpath.js';
 import { parseDxf } from './import/dxf.js';
 import { parseSvg, parseSvgPath } from './import/svg.js';
@@ -42,6 +43,14 @@ function argVal(flag, def) {
 const PORT = parseInt(argVal('--port', process.env.PORT || '8080'), 10);
 const HOST = argVal('--host', '0.0.0.0');
 const CONFIG_PATH = resolve(DATA_ROOT, 'config.json');
+
+/**
+ * 手动控制的「当前刀头绝对坐标」缓存（机器单位，按 machineId 分）。
+ * 只有不支持 PR/IP 的流式方言（skm）需要：它没有相对移动指令，
+ * 必须由上位机累加坐标。换机型或服务重启后归零（拿不到机器真实位置，
+ * 界面应提示重新对刀），所以只在内存里、不写 config.json。
+ */
+const manualPositions = new Map();
 
 const DEFAULT_CONFIG = {
   machineId: 'liyue-sc630',
@@ -144,8 +153,15 @@ function broadcast(type, payload) {
 /**
  * 连接后的链路探测（2026-10-19 实测驱动的加固）。
  */
-async function probeLink(t) {
-  await t.write('IN;');
+async function probeLink(t, preset = getPreset(config.machineId)) {
+  const dialect = getDialect(preset.dialect);
+  // skm 这类纯单工被动机型不认 IN;，发了只会往机载缓冲里塞脏字节。
+  // 直接判为单工链路（完成状态按运动学仿真推算，日志会提示目视确认）。
+  if (!dialect.probeCommand) {
+    console.log('  · 链路探测：跳过（该机型为纯单工被动型，无查询指令）');
+    return true;
+  }
+  await t.write(dialect.probeCommand);
   await new Promise((r) => setTimeout(r, 300));
   const silent = t.everRx === false;
   if (t instanceof SerialTransport || t instanceof TcpTransport) {
@@ -230,7 +246,7 @@ async function tryReconnect() {
       await t.connect();
       let silent = false;
       try {
-        silent = await probeLink(t);
+        silent = await probeLink(t, getPreset(config.machineId));
       } catch (probeErr) {
         try { await t.disconnect(); } catch { /* 忽略 */ }
         continue;
@@ -395,7 +411,8 @@ const routes = {
         await t.connect();
         deviceInfo = { path: `${body.host}:${body.port}` };
       } else if (type === 'virtual') {
-        t = new VirtualPlotter({ width: getPreset(config.machineId).width, stepsPerInch: getPreset(config.machineId).stepsPerInch });
+        const vp = getPreset(config.machineId);
+        t = new VirtualPlotter({ width: vp.width, stepsPerInch: vp.stepsPerInch, dialect: vp.dialect });
         await t.connect();
         deviceInfo = { path: '内置虚拟刻字机（不驱动真实硬件）', pathEn: 'Built-in virtual plotter (no real hardware)' };
       } else {
@@ -404,7 +421,7 @@ const routes = {
       let silent = false;
       if (type === 'serial' || type === 'tcp') {
         try {
-          silent = await probeLink(t);
+          silent = await probeLink(t, getPreset(config.machineId));
         } catch (probeErr) {
           try { await t.disconnect(); } catch { /* 忽略 */ }
           return sendJson(res, 400, err(
@@ -439,6 +456,10 @@ const routes = {
 
   'POST /api/config': async (req, res) => {
     const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+    // 换机器后旧机型累加出来的刀头坐标不可信，必须丢弃重新对刀
+    if (body.machineId && body.machineId !== config.machineId) {
+      manualPositions.delete(body.machineId);
+    }
     // 当切换机型且未显式指定新的 originPosition 时，自动同步为该机型预设的默认原点位置
     if (body.machineId && body.machineId !== config.machineId && !body.originPosition) {
       const nextPreset = getPreset(body.machineId);
@@ -614,6 +635,7 @@ const routes = {
 
       sendJson(res, 200, {
         gcode: timeText,
+        format: result.format || 'lines',
         bytes: result.bytes,
         commandCount: result.commandCount,
         info: compiled.info,
@@ -670,9 +692,10 @@ const routes = {
       let jobId = null;
       const shouldSend = connected && body.runNow !== false;
       if (shouldSend) {
-        if (!engine.busy && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
+        const dialect = getDialect(preset.dialect);
+        if (!engine.busy && dialect.probeCommand && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
           try {
-            await transport.write('IN;');
+            await transport.write(dialect.probeCommand);
           } catch (probeErr) {
             connected = false;
             broadcast('device:closed', {});
@@ -687,6 +710,7 @@ const routes = {
         jobId = engine.enqueue({
           name: `走框预览 · ${wStr}×${hStr}mm`,
           text: built.text,
+          streamFormat: built.format || 'lines',
           baud,
           priority: true,
           speed,
@@ -723,18 +747,22 @@ const routes = {
     if (!body.action) return sendJson(res, 400, err('缺少 action', 'Missing action'));
 
     const preset = getPreset(config.machineId);
+    const manualKey = config.machineId;
     let built;
     try {
-      built = buildManualCommand({ ...preset, ...axisOptions(preset) }, body);
+      built = buildManualCommand({ ...preset, ...axisOptions(preset) }, body, { pos: manualPositions.get(manualKey) });
     } catch (err) {
       return sendJson(res, 400, err('指令生成失败：' + err.message, 'Command build failed: ' + err.message));
     }
     if (!built.text) return sendJson(res, 400, err('未生成任何指令', 'No commands generated'));
+    // 流式方言没有相对移动，把累加后的绝对坐标存好供下一次手动操作使用
+    if (built.nextPos) manualPositions.set(manualKey, built.nextPos);
 
     const baud = +(config.serial?.baud || preset.serialDefault.baud || 9600);
     const id = engine.enqueue({
       name: `手动·${MANUAL_LABELS[body.action] || body.action}`,
       text: built.text,
+      streamFormat: built.format || 'lines',
       baud,
       priority: true,
       meta: { bytes: built.text.length, manual: true },
@@ -749,9 +777,10 @@ const routes = {
     if (!body.gcode) return sendJson(res, 400, err('没有指令内容', 'No command content'));
     const preset = getPreset(config.machineId);
 
-    if (!engine.busy && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
+    const dialect = getDialect(preset.dialect);
+    if (!engine.busy && dialect.probeCommand && (transport instanceof SerialTransport || transport instanceof TcpTransport)) {
       try {
-        await transport.write('IN;');
+        await transport.write(dialect.probeCommand);
       } catch (probeErr) {
         connected = false;
         broadcast('device:closed', {});
@@ -765,6 +794,7 @@ const routes = {
     const id = engine.enqueue({
       name: body.name || `任务 ${new Date().toLocaleTimeString('zh-CN')}`,
       text: body.gcode,
+      streamFormat: dialect.stream ? 'stream' : 'lines',
       baud,
       estimate: body.estimate,
       speed: +(body.speed || config.defaultSpeed || 30),

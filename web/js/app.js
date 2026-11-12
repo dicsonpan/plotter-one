@@ -1458,7 +1458,16 @@ if (typeof window !== 'undefined') {
       const machineId = $('machineSel').value;
       const nextPreset = state.presets[machineId];
       const nextOriginPos = nextPreset?.originPosition || 'bottom-right';
-      await api('/api/config', { method: 'POST', body: { machineId, originPosition: nextOriginPos } });
+      const body = { machineId, originPosition: nextOriginPos };
+      // 串口参数由机型预设决定：SparkPlotter-GZ 是 9600，力宇系是 115200。
+      // 不同步的话前端仍按上一台机器的波特率连接，协议再对也连不上。
+      // 展开旧 serial 是为了保住已选中的串口路径 path。
+      const sd = nextPreset?.serialDefault;
+      if (sd?.baud) {
+        body.serial = { ...(state.config?.serial || {}), ...sd };
+        if ($('baudSel')) $('baudSel').value = String(sd.baud);
+      }
+      await api('/api/config', { method: 'POST', body });
       state.originInitialized = false;
       toast(t('toast.machineChanged'));
       await refreshState();
@@ -2014,7 +2023,11 @@ if (typeof window !== 'undefined') {
       });
       state.gcode = r.gcode;
       state.compiled = r;
-      $('gcodeView').textContent = r.gcode.split('\n').slice(0, 200).join('\n');
+      // 私有协议是连续字节流（空格即指令边界），按边界折行便于阅读；
+      // HP-GL 保持原有按行显示。这里只改展示，实际下发仍用 state.gcode 原文。
+      $('gcodeView').textContent = r.format === 'stream'
+        ? r.gcode.split(' ').map((s) => s + ' ').slice(0, 200).join('\n')
+        : r.gcode.split('\n').slice(0, 200).join('\n');
       updateStats();
 
       const warnBox = $('compileWarn');

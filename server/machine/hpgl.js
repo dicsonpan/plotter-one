@@ -70,6 +70,20 @@
  */
 
 import { DEG, normAngle, currentPoint, mapPathPoints, pathBBox, makePath, makeSubpath, addLine } from '../geom/path.js';
+import { getDialect, hpglToDmpl } from './dialects.js';
+
+/** DMPL 后处理已迁到协议层；这里 re-export 保持 selftest 等旧 import 兼容 */
+export { hpglToDmpl };
+
+/*
+ * 架构说明（2026-11-12 引入协议层后）：
+ *   本文件 = 几何层，只负责「刀路怎么算」：坐标变换、版面旋转、图元离散、
+ *   就近起刀、闭合过切。所有机器共用这一套，不因机型不同而分叉。
+ *   「机器怎么说话」（分隔符、初始化、抬落刀字节、作业结束标记、是否单工）
+ *   全部委托给 server/machine/dialects.js 的方言适配器（this.adapter）。
+ *   新增机器时不要在这里加 if (dialect === ...)，去方言注册表加适配器即可。
+ *   力宇 HP-GL 的输出由 server/selftest.js 的 golden 快照逐字节守护。
+ */
 
 // ---------------------------------------------------------------------------
 // 机器原点方位定义
@@ -315,6 +329,33 @@ export const MACHINE_PRESETS = {
     note: '金谷田 / 赛博等国产通用 DMPL 语言刻字机，默认右下角原点',
     noteEn: 'Domestic DMPL engravers such as JinguTian / Saibo, bottom-right origin',
   },
+  /**
+   * SparkPlotter-GZ —— 2026-11-12 新增（原致刻 SKA720 白牌机）。
+   *
+   * 与前面所有预设的关键区别：它不认 HP-GL，走文泰/力宇私有文本协议 skm。
+   * 幅面按潘老师给的 600mm 刻绘宽（进纸长度暂按 710mm，实机确认后可调）；
+   * 分辨率 1016 步/英寸（≈40 步/mm，文泰实机设置值）；波特率 9600。
+   * 方向/版面朝向沿用「右下角原点」模型，但 🔴 尚未实机校准，
+   * 首次上机务必先走框预览确认 X/Y 与朝向，别直接刻大图。
+   */
+  'sparkplotter-gz': {
+    id: 'sparkplotter-gz',
+    name: 'SparkPlotter-GZ（600mm · 私有协议）',
+    nameEn: 'SparkPlotter-GZ (600mm · private protocol)',
+    width: 600, height: 710,
+    stepsPerInch: 1016,
+    dialect: 'skm',
+    originPosition: 'bottom-right',
+    axisX: 1,
+    axisY: 1,
+    swapAxes: false,
+    layoutRotate: 90,
+    serialDefault: { baud: 9600, dataBits: 8, stopBits: 1, parity: 'none', rtscts: false },
+    maxSpeed: 800, minSpeed: 12.5,
+    force: { min: 10, max: 500, default: 250, unit: 'g' },
+    note: '私有文本协议（非 HP-GL）：9600 波特、空格分隔、作业必须以结束标记提交；纯单工无回执。方向待实机校准。',
+    noteEn: 'Private text protocol (not HP-GL): 9600 baud, space-delimited, job must be committed with an end marker; one-way link, no acknowledgement. Orientation needs on-site calibration.',
+  },
 };
 
 export const MATERIAL_PRESETS = [
@@ -390,7 +431,11 @@ export class HpglBuilder {
     this.layoutRotate = normalizeRotate(rawRotate);
     this.origin = options.origin || null;
     this.dialect = preset.dialect || 'hpgl';
+    // 协议层适配器：本台机器「怎么说话」。几何变换与它完全无关。
+    this.adapter = getDialect(this.dialect);
     this.cmds = [];
+    // 非 HP-GL 方言的等价 HP-GL 影子指令，仅供运动学耗时估算，绝不下发
+    this.shadow = [];
     this.pos = { x: 0, y: 0 };
     this.penDown = false;
     this.bytes = 0;
@@ -534,14 +579,13 @@ export class HpglBuilder {
   }
 
   _flushCoords() {
-    if (this._coordBatch && this._coordBatch.length > 0) {
-      const coords = this._coordBatch.join(',');
-      this._coordBatch = [];
-      this._flushing = true;
-      this.emit(`PD${coords};`);
-      this._flushing = false;
-    }
+    this.adapter.flushCoords(this);
     return this;
+  }
+
+  /** 记录等价 HP-GL 影子指令（只有流式方言才需要，用于耗时/进度估算） */
+  _shadow(str) {
+    if (this.adapter.stream) this.shadow.push(str);
   }
 
   /**
@@ -584,52 +628,37 @@ export class HpglBuilder {
    *   3. 显式发送 PA; 锁定绝对坐标模式，对齐文泰（ArtCut）标准 PLT 头部。
    */
   setupCoords(origin) {
-    this.emit('IN;');
-    if (this.dialect === 'dmpl') {
-      this.emit(';:');
-      this.emit('IN;');
-    }
-    this.emit('PA;');
-    this.emit('SP1;');
-    this.emit('PU0,0;');
-    this.penDown = false;
-    this.pos = { x: 0, y: 0 };
+    this.adapter.init(this, origin);
     return this;
   }
 
   setSpeed(mmPerSec) {
-    // VS 用 cm/s
-    const cmps = Math.max(1, Math.round(mmPerSec / 10));
-    this.emit(`VS${cmps};`);
+    this.adapter.setSpeed(this, mmPerSec);
     return this;
   }
 
   setForce(gram) {
-    // 力宇 3D 机型支持力度指令；2D 机器的刀压是面板旋钮，软件控制不了
-    if (this.dialect === 'hpgl3d') this.emit(`FS${Math.round(gram)};`);
+    this.adapter.setForce(this, gram);
     return this;
   }
 
-  /** 结束落刀批次并标记抬刀（对齐文泰 WritePlt：不发孤立无坐标的 PU;，由后续 PU x,y; 执行抬刀空移） */
+  /** 结束落刀批次并标记抬刀：HP-GL 收束 PD 批次；skm 补一个边界空格结束续接串 */
   penUp() {
     this._flushCoords();
-    this.penDown = false;
+    this.adapter.penUp(this);
     return this;
   }
 
-  /**
-   * 无条件抬刀：显式发一条 `PU;`（供手动按钮或安全測試调用）。
-   */
+  /** 无条件抬刀：显式发一条该方言的抬刀指令（供手动按钮或安全测试调用） */
   forcePenUp() {
     this._flushCoords();
-    this.emit('PU;');
-    this.penDown = false;
+    this.adapter.forcePenUp(this);
     return this;
   }
 
   penSelectOn() {
     this._flushCoords();
-    this.penDown = false;
+    this.adapter.penSelectOn(this);
     return this;
   }
 
@@ -641,29 +670,18 @@ export class HpglBuilder {
     const p = this.toMachine(x, y);
     const px = toPlotterUnits(p.x, this.spi);
     const py = toPlotterUnits(p.y, this.spi);
-    this.emit(`PU${px},${py};`);
-    this.penDown = false;
-    this.pos = { x: px, y: py };
+    this.adapter.moveTo(this, px, py);
+    this._shadow(`PU${px},${py};`);
     return this;
   }
 
-  /**
-   * 落刀切割到绝对坐标 (x, y)：使用文泰标准 `PD x,y;` 格式。
-   */
+  /** 落刀切割到绝对坐标 (x, y)：具体字节由方言决定 */
   lineTo(x, y) {
     const p = this.toMachine(x, y);
     const px = toPlotterUnits(p.x, this.spi);
     const py = toPlotterUnits(p.y, this.spi);
-    this.penDown = true;
-    this.pos = { x: px, y: py };
-    if (this.maxBatchPairs <= 1) {
-      this.emit(`PD${px},${py};`);
-      return this;
-    }
-    this._coordBatch.push(px, py);
-    if (this.maxBatchPairs > 0 && this._coordBatch.length >= this.maxBatchPairs * 2) {
-      this._flushCoords();
-    }
+    this.adapter.lineTo(this, px, py);
+    this._shadow(`PD${px},${py};`);
     return this;
   }
 
@@ -671,7 +689,7 @@ export class HpglBuilder {
    * 圆弧：默认按 0.02mm 弦高离散为标准 `PD x,y;` 折线。
    */
   arcTo(cx, cy, r, a0, a1) {
-    if (!this.useNativeArc) {
+    if (!this.useNativeArc || this.adapter.nativeArc === false) {
       const rAbs = Math.max(0.001, Math.abs(r));
       const step = rAbs <= 0.02
         ? Math.PI / 4
@@ -731,7 +749,7 @@ export class HpglBuilder {
    * 整圆：默认离散为闭合折线 `PU x,y;` + `PD x,y;`。
    */
   circleAt(x, y, r) {
-    if (!this.useNativeArc) {
+    if (!this.useNativeArc || this.adapter.nativeArc === false) {
       this.penUp();
       this.moveTo(x + r, y);
       this.arcTo(x, y, r, 0, Math.PI * 2);
@@ -829,9 +847,7 @@ export class HpglBuilder {
    */
   home() {
     this._flushCoords();
-    this.emit('PU0,0;');
-    this.penDown = false;
-    this.pos = { x: 0, y: 0 };
+    this.adapter.home(this);
     return this;
   }
 
@@ -863,7 +879,7 @@ export class HpglBuilder {
 
     // 2. 初始化与设置（文泰标准：IN; PA; SP1; PU0,0;）
     this.setupCoords(options.origin);
-    if (options.emitSpeed === true || this.dialect === 'hpgl3d' || this.dialect === 'dmpl') {
+    if (options.emitSpeed === true || this.adapter.emitSpeedByDefault) {
       this.setSpeed(options.speedMmPerSec || 30);
     }
     if (options.force) this.setForce(options.force);
@@ -878,22 +894,22 @@ export class HpglBuilder {
       this.runSubpath(sub, { closeAll: !!options.closeAll });
     }
 
-    // 4. 收尾：抬刀回到对刀原点 (0,0)
+    // 4. 收尾：抬刀 + 方言自己的作业结束语义。
+    //    HP-GL 回 PU0,0;（绝不默认 !PG;）；skm 发 `U F{x} @ ` 提交作业，缺它机器完全不动。
     this.penUp();
-    if (options.homeEnd === true) {
-      this.emit('!PG;');
-    } else {
-      this.emit('PU0,0;');
-    }
+    this.adapter.finish(this, options);
     this.end();
     this._flushCoords();
 
-    const text = this.cmds.join('\n') + '\n';
+    const text = this.adapter.serialize(this.cmds);
     return {
       text,
       bytes: text.length,
       commandCount: this.cmds.length,
       lines: this.cmds.length,
+      // 传输层据此决定：按行下发（HP-GL）还是原样字节流（skm，空格不可 trim）
+      format: this.adapter.stream ? 'stream' : 'lines',
+      estimateText: this.adapter.stream ? this.shadow.join('\n') + '\n' : null,
     };
   }
 }
@@ -941,25 +957,32 @@ export function buildFrameCommand(path, preset, options = {}) {
   sub.closed = true;
   framePath.subpaths.push(sub);
 
-  // 生成纯抬刀（PU）走框指令：绝不落刀
-  builder.emit('IN;');
-  if (builder.dialect === 'dmpl') {
-    builder.emit(';:');
+  // 生成纯抬刀走框指令：绝不落刀
+  const adapter = builder.adapter;
+  if (adapter.stream) {
+    adapter.init(builder);
+  } else {
     builder.emit('IN;');
-  }
-  builder.emit('PA;');
-  builder.emit('SP1;');
-  builder.forcePenUp();
-  if (options.emitSpeed === true || builder.dialect === 'hpgl3d' || builder.dialect === 'dmpl') {
-    builder.setSpeed(options.speedMmPerSec || 40);
+    if (builder.dialect === 'dmpl') {
+      builder.emit(';:');
+      builder.emit('IN;');
+    }
+    builder.emit('PA;');
+    builder.emit('SP1;');
+    builder.forcePenUp();
+    if (options.emitSpeed === true || adapter.emitSpeedByDefault) {
+      builder.setSpeed(options.speedMmPerSec || 40);
+    }
   }
 
   for (const pt of corners) {
     builder.moveTo(pt.x - shift.x, pt.y - shift.y);
   }
   builder.home();
+  // skm 是「攒缓冲 + 收到结束标记才一次性执行」，走框同样必须提交，否则刀头不动
+  if (adapter.stream) adapter.finish(builder, {});
 
-  let text = builder.cmds.join('\n') + '\n';
+  let text = adapter.serialize(builder.cmds);
   if (preset.dialect === 'dmpl') {
     text = hpglToDmpl(text);
   }
@@ -985,6 +1008,7 @@ export function buildFrameCommand(path, preset, options = {}) {
     text,
     bytes: text.length,
     commandCount: builder.cmds.length,
+    format: adapter.stream ? 'stream' : 'lines',
     bbox,
     originBBox,
     framePath,
@@ -997,47 +1021,15 @@ export function buildFrameCommand(path, preset, options = {}) {
   };
 }
 
-/** DMPL 方言：把 HPGL 指令翻译成 DMPL 语法 */
-export function hpglToDmpl(hpglText) {
-  // DMPL: A=绝对, R=相对, D=落刀, U=抬刀, V=速度, S=选笔, Z=复位
-  const map = {
-    'IN;': ';:A;',
-    'PA;': 'A;',
-    'PA': 'A',
-    'PR': 'R',
-    'PD;': 'D;',
-    'PU;': 'U;',
-    'SP1;': 'S1;',
-    'SP0;': 'S0;',
-    'LT;': 'T0;',
-    'PA0,0;': 'U0,0;',
-    'PU0,0;': 'U0,0;',
-  };
-  const out = [];
-  for (let line of hpglText.split('\n')) {
-    line = line.trim();
-    if (!line) continue;
-    if (map[line]) { out.push(map[line]); continue; }
-    let m;
-    if ((m = line.match(/^PA((?:-?\d+,-?\d+,?)+);$/))) { out.push(`A${m[1].replace(/,$/, '')};`); continue; }
-    if ((m = line.match(/^PU((?:-?\d+,-?\d+,?)+);$/))) { out.push(`U;A${m[1].replace(/,$/, '')};`); continue; }
-    if ((m = line.match(/^PD((?:-?\d+,-?\d+,?)+);$/))) { out.push(`D;A${m[1].replace(/,$/, '')};`); continue; }
-    if ((m = line.match(/^PD;$/))) { out.push('D;'); continue; }
-    if ((m = line.match(/^PU;$/))) { out.push('U;'); continue; }
-    if ((m = line.match(/^VS(\d+);$/))) { out.push(`V${m[1]};`); continue; }
-    if ((m = line.match(/^AA(-?\d+),(-?\d+),(-?\d+),(-?\d+);$/))) { out.push(`A${m[1]},${m[2]};CA${m[3]},${m[4]};`); continue; }
-    out.push(line);
-  }
-  return out.join('\n') + '\n';
-}
+/** DMPL 后处理已迁至协议层 dialects.js（hpgl.js 顶部 re-export 保持兼容） */
 
-/** 生成 HPGL 文本（按方言分发） */
+/** 生成指令文本（按方言分发），并返回传输层需要的 format / estimateText */
 export function compileToPlotterLanguage(path, preset, options = {}) {
   const builder = new HpglBuilder(preset, options);
   const res = builder.build(path, options);
-  if (preset.dialect === 'dmpl') {
+  if (builder.adapter.postProcess === 'hpglToDmpl') {
     const t = hpglToDmpl(res.text);
-    return { text: t, bytes: t.length, commandCount: res.commandCount, lines: res.lines };
+    return { ...res, text: t, bytes: t.length, estimateText: null };
   }
   return res;
 }

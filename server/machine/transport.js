@@ -15,6 +15,7 @@ import { exec, execFile } from 'node:child_process';
 import { open, readFile, access } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
+import { getDialect } from './dialects.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -369,11 +370,17 @@ export class VirtualPlotter extends EventEmitter {
     this.height = opts.height || 710;
     this.spi = opts.stepsPerInch || 1000;
     this.firmware = opts.firmware || 'grbl-like';
+    // 协议层：skm 这类纯单工被动机型，虚拟机也不该回 banner / 应答
+    this.dialectId = opts.dialect || 'hpgl';
+    this.adapter = getDialect(this.dialectId);
     this.open = true;
-    this.everRx = true; // 虚拟机会回应答（banner），模拟双向链路
+    this.everRx = !this.adapter.silent;
     this.pos = { x: 0, y: 0 };
     this.penDown = false;
     this.running = false;
+    // 流式方言的机载缓冲：收到作业结束标记之前，指令只暂存、不执行
+    this._streamBuf = '';
+    this.jobs = 0;
     this._scale = this.spi / 25.4;
     // 力宇等 2D 刻字机对 IN; 返回版本行；GRBL 返回欢迎信息
     this._banner = this.firmware === 'grbl'
@@ -382,8 +389,9 @@ export class VirtualPlotter extends EventEmitter {
   }
 
   async connect() {
-    this.emit('open', { mode: 'virtual', banner: this._banner });
-    setTimeout(() => this.emit('data', this._banner), 30);
+    const banner = this.adapter.silent ? '' : this._banner;
+    this.emit('open', { mode: 'virtual', banner });
+    if (!this.adapter.silent) setTimeout(() => this.emit('data', banner), 30);
   }
 
   async write(data) {
@@ -396,6 +404,7 @@ export class VirtualPlotter extends EventEmitter {
   }
 
   _process(text) {
+    if (this.adapter.stream) return this._processStream(text);
     const cmds = text.split(';').map((s) => s.trim()).filter(Boolean);
     for (const c of cmds) {
       const t = c.replace(/^;/, '');
@@ -425,6 +434,43 @@ export class VirtualPlotter extends EventEmitter {
         this._scale = this.spi / 25.4;
       } else if (t.startsWith('VS') || t.startsWith('LT') || t.startsWith('SP') || t.startsWith('IN')) {
         this.emit('data', 'ok\n');
+      }
+    }
+  }
+
+  /**
+   * skm 私有协议的缓冲语义（2026-11-12 实测结论）：
+   * 机器把收到的指令先攒在缓冲里，只有收到作业结束标记 `U F{x} @ ` 才一次性执行。
+   * 这正是历史上「发了不动」的唯一根因。虚拟机必须如实模拟，
+   * 否则无硬件自测会对一个根本不会动的作业给出假绿灯。
+   */
+  _processStream(text) {
+    this._streamBuf += text;
+    const END_RE = /U F-?\d+ @ /;
+    let m;
+    while ((m = this._streamBuf.match(END_RE))) {
+      const payload = this._streamBuf.slice(0, m.index);
+      this._streamBuf = this._streamBuf.slice(m.index + m[0].length);
+      this.jobs++;
+      this._applyStreamPayload(payload);
+      this.emit('jobSubmitted', { jobs: this.jobs, pos: { ...this.pos } });
+    }
+  }
+
+  /** 把一个已提交作业里的 U/D/逗号续接点应用到虚拟机状态 */
+  _applyStreamPayload(payload) {
+    const s = payload.replace(/^;:H A L0 EC1 U /, '');
+    for (const tok of s.split(' ')) {
+      if (!tok) continue;
+      const head = tok[0];
+      if (head !== 'U' && head !== 'D' && head !== ',') continue;
+      const body = tok.slice(1);
+      if (!/^-?\d/.test(body)) continue;
+      const nums = body.split(',').filter((v) => v !== '');
+      for (let i = 0; i + 1 < nums.length; i += 2) {
+        this.pos = { x: +nums[i] / this._scale, y: +nums[i + 1] / this._scale };
+        this.penDown = head !== 'U';
+        this.emit('status', { pos: { ...this.pos }, penDown: this.penDown });
       }
     }
   }

@@ -13,6 +13,7 @@
  */
 
 import { HpglBuilder } from './hpgl.js';
+import { getDialect } from './dialects.js';
 
 /** 单次移动/进纸的距离上限（mm）。防止手滑点一下把刀送到材料外。 */
 const MAX_STEP = 200;
@@ -40,7 +41,12 @@ function n(zh, en) {
   return { zh, en: en || zh };
 }
 
-export function buildManualCommand(preset, cmd) {
+export function buildManualCommand(preset, cmd, ctx = {}) {
+  // 协议层分发：HP-GL 家族（力宇 / 3D / DMPL）继续走下面那套实机验证过的
+  // PU/PR/PA/IP 指令序列，一行都不改；流式私有协议走单独实现。
+  const dialect = getDialect(preset.dialect);
+  if (dialect.stream) return buildStreamManualCommand(preset, cmd, ctx, dialect);
+
   const notes = [];
   const b = new HpglBuilder(preset);
   // mm → 机器单位。与 HpglBuilder.moveTo 用的是同一套换算
@@ -251,6 +257,145 @@ export function buildManualCommand(preset, cmd) {
   }
 
   return { text: b.cmds.join('\n') + '\n', notes };
+}
+
+/**
+ * 流式方言（skm / SparkPlotter-GZ）的手动控制。
+ *
+ * 🔴 这台机器没有 PR 相对移动，也没有 IP 设原点：
+ *   所有「相对位移」都必须由上位机把当前绝对坐标累加后再发 U{x},{y}（末尾空格）。
+ *   ctx.pos 是上一次操作后的机器坐标（单位：步），nextPos 由接口层保存，
+ *   进程重启或切换机型后归零（界面上应提示重新对刀）。
+ * 🔴 每次操作都必须以 `U F{x} @ ` 收尾，否则机器把指令攒在缓冲里根本不动。
+ */
+function buildStreamManualCommand(preset, cmd, ctx, adapter) {
+  const notes = [];
+  const b = new HpglBuilder(preset);
+  const u = (mm) => Math.round((mm / 25.4) * b.spi);
+  let pos = {
+    x: Number(ctx?.pos?.x) || 0,
+    y: Number(ctx?.pos?.y) || 0,
+  };
+  let noop = false;
+  adapter.init(b);
+
+  const moveAbs = () => adapter.moveTo(b, pos.x, pos.y);
+  const step = (dxMm, dyMm) => {
+    const d = b.toMachineDelta(dxMm, dyMm);
+    pos = { x: pos.x + u(d.dx), y: pos.y + u(d.dy) };
+    moveAbs();
+  };
+  const clamp = (v) => Math.sign(v) * Math.min(Math.abs(v), MAX_STEP);
+
+  switch (cmd.action) {
+    case 'move': {
+      let dx = Number(cmd.dx) || 0;
+      let dy = Number(cmd.dy) || 0;
+      if (dx === 0 && dy === 0) {
+        notes.push(n('位移为 0，未发送移动指令', 'Zero displacement, no move command sent'));
+        noop = true;
+        break;
+      }
+      if (Math.abs(dx) > MAX_STEP || Math.abs(dy) > MAX_STEP) {
+        dx = clamp(dx);
+        dy = clamp(dy);
+        notes.push(n(`单次位移已限制在 ±${MAX_STEP}mm`, `Single move clamped to ±${MAX_STEP}mm`));
+      }
+      step(dx, dy);
+      notes.push(n(`移动 ${dx.toFixed(1)}, ${dy.toFixed(1)} mm（抬刀状态，不划伤材料）`,
+        `Move ${dx.toFixed(1)}, ${dy.toFixed(1)} mm (pen up, will not scratch)`));
+      break;
+    }
+
+    case 'home': {
+      pos = { x: 0, y: 0 };
+      moveAbs();
+      notes.push(n('已抬刀并返回机器原点 (0,0)', 'Pen up and returned to machine origin (0,0)'));
+      break;
+    }
+
+    case 'penup': {
+      adapter.forcePenUp(b);
+      notes.push(n('已抬刀（该机型以 U 指令抬刀）', 'Pen up (U command for this machine)'));
+      break;
+    }
+
+    case 'pendown': {
+      const d = b.toMachineDelta(2, 0);
+      pos = { x: pos.x + u(d.dx), y: pos.y + u(d.dy) };
+      adapter.lineTo(b, pos.x, pos.y);   // D{x},{y} 落刀第一点
+      adapter.penUp(b);                   // 补一个空格收束笔画，避免与结束标记粘连
+      notes.push(n('落刀并在当前方向试切 2mm（已抬刀收尾）',
+        'Pen down, 2mm test cut along current direction (pen up to finish)'));
+      break;
+    }
+
+    case 'setorigin': {
+      // 该机型没有 IP 指令：发一条「原地抬刀」保持物理位置不变，
+      // 只把上位机的坐标基准归零。
+      moveAbs();
+      pos = { x: 0, y: 0 };
+      notes.push(n('已在软件侧把当前位置记为原点（该机型无设原点指令，刀头物理位置不变）',
+        'Software origin reset (machine has no origin-set command; blade stays put)'));
+      break;
+    }
+
+    case 'feed':
+    case 'eject': {
+      let d = Math.abs(Number(cmd.distance) || 0);
+      if (d === 0) {
+        notes.push(n('距离为 0，未发送进纸指令', 'Zero distance, no feed command sent'));
+        noop = true;
+        break;
+      }
+      if (d > MAX_STEP) {
+        d = MAX_STEP;
+        notes.push(n(`单次进纸限制在 ${MAX_STEP}mm`, `Single feed clamped to ${MAX_STEP}mm`));
+      }
+      // 用户坐标 Y = 走纸方向；经 toMachineDelta 落到这台机器的 x 轴（料子进）
+      step(0, (cmd.action === 'feed' ? 1 : -1) * d);
+      notes.push(n(`${cmd.action === 'feed' ? '进纸' : '出纸'} ${d.toFixed(0)}mm`,
+        `${cmd.action === 'feed' ? 'Feed' : 'Eject'} ${d.toFixed(0)}mm`));
+      break;
+    }
+
+    case 'stop': {
+      adapter.forcePenUp(b);
+      notes.push(n('已抬刀并停止输出（该机型为单工，无法中途急停，请等待本条作业执行完）',
+        'Pen up, output stopped (one-way machine cannot be interrupted mid-job)'));
+      break;
+    }
+
+    case 'pause': {
+      adapter.forcePenUp(b);
+      notes.push(n('该机型协议无暂停指令，请使用界面「暂停」按钮控制后续任务',
+        'No pause command in this protocol — use the Pause button for queued jobs'));
+      break;
+    }
+
+    case 'end': {
+      pos = { x: 0, y: 0 };
+      moveAbs();
+      notes.push(n('已抬刀并返回机器原点，本次控制结束',
+        'Pen up and returned to machine origin, control session ended'));
+      break;
+    }
+
+    default:
+      notes.push(n(`未知指令：${cmd.action}`, `Unknown command: ${cmd.action}`));
+      noop = true;
+  }
+
+  if (noop) return { text: '', notes, nextPos: pos, format: 'stream' };
+
+  b.pos = { ...pos };   // 结束标记的 F{x} 取上位机记录的当前走纸轴坐标
+  adapter.finish(b);
+  return {
+    text: adapter.serialize(b.cmds),
+    notes,
+    nextPos: pos,
+    format: 'stream',
+  };
 }
 
 export { MAX_STEP };

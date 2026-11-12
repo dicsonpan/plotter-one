@@ -47,7 +47,7 @@ Zero dependencies is deliberate: the serial port uses `stty` + file descriptors 
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# self-test (286 checks: geometry / protocol / state machine / 4-corner origin / Y-travel fix / frame check / i18n)
+# self-test (329 checks, incl. byte-exact regression snapshots for Liyu output and the SparkPlotter-GZ protocol)
 npm run selftest
 
 # i18n audit (verify all 364 strings have both zh and en)
@@ -163,6 +163,22 @@ Open `http://<board-ip>:8080` in any browser on the LAN, import or add a test sh
 | `generic-hpgl-1016` | Generic HPGL engraver | 630 × 710 mm | 1016 | `bottom-right` | Standard HPGL resolution |
 | `generic-dmpl` | Generic DMPL cutter | 630 × 710 mm | 1016 | `bottom-right` | Domestic DMPL boards |
 | `liyue-4axis` | Liyue 4-axis / servo (3D) | 800 × 880 mm | 4060 | `bottom-left` | 3D flatbed, supports `FS` force |
+| **`sparkplotter-gz`** | **SparkPlotter-GZ (600mm)** | 600 × 710 mm | 1016 | `bottom-right` | Private `skm` text protocol, 9600 baud, one-way link (no replies) |
+
+### Dialect architecture
+
+Geometry (`HpglBuilder`) is shared by every machine; only the **wire protocol** differs.
+`server/machine/dialects.js` is a registry of adapters (`hpgl` / `hpgl3d` / `dmpl` / `skm`)
+that own initialization, move/draw bytes, serialization, job-end markers and link semantics.
+To add a machine: add a preset if it speaks an existing dialect, otherwise add one adapter.
+`npm run selftest` holds byte-exact golden snapshots of all legacy Liyu/DMPL output.
+
+**SparkPlotter-GZ (`skm`) still needs on-site calibration** (as of 2026-11-12): the 710mm feed
+length is provisional, axis directions / layout rotation are uncalibrated, and the `F{x}` value
+in the job-end marker `U F{x} @ ` is assumed to be the last point's feed-axis coordinate.
+Run a **Frame Check** before cutting anything large. This protocol has no relative-move or
+set-origin command, so manual-control coordinates are accumulated in server memory and reset
+on restart or machine switch.
 
 ---
 
@@ -172,13 +188,14 @@ Open `http://<board-ip>:8080` in any browser on the LAN, import or add a test sh
 plotter-one/
 ├── server/
 │   ├── index.js              HTTP routes + WebSocket + POST /api/frame
-│   ├── selftest.js           286 end-to-end self-checks (no hardware required)
+│   ├── selftest.js           329 end-to-end self-checks (incl. byte-exact Liyu regression, no hardware)
 │   ├── geom/path.js          geometry kernel (paths / matrices / RDP / de-speckle / ordering)
 │   ├── cam/
 │   │   ├── toolpath.js       toolpath engine (origin-aware ordering + closed-loop vertex rotation)
 │   │   └── textToPath.js     single-stroke font → paths
 │   ├── machine/
-│   │   ├── hpgl.js           HP-GL / DMPL builder + 4-corner origin + frame check + presets
+│   │   ├── hpgl.js           geometry layer: transforms / primitives / frame check + presets
+│   │   ├── dialects.js       protocol layer: dialect registry (HP-GL / 3D / DMPL / skm)
 │   │   ├── transport.js      serial / TCP / virtual plotter (with 5s write watchdog)
 │   │   ├── jobEngine.js      job queue + chunked streaming + kinematic progress tracking
 │   │   ├── manual.js         manual control commands
@@ -205,7 +222,7 @@ plotter-one/
 ## Development
 
 ```bash
-npm run selftest         # 286 self-checks, no machine required
+npm run selftest         # 329 self-checks, no machine required
 node tools/i18n-check.js # i18n audit (364 keys)
 npm start                # default port 8080
 npm start -- --port 9000

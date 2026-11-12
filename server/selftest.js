@@ -25,6 +25,22 @@ import { compileToolpath, analyze, estimateTime, Direction } from './cam/toolpat
 import { textToPath } from './cam/textToPath.js';
 import { VirtualPlotter, NullTransport, SerialTransport } from './machine/transport.js';
 import { JobEngine } from './machine/jobEngine.js';
+import { DIALECTS, getDialect, detectStreamFormat, splitStreamUnits, skmToHpglShadow, SKM_INIT } from './machine/dialects.js';
+
+/**
+ * 深拷贝路径：geom/path.js 的 mapPathPoints 是原地修改，
+ * golden 快照必须每个用例用一份干净输入，否则坐标会被前一个用例的
+ * 自定义原点累积平移，快照就失去意义（2026-11-12 踩到）。
+ */
+function freshPath(src) {
+  return {
+    subpaths: src.subpaths.map((s) => ({
+      start: { ...s.start },
+      elems: s.elems.map((e) => ({ ...e })),
+      closed: s.closed,
+    })),
+  };
+}
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -1388,6 +1404,157 @@ section('单工链路识别与写入看门狗（2026-10-19 实测加固）');
   let okWrite = false;
   try { await noWatch.write('IN;\n'); okWrite = true; } catch { /* 不应抛 */ }
   check('writeTimeoutMs=0 时看门狗关闭，写入直通', okWrite);
+}
+
+// ---------------------------------------------------------------------------
+section('协议层：方言可插拔 + 力宇零回归（2026-11-12）');
+{
+  const line = (x2, y2) => ({ type: 'line', x2, y2 });
+  const rect = {
+    subpaths: [{ start: { x: 10, y: 10 }, elems: [line(100, 10), line(100, 60), line(10, 60), line(10, 10)] }],
+  };
+  const multi = {
+    subpaths: [
+      { start: { x: 0, y: 0 }, elems: [line(30, 0), line(30, 30), line(0, 30)] },
+      { start: { x: 120, y: 40 }, elems: [line(170, 40), line(170, 90)] },
+    ],
+  };
+
+  // 🔴 改动前逐字节采集的 golden 快照：以后重构协议层，这些字符串一个字节都不许变。
+  const golden = [
+    ['SC631-AU 基础输出', 'liyue-sc631-au', rect, {},
+      'IN;\nPA;\nSP1;\nPU0,0;\nPU394,23228;\nPD394,19685;\nPD2362,19685;\nPD2362,23228;\nPD394,23228;\nPU0,0;\n'],
+    ['SC631-AU 自定义工作原点', 'liyue-sc631-au', rect, { origin: { x: 20, y: 20 } },
+      'IN;\nPA;\nSP1;\nPU0,0;\nPU-394,394;\nPD-394,-3150;\nPD1575,-3150;\nPD1575,394;\nPD-394,394;\nPU0,0;\n'],
+    ['DMPL 后处理转译', 'generic-dmpl', rect, {},
+      ';:A;\n;:\n;:A;\nA;\nS1;\nU0,0;\nV3;\nU;A400,24800;\nD;A400,21200;\nD;A2400,21200;\nD;A2400,24800;\nD;A400,24800;\nU0,0;\n'],
+    ['四轴 3D 机型 VS/FS 头部', 'liyue-4axis', rect, {},
+      'IN;\nPA;\nSP1;\nPU0,0;\nVS3;\nPU1598,1598;\nPD15984,1598;\nPD15984,9591;\nPD1598,9591;\nPD1598,1598;\nPU0,0;\n'],
+    ['通用 1016 批量坐标流', 'generic-1016-600', multi, { maxBatchPairs: 8 },
+      'IN;\nPA;\nSP1;\nPU0,0;\nPU0,24000;\nPD0,22800,1200,22800,1200,24000;\nPU1600,19200;\nPD1600,17200,3600,17200;\nPU0,0;\n'],
+  ];
+  for (const [name, id, path, opts, want] of golden) {
+    const got = compileToPlotterLanguage(freshPath(path), MACHINE_PRESETS[id], opts).text;
+    check(`【回归】${name} 逐字节不变`, got === want, `实际 ${JSON.stringify(got)}`);
+  }
+
+  const frame = buildFrameCommand(freshPath(rect), MACHINE_PRESETS['liyue-sc631-au'], {});
+  check('【回归】走框预览逐字节不变',
+    frame.text === 'IN;\nPA;\nSP1;\nPU;\nPU394,19685;\nPU394,23228;\nPU2362,23228;\nPU2362,19685;\nPU394,19685;\nPU0,0;\n',
+    JSON.stringify(frame.text));
+
+  const manualGolden = {
+    move: 'IN;\nSP1;\nVS3;\nPU;\nPR197,-394;\nPA;\n',
+    home: 'IN;\nSP1;\nVS3;\nPU;\nPR197,-394;\nPA;\nIP0,0;\n',
+    feed: 'IN;\nSP1;\nVS3;\nPU;\nPR787,0;\nPA;\n',
+  };
+  for (const [action, want] of Object.entries(manualGolden)) {
+    const got = buildManualCommand(MACHINE_PRESETS['liyue-sc631-au'],
+      { action, dx: 10, dy: 5, distance: 20, speed: 30 }).text;
+    check(`【回归】手动 ${action} 逐字节不变`, got === want, JSON.stringify(got));
+  }
+
+  check('新增机器没有改动任何原预设的方言',
+    ['liyue-sc631-au', 'liyue-sc631e', 'liyue-sc630', 'liyue-sc801', 'liyue-sc1261',
+      'generic-hpgl-1016', 'generic-1016-600'].every((id) => MACHINE_PRESETS[id].dialect === 'hpgl')
+    && MACHINE_PRESETS['liyue-4axis'].dialect === 'hpgl3d'
+    && MACHINE_PRESETS['generic-dmpl'].dialect === 'dmpl');
+  check('方言注册表覆盖 hpgl / hpgl3d / dmpl / skm',
+    ['hpgl', 'hpgl3d', 'dmpl', 'skm'].every((id) => DIALECTS[id] && DIALECTS[id].id === id));
+  check('未知方言安全回退到 HP-GL', getDialect('no-such-dialect').id === 'hpgl');
+}
+
+// ---------------------------------------------------------------------------
+section('SparkPlotter-GZ：skm 私有协议');
+{
+  const p = MACHINE_PRESETS['sparkplotter-gz'];
+  const line = (x2, y2) => ({ type: 'line', x2, y2 });
+  const rect = {
+    subpaths: [{ start: { x: 10, y: 10 }, elems: [line(100, 10), line(100, 60), line(10, 60), line(10, 10)] }],
+  };
+  const r = compileToPlotterLanguage(freshPath(rect), p, {});
+
+  check('预设存在且名为 SparkPlotter-GZ', !!p && p.name.startsWith('SparkPlotter-GZ'));
+  check('幅面 600mm 刻绘宽 / 1016 步每英寸', p.width === 600 && p.stepsPerInch === 1016);
+  check('串口 9600 / 8N1 / 无流控',
+    p.serialDefault.baud === 9600 && p.serialDefault.dataBits === 8
+    && p.serialDefault.stopBits === 1 && p.serialDefault.parity === 'none' && !p.serialDefault.rtscts);
+  check('方言为 skm 且几何层与 HP-GL 共用', p.dialect === 'skm' && getDialect('skm').stream === true);
+
+  check('初始化串逐字节正确（15 字节，末尾空格是协议的一部分）',
+    r.text.startsWith(SKM_INIT) && SKM_INIT.length === 15 && SKM_INIT.endsWith(' '), JSON.stringify(SKM_INIT));
+  check('抬刀移动 U{x},{y} 以空格结尾', /\bU-?\d+,-?\d+ /.test(r.text));
+  check('落刀首点 D{x},{y} 以空格结尾', /\bD-?\d+,-?\d+ /.test(r.text));
+  check('连续线段用逗号续接（无 D 前缀、无空格）', /,\d+,\d+,\d+,\d+/.test(r.text));
+  check('【关键】作业结束标记存在且在最后', /U F-?\d+ @ $/.test(r.text), JSON.stringify(r.text.slice(-24)));
+  check('初始化之后全协议无分号（空格才是边界）', !r.text.slice(SKM_INIT.length).includes(';'));
+  check('序列化为连续字节流（不插换行）', !r.text.includes('\n'));
+  check('编译结果携带 format=stream', r.format === 'stream');
+
+  const fr = buildFrameCommand(freshPath(rect), p, {});
+  check('走框预览同样带结束标记（否则刀头不动）', /U F-?\d+ @ $/.test(fr.text));
+  check('走框全程抬刀：没有落刀 D 指令', !/\bD-?\d+,-?\d+ /.test(fr.text));
+  check('走框结果携带 format=stream', fr.format === 'stream');
+
+  // 影子估算：几何不变，耗时/进度口径与 HP-GL 一致
+  const shadow = skmToHpglShadow(r.text);
+  check('影子文本可由下发字节流无损反推', shadow === r.estimateText, JSON.stringify(shadow));
+  const hpglText = compileToPlotterLanguage(freshPath(rect), MACHINE_PRESETS['generic-1016-600'], {}).text;
+  const mSk = estimateHpglMotion(shadow, { stepsPerInch: 1016 });
+  const mHp = estimateHpglMotion(hpglText, { stepsPerInch: 1016 });
+  check('影子估算的切割长度与 HP-GL 版一致',
+    near(mSk.cutLengthMm, mHp.cutLengthMm, 0.5), `${mSk.cutLengthMm} vs ${mHp.cutLengthMm}`);
+
+  // 传输层：空格不能被 trim、字节流必须无损
+  check('格式嗅探：HP-GL → lines，skm → stream',
+    detectStreamFormat('IN;\nPA;\n') === 'lines' && detectStreamFormat(r.text) === 'stream');
+  check('流式切块拼接无损', splitStreamUnits(r.text, 17).join('') === r.text);
+  const nt = new NullTransport();
+  const eng = new JobEngine(nt);
+  eng.enqueue({
+    id: 'skm-e2e', name: 'skm 端到端', text: r.text, baud: 9600,
+    stepsPerInch: p.stepsPerInch,
+    estimate: { totalSeconds: 0.01, cutLengthMm: 0, rapidLengthMm: 0 },
+  });
+  const queued = eng.queue.find((j) => j.id === 'skm-e2e');
+  check('任务自动识别为流式下发', queued.streamFormat === 'stream');
+  check('下发单元拼接后与原文一致', queued.units.join('') === r.text);
+  const forced = new JobEngine(new NullTransport());
+  forced.enqueue({ id: 'skm-lines', text: r.text, streamFormat: 'lines' });
+  check('即使调用方误传 lines，skm 文本仍按流式下发（切换机型后重发不会损坏指令）',
+    forced.queue[0].streamFormat === 'stream' && forced.queue[0].units.join('') === r.text);
+  await eng.run();
+  check('【关键】端到端下发字节流逐字节一致（结尾空格未被 trim）',
+    nt.written === r.text, JSON.stringify(nt.written));
+
+  // 虚拟机如实模拟「攒缓冲 + 结束标记才执行」
+  const vp = new VirtualPlotter({ dialect: 'skm', stepsPerInch: p.stepsPerInch });
+  let banner = null;
+  vp.on('data', (d) => { banner = d; });
+  await vp.connect();
+  await new Promise((res) => setTimeout(res, 40));
+  check('单工虚拟机 everRx=false 且不回 banner', vp.everRx === false && banner === null);
+  const noEnd = r.text.replace(/U F-?\d+ @ $/, '');
+  await vp.write(noEnd);
+  await new Promise((res) => setTimeout(res, 25));
+  check('【关键】缺结束标记时机器完全不动',
+    vp.jobs === 0 && vp.pos.x === 0 && vp.pos.y === 0, JSON.stringify(vp.pos));
+  await vp.write('U F0 @ ');
+  await new Promise((res) => setTimeout(res, 25));
+  check('收到结束标记后缓冲作业一次性执行',
+    vp.jobs === 1 && (vp.pos.x !== 0 || vp.pos.y !== 0), JSON.stringify(vp.pos));
+
+  // 手动控制：没有 PR / IP，坐标由上位机累加
+  const m1 = buildManualCommand(p, { action: 'move', dx: 10, dy: 5, speed: 30 }, { pos: { x: 0, y: 0 } });
+  check('手动移动生成绝对坐标 U 指令', /U-?\d+,-?\d+ /.test(m1.text));
+  check('手动移动自带作业结束标记', /U F-?\d+ @ $/.test(m1.text));
+  check('手动移动不含 HP-GL 的 PR/PA/IP', !/PR|PA|IP/.test(m1.text));
+  const m2 = buildManualCommand(p, { action: 'move', dx: 10, dy: 0, speed: 30 }, { pos: m1.nextPos });
+  check('连续两次移动：上位机累加绝对坐标',
+    m2.nextPos.x === m1.nextPos.x && m2.nextPos.y !== m1.nextPos.y,
+    `${JSON.stringify(m1.nextPos)} → ${JSON.stringify(m2.nextPos)}`);
+  const mh = buildManualCommand(p, { action: 'home' }, { pos: m2.nextPos });
+  check('回原点发 U0,0 并以 F0 提交', mh.text.includes('U0,0 ') && /U F0 @ $/.test(mh.text));
 }
 
 // ---------------------------------------------------------------------------

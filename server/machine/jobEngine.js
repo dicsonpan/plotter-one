@@ -21,6 +21,7 @@
 
 import { EventEmitter } from 'node:events';
 import { estimateHpglMotion, estimateLineMotionMs } from './hpgl.js';
+import { detectStreamFormat, splitStreamUnits, skmToHpglShadow } from './dialects.js';
 
 const BAUD_EFFICIENCY = 0.88; // 协议开销 + 控制板缓冲，实测效率约 88%
 
@@ -168,9 +169,18 @@ export class JobEngine extends EventEmitter {
   /** 入队一个任务：{ id, name, text, baud } */
   enqueue(job) {
     const text = job.text || '';
-    // 下发单元：先按行，再把超长行按语义安全拆到 MAX_LINE_BYTES 以内。
-    // 单元数 ≥ 行数，UI 的行数/进度用单元数，与实际下发节奏一致。
-    const units = prepareUnits(text, MAX_LINE_BYTES);
+    // 协议层决定下发方式：HP-GL 按行（每条自带 ';'，可 trim/拆分）；
+    // skm 是连续字节流（结尾空格即指令边界，绝不能 trim 或插换行）。
+    // 🔴 文本自身是权威：只要是以私有初始化串开头的 skm 字节流，一律按流式处理，
+    // 哪怕调用方传来的 streamFormat 是错的（编译后切换机型、历史任务重发等场景）。
+    const stream = job.streamFormat === 'stream' || detectStreamFormat(text) === 'stream';
+    // 行式：先按行，再把超长行按语义安全拆到 MAX_LINE_BYTES 以内；
+    // 流式：按固定长度等分，拼接后必须与原文逐字节相同。
+    const units = stream
+      ? splitStreamUnits(text)
+      : prepareUnits(text, MAX_LINE_BYTES);
+    // 运动学估算器只认 HP-GL 语法：流式方言先转成等价 HP-GL 影子文本再估算。
+    const estimateSource = stream ? skmToHpglShadow(text) : text;
     const motion = job.estimate
       ? {
           totalSeconds: job.estimate.totalSeconds,
@@ -178,7 +188,7 @@ export class JobEngine extends EventEmitter {
           rapidLengthMm: job.estimate.rapidLengthMm || 0,
           ...job.estimate,
         }
-      : estimateHpglMotion(text, {
+      : estimateHpglMotion(estimateSource, {
           defaultSpeed: job.speed || 30,
           stepsPerInch: job.stepsPerInch || 1000,
         });
@@ -193,6 +203,7 @@ export class JobEngine extends EventEmitter {
       baud: job.baud || 9600,
       lines: units,
       units,
+      streamFormat: stream ? 'stream' : 'lines',
       status: 'queued',
       createdAt: Date.now(),
       motion,
@@ -371,7 +382,9 @@ export class JobEngine extends EventEmitter {
         let count = 0;
         let hasHome = false;
         while (i + count < this.current.units.length) {
-          const u = this.current.units[i + count].trim();
+          const rawUnit = this.current.units[i + count];
+          // 🔴 流式方言的结尾空格就是指令边界，trim 会让两条指令粘连、机器静默不动
+          const u = this.current.streamFormat === 'stream' ? rawUnit : rawUnit.trim();
           if (chunk.length > 0 && chunk.length + u.length > CHUNK_BYTES) break;
           chunk += u;
           count++;

@@ -47,7 +47,7 @@
 git clone https://github.com/dicsonpan/plotter-one.git
 cd plotter-one
 
-# 自检（286 项，验证几何/协议/状态机/四方位原点/消除Y轴空走/走框预览/双语，无需接真机）
+# 自检（329 项，含力宇输出逐字节回归快照与 SparkPlotter-GZ 私有协议用例，无需接真机）
 npm run selftest
 
 # i18n 体检（确认全部 364 条文案中英严格对齐）
@@ -278,7 +278,9 @@ sudo bash deploy/uninstall.sh --purge   # 彻底清除
 
 ## 支持的机器预设
 
-力宇 SC 系列（SC631-AU / SC631E / SC630 / SC801 / SC1261）及其他兼容 HP-GL / DMPL 的刻字机：
+力宇 SC 系列（SC631-AU / SC631E / SC630 / SC801 / SC1261）、通用 HP-GL / DMPL 板卡，以及走私有文本协议的 SparkPlotter-GZ：
+
+**机型差异只发生在「怎么说话」，不发生在「怎么算刀路」**：几何层（`HpglBuilder`）所有机器共用，协议层（`server/machine/dialects.js`）按 `dialect` 分发指令格式、初始化串、作业结束标记与下发方式。新增机型不要动几何代码。
 
 | 机型 ID | 名称 | 预设幅面 | 分辨率 (步/英寸) | 默认原点位置 (`originPosition`) | 说明 |
 |---|---|---|---|---|---|
@@ -291,9 +293,37 @@ sudo bash deploy/uninstall.sh --purge   # 彻底清除
 | `generic-hpgl-1016` | 通用 HPGL 刻字机 | 630 × 710 mm | 1016 | `bottom-right`（右下） | 标准 HPGL 分辨率（40 步/mm） |
 | `generic-dmpl` | 通用 DMPL 割字机 | 630 × 710 mm | 1016 | `bottom-right`（右下） | 金谷田 / 赛博等国产 DMPL 语言板卡 |
 | `liyue-4axis` | 力宇四轴 / 伺服刻字机（3D） | 800 × 880 mm | 4060 | `bottom-left`（左下） | 平板 3D 机型，支持 `FS` 刀压指令 |
+| **`sparkplotter-gz`** | **SparkPlotter-GZ（600mm）** | 600 × 710 mm | 1016 | `bottom-right`（右下） | **私有文本协议 `skm`**，9600 波特、纯单工无回执；见下方 |
 
 **分辨率**：力宇标注 0.0254mm/step 即 1000 步/英寸。本服务在上位机通过 `toPlotterUnits()` 精确换算为机器脉冲整数步进，直发原生 HP-GL 坐标。
 **注意：卷筒刻字机绝不能下发 `SC`（缩放）指令**——卷筒纸轴无物理上限（$P2_y = 0$），发 `SC` 会导致固件将缩放比例归零，使走纸完全失去响应。
+
+### SparkPlotter-GZ（`skm` 私有协议，2026-11-12 新增）
+
+这台机器**不认任何标准 HP-GL**，走的是文泰/力宇系私有文本协议：
+
+| 项 | 值 |
+|---|---|
+| 串口 | 9600 / 8N1 / 无流控（切换机型时前端自动同步波特率） |
+| 分辨率 | 1016 步/英寸（≈40 步/mm） |
+| 指令边界 | **结尾空格 `0x20`**，初始化之后全协议没有分号 |
+| 初始化 | `;:H A L0 EC1 U `（15 字节，末尾空格是协议的一部分） |
+| 抬刀 / 落刀 | `U{x},{y} ` / `D{x},{y} `，连续点用 `,{x},{y}` 逗号续接 |
+| 作业提交 | **`U F{x} @ `** —— 机器先攒缓冲，收到这条才一次性执行；漏发则「发了完全不动」 |
+| 回执 | 上电静默、从不回应查询 → 单工链路，完成状态按运动学仿真推算 |
+
+🔴 **上机前必须实机确认（2026-11-12 尚未校准）**：
+
+1. 幅面：刻绘宽 600mm 已定，**进纸长度 710mm 是暂定值**，按铭牌/实测改 `height`；
+2. 方向与版面朝向：`axisX/axisY/swapAxes/layoutRotate` 沿用右下角原点模型的默认值，**先用「走框预览」确认 X/Y 与朝向**，别直接刻大图；
+3. 结束标记里 `F{x}` 的 x 现取「最后一点的走纸轴坐标」，若实机语义不同，改 `dialects.js` 的 `skm.finish()`；
+4. 手动控制没有相对移动指令，坐标由服务进程在内存里累加，**重启服务或切换机型后需重新对刀**。
+
+### 新增一台机器要改什么
+
+1. 协议与现有某方言相同 → 只在 `MACHINE_PRESETS` 加一条预设（幅面、分辨率、串口、原点方位），前端下拉自动出现；
+2. 协议不同 → 在 `server/machine/dialects.js` 加一个适配器（实现 `init / moveTo / lineTo / penUp / finish / serialize` 等钩子），预设里指定新 `dialect`；
+3. 跑 `npm run selftest`：力宇的 golden 快照会挡住任何把老机型改坏的改动，新方言补自己的协议用例。
 
 ### ⚠️ 幅面宽度为什么取 600 而不是 630
 
@@ -400,13 +430,14 @@ node tools/i18n-check.js
 plotter-one/
 ├── server/
 │   ├── index.js              HTTP 路由 + WebSocket + /api/frame 走框预览接口
-│   ├── selftest.js           286 项端到端自检（无需真机）
+│   ├── selftest.js           329 项端到端自检（含力宇输出逐字节回归快照，无需真机）
 │   ├── geom/path.js          几何内核（路径/矩阵/抽稀/除杂点/最近邻排序）
 │   ├── cam/
 │   │   ├── toolpath.js       刀路计算（原点就近排序 + 闭合环起点旋转 + 幅面校核）
 │   │   └── textToPath.js     内置单线字体转路径
 │   ├── machine/
-│   │   ├── hpgl.js           HP-GL / DMPL 生成 + 四方位原点 + 走框指令 + 机型预设
+│   │   ├── hpgl.js           几何层：坐标变换 / 图元离散 / 走框指令 + 机型预设
+│   │   ├── dialects.js       协议层：方言注册表（HP-GL / 3D / DMPL / skm）+ 流式切块与影子估算
 │   │   ├── transport.js      串口 / TCP / 虚拟机传输层（含 5s 写入看门狗）
 │   │   ├── jobEngine.js      任务队列、分块流式下发与运动学双阶段进度跟踪
 │   │   ├── manual.js         手动控制指令生成
@@ -433,7 +464,7 @@ plotter-one/
 ## 开发与自检
 
 ```bash
-npm run selftest           # 运行全部 286 项自检，不需要接机器
+npm run selftest           # 运行全部 329 项自检，不需要接机器
 node tools/i18n-check.js   # 运行双语词典体检（364 条）
 npm start                  # 启动服务（默认 8080 端口）
 npm start -- --port 9000   # 指定端口启动
